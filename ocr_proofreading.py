@@ -10,7 +10,9 @@ import base64
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QSplitter, QTextEdit, QLabel, QToolBar, QFileDialog, 
                              QMessageBox, QLineEdit, QPushButton, QComboBox, QCheckBox,
-                             QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsRectItem)
+                             QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsRectItem,
+                             QDialog, QFormLayout, QTabWidget, QListWidget, QDialogButtonBox, QInputDialog,
+                             QSpinBox)
 from PyQt6.QtGui import (QAction, QColor, QFont, QImage, QPixmap, QPen, QTextCursor, 
                          QTextCharFormat, QCursor, QTextFormat, QSyntaxHighlighter)
 from PyQt6.QtWidgets import QProgressBar
@@ -31,7 +33,15 @@ try:
 except ImportError:
     print("PaddleOCR not found. Local OCR disabled.")
 
-DEFAULT_CONFIG = {
+
+DEFAULT_GLOBAL_CONFIG = {
+    "ocr_api_url": "",
+    "ocr_api_token": "",
+    "ocr_engine": "remote" # remote or local
+}
+
+DEFAULT_PROJECT_CONFIG = {
+    "name": "Default Project",
     "pdf_path": "",
     "image_dir": "",
     "start_page": 1,
@@ -39,13 +49,115 @@ DEFAULT_CONFIG = {
     "page_offset": 0,
     "text_path_left": "",
     "text_path_right": "", # 第二版本文本
-    "ocr_json_path": "",       # OCR 数据目录
+    "ocr_json_path": "ocr_results",       # OCR 数据目录
     "regex_left": r"^\*\*(.*?)\*\*",
     "regex_right": r"^([a-zA-Z]*?)",
     "use_pdf_render": False,
-    "ocr_api_url": "", # Remote OCR URL
-    "ocr_api_token": "", # Remote OCR Token
 }
+
+class ConfigManager:
+    def __init__(self, filepath="config.json"):
+        self.filepath = filepath
+        self.data = {
+            "global": DEFAULT_GLOBAL_CONFIG.copy(),
+            "projects": [DEFAULT_PROJECT_CONFIG.copy()],
+            "active_project": "Default Project"
+        }
+        self.load()
+
+    def load(self):
+        if not os.path.exists(self.filepath):
+            return
+
+        try:
+            with open(self.filepath, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                
+            # Migration Logic: Check if it's flat (old style)
+            if "projects" not in loaded:
+                print("Migrating legacy config to new structure...")
+                # It's a flat config, migrate to Default Project
+                new_project = DEFAULT_PROJECT_CONFIG.copy()
+                # Copy known project keys
+                for key in new_project:
+                    if key in loaded:
+                        new_project[key] = loaded[key]
+                new_project["name"] = "Default Project"
+                
+                # Copy known global keys
+                if "ocr_api_url" in loaded:
+                    self.data["global"]["ocr_api_url"] = loaded["ocr_api_url"]
+                if "ocr_api_token" in loaded:
+                    self.data["global"]["ocr_api_token"] = loaded["ocr_api_token"]
+                    
+                self.data["projects"] = [new_project]
+            else:
+                self.data = loaded
+                # Ensure structure integrity
+                if "global" not in self.data: 
+                    self.data["global"] = DEFAULT_GLOBAL_CONFIG.copy()
+                if "projects" not in self.data: 
+                    self.data["projects"] = [DEFAULT_PROJECT_CONFIG.copy()]
+                if "active_project" not in self.data:
+                    self.data["active_project"] = self.data["projects"][0]["name"]
+                    
+        except Exception as e:
+            print(f"Config load error: {e}")
+
+    def save(self):
+        try:
+            with open(self.filepath, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            print(f"Config save error: {e}")
+
+    def get_global(self):
+        return self.data["global"]
+
+    def get_projects(self):
+        return self.data["projects"]
+
+    def get_project(self, name):
+        for p in self.data["projects"]:
+            if p["name"] == name:
+                return p
+        return None
+
+    def get_active_project(self):
+        name = self.data.get("active_project")
+        p = self.get_project(name)
+        if p: return p
+        # Fallback
+        if self.data["projects"]:
+            self.data["active_project"] = self.data["projects"][0]["name"]
+            return self.data["projects"][0]
+        return DEFAULT_PROJECT_CONFIG.copy()
+
+    def set_active_project(self, name):
+        if self.get_project(name):
+            self.data["active_project"] = name
+            self.save()
+
+    def create_project(self, name):
+        if self.get_project(name): return False
+        new_p = DEFAULT_PROJECT_CONFIG.copy()
+        new_p["name"] = name
+        self.data["projects"].append(new_p)
+        self.save()
+        return True
+        
+    def delete_project(self, name):
+        # Don't delete if it's the only one
+        if len(self.data["projects"]) <= 1: return False
+        
+        self.data["projects"] = [p for p in self.data["projects"] if p["name"] != name]
+        
+        # Reset active if needed
+        if self.data["active_project"] == name:
+            self.data["active_project"] = self.data["projects"][0]["name"]
+        
+        self.save()
+        return True
 
 PAGE_PATTERN = re.compile(r"<(\d+)>")
 
@@ -449,12 +561,14 @@ class OCRWorker(QThread):
     progress = pyqtSignal(str)
     finished = pyqtSignal(bool, str) # success, message
     
-    def __init__(self, mode, page_list, config, pdf_path=None):
+    def __init__(self, mode, page_list, project_config, global_config, engine="remote"):
         super().__init__()
         self.mode = mode # 'single' or 'batch'
         self.page_list = page_list # list of page numbers (int)
-        self.config = config
-        self.pdf_path = pdf_path
+        self.project_config = project_config
+        self.global_config = global_config
+        self.engine = engine
+        self.pdf_path = project_config.get('pdf_path')
         self._is_running = True
 
     def run(self):
@@ -465,10 +579,11 @@ class OCRWorker(QThread):
                 doc = fitz.open(self.pdf_path)
             except: pass
             
-        api_url = self.config.get("ocr_api_url")
-        token = self.config.get("ocr_api_token")
+            
+        api_url = self.global_config.get("ocr_api_url")
+        token = self.global_config.get("ocr_api_token")
         
-        save_dir = self.config.get("ocr_json_path", "ocr_results")
+        save_dir = self.project_config.get("ocr_json_path", "ocr_results")
         if not os.path.exists(save_dir): 
             try: os.makedirs(save_dir)
             except: pass
@@ -487,7 +602,7 @@ class OCRWorker(QThread):
                 
                 if doc:
                     try:
-                        idx = page_num + self.config['page_offset'] - 1
+                        idx = page_num + self.project_config['page_offset'] - 1
                         if 0 < idx <= len(doc):
                             page = doc[idx-1]
                             
@@ -503,9 +618,8 @@ class OCRWorker(QThread):
                                 img_bytes = pix.tobytes("png")
                     except: pass
                     
-                # Try Image Dir if PDF failed
                 if not img_bytes:
-                    img_dir = self.config.get('image_dir')
+                    img_dir = self.project_config.get('image_dir')
                     if img_dir:
                         names = [f"page_{page_num}", f"{page_num}"]
                         exts = [".jpg", ".png", ".jpeg"]
@@ -524,31 +638,54 @@ class OCRWorker(QThread):
                     else:
                         continue # Skip in batch
                 
-                # 2. Prepare Request
-                file_data = base64.b64encode(img_bytes).decode("ascii")
-                headers = {
-                    "Authorization": f"token {token}",
-                    "Content-Type": "application/json"
-                }
-                payload = {
-                    "file": file_data,
-                    "fileType": 1,
-                    "useDocOrientationClassify": False,
-                    "useDocUnwarping": False,
-                    "useChartRecognition": False,
-                }
-
-                # 3. Send Request
-                response = requests.post(api_url, json=payload, headers=headers)
+                result = None
                 
-                if response.status_code != 200:
-                    if self.mode == 'single':
-                         raise Exception(f"Remote Error: {response.text}")
-                    else:
-                         print(f"Page {page_num} Error: {response.text}")
-                         continue
-
-                result = response.json().get("result")
+                # --- Execution ---
+                if self.engine == "local":
+                    if not HAS_LOCAL_OCR:
+                        raise Exception("Local OCR module not loaded.")
+                    
+                    # Local needs file path usually, or we wrap bytes to temp
+                    # PaddleOCRVL expects path
+                    temp_path = os.path.join(save_dir, f"temp_{page_num}.thumb")
+                    with open(temp_path, "wb") as f:
+                        f.write(img_bytes)
+                        
+                    try:
+                        ocr = PaddleOCRVL() # Warning: instantiating inside thread? 
+                        # Ideally PaddleOCR is thread-safe or lightweight.
+                        # If init is heavy, should be done once.
+                        # But PaddleOCRVL wrapper might handle it.
+                        res = ocr.predict(temp_path)
+                        result = res[0] if res else []
+                    finally:
+                         if os.path.exists(temp_path): os.remove(temp_path)
+                         
+                else:
+                    # Remote API
+                    file_data = base64.b64encode(img_bytes).decode("ascii")
+                    headers = {
+                        "Authorization": f"token {token}",
+                        "Content-Type": "application/json"
+                    }
+                    payload = {
+                        "file": file_data,
+                        "fileType": 1,
+                        "useDocOrientationClassify": False,
+                        "useDocUnwarping": False,
+                        "useChartRecognition": False,
+                    }
+    
+                    response = requests.post(api_url, json=payload, headers=headers)
+                    
+                    if response.status_code != 200:
+                        if self.mode == 'single':
+                             raise Exception(f"Remote Error: {response.text}")
+                        else:
+                             print(f"Page {page_num} Error: {response.text}")
+                             continue
+    
+                    result = response.json().get("result")
                 
                 # 4. Save
                 json_path = os.path.join(save_dir, f"page_{page_num}.json")
@@ -558,10 +695,12 @@ class OCRWorker(QThread):
                 success_count += 1
                 
             except Exception as e:
+                print(f"OCR Error page {page_num}: {e}")
                 if self.mode == 'single':
                     self.finished.emit(False, str(e))
                     return
-                print(e)
+                # Batch continues
+
                 
         if doc: doc.close()
         self.finished.emit(True, f"Batch OCR Done. {success_count}/{total} processed.")
@@ -612,9 +751,9 @@ class FileHeaderWidget(QWidget):
             self.set_path(filename)
             # Update config and reload
             if self.side == "left":
-                self.main_window.config['text_path_left'] = filename
+                self.main_window.project_config['text_path_left'] = filename
             else:
-                self.main_window.config['text_path_right'] = filename
+                self.main_window.project_config['text_path_right'] = filename
             self.main_window.save_config()
             self.main_window.reload_all_data()
 
@@ -623,6 +762,284 @@ class FileHeaderWidget(QWidget):
             self.main_window.save_left_data()
         elif self.side == "right":
             self.main_window.save_right_data()
+
+# ==========================================
+# 2.6 项目管理对话框
+# ==========================================
+
+class ProjectManagerDialog(QDialog):
+    def __init__(self, parent, config_manager):
+        super().__init__(parent)
+        self.setWindowTitle("Settings & Project Manager")
+        self.resize(800, 600)
+        self.config_manager = config_manager
+        
+        # UI Layout
+        layout = QVBoxLayout(self)
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+        
+        # Tab 1: Global Settings
+        self.tab_global = QWidget()
+        self.init_global_tab()
+        self.tabs.addTab(self.tab_global, "Global Settings")
+        
+        # Tab 2: Projects
+        self.tab_projects = QWidget()
+        self.init_projects_tab()
+        self.tabs.addTab(self.tab_projects, "Projects")
+        
+        # Buttons
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        btns.rejected.connect(self.accept) # Close acts as confirm/exit
+        layout.addWidget(btns)
+        
+    def init_global_tab(self):
+        layout = QFormLayout(self.tab_global)
+        
+        self.input_api_url = QLineEdit()
+        self.input_api_token = QLineEdit()
+        
+        # Load values
+        g = self.config_manager.get_global()
+        self.input_api_url.setText(g.get("ocr_api_url", ""))
+        self.input_api_token.setText(g.get("ocr_api_token", ""))
+        
+        # Connect save
+        self.input_api_url.textChanged.connect(self.save_global)
+        self.input_api_token.textChanged.connect(self.save_global)
+        
+        layout.addRow("OCR API URL:", self.input_api_url)
+        layout.addRow("OCR API Token:", self.input_api_token)
+        
+    def save_global(self):
+        g = self.config_manager.get_global()
+        g["ocr_api_url"] = self.input_api_url.text()
+        g["ocr_api_token"] = self.input_api_token.text()
+        self.config_manager.save()
+
+    def init_projects_tab(self):
+        layout = QHBoxLayout(self.tab_projects)
+        
+        # Left: List
+        left_layout = QVBoxLayout()
+        self.list_projects = QListWidget()
+        self.list_projects.currentRowChanged.connect(self.load_selected_project)
+        left_layout.addWidget(self.list_projects)
+        
+        btn_add = QPushButton("New Project")
+        btn_add.clicked.connect(self.add_project)
+        btn_del = QPushButton("Delete Project")
+        btn_del.clicked.connect(self.delete_project)
+        
+        left_layout.addWidget(btn_add)
+        left_layout.addWidget(btn_del)
+        
+        layout.addLayout(left_layout, 1)
+        
+        # Right: Details Form
+        self.form_widget = QWidget()
+        self.form_layout = QFormLayout(self.form_widget)
+        
+        # 1. Project Name (Editable)
+        self.inp_name = QLineEdit()
+        self.inp_name.editingFinished.connect(self.save_current_project)
+        self.form_layout.addRow("Name:", self.inp_name)
+        
+        # 2. Paths with Browse Buttons
+        self.inp_pdf = self.add_browse_row("PDF Path:", "file", "PDF Files (*.pdf)")
+        self.inp_left_txt = self.add_browse_row("Left Text:", "file", "Text (*.txt)")
+        self.inp_right_txt = self.add_browse_row("Right Text:", "file", "Text (*.txt)")
+        self.inp_img_dir = self.add_browse_row("Image Dir:", "dir")
+        self.inp_ocr_json = self.add_browse_row("OCR JSON Dir:", "dir")
+        
+        # 3. Numeric Fields
+        self.spin_start = QSpinBox(); self.spin_start.setRange(1, 9999); 
+        self.spin_end = QSpinBox(); self.spin_end.setRange(1, 9999);
+        self.spin_offset = QSpinBox(); self.spin_offset.setRange(-999, 999);
+        
+        self.spin_start.valueChanged.connect(self.save_current_project)
+        self.spin_end.valueChanged.connect(self.save_current_project)
+        self.spin_offset.valueChanged.connect(self.save_current_project)
+        
+        self.form_layout.addRow("Start Page:", self.spin_start)
+        self.form_layout.addRow("End Page:", self.spin_end)
+        self.form_layout.addRow("Page Offset:", self.spin_offset)
+        
+        # 4. Regex
+        self.inp_reg_l = QLineEdit()
+        self.inp_reg_r = QLineEdit()
+        self.inp_reg_l.editingFinished.connect(self.save_current_project)
+        self.inp_reg_r.editingFinished.connect(self.save_current_project)
+        
+        self.form_layout.addRow("Regex Left:", self.inp_reg_l)
+        self.form_layout.addRow("Regex Right:", self.inp_reg_r)
+        
+        layout.addWidget(self.form_widget, 2)
+        
+        self.current_project_original_name = None
+        self.refresh_project_list()
+        
+    def add_browse_row(self, label, mode, filter_str=""):
+        widget = QWidget()
+        h = QHBoxLayout(widget)
+        h.setContentsMargins(0,0,0,0)
+        
+        line_edit = QLineEdit()
+        line_edit.editingFinished.connect(self.save_current_project)
+        
+        btn = QPushButton("...")
+        btn.setFixedWidth(30)
+        btn.clicked.connect(lambda: self.browse_path(line_edit, mode, filter_str))
+        
+        h.addWidget(line_edit)
+        h.addWidget(btn)
+        
+        self.form_layout.addRow(label, widget)
+        return line_edit
+        
+    def browse_path(self, line_edit, mode, filter_str):
+        current = line_edit.text()
+        path = ""
+        if mode == "file":
+             path, _ = QFileDialog.getOpenFileName(self, "Select File", current, filter_str)
+        else:
+             path = QFileDialog.getExistingDirectory(self, "Select Directory", current)
+             
+        if path:
+            line_edit.setText(path)
+            self.save_current_project()
+
+    def refresh_project_list(self):
+        self.list_projects.blockSignals(True)
+        self.list_projects.clear()
+        projects = self.config_manager.get_projects()
+        current = self.config_manager.get_active_project()
+        
+        sel_row = 0
+        for i, p in enumerate(projects):
+            self.list_projects.addItem(p["name"])
+            if p["name"] == current["name"]:
+                sel_row = i
+                
+        # If we just renamed, try to keep selection on renamed item
+        if self.current_project_original_name:
+             # Find item with new name? Or just use index?
+             # Let's rely on index for stability if possible, but projects list might reorder?
+             # List order is usually stable.
+             pass
+             
+        self.list_projects.setCurrentRow(sel_row)
+        self.list_projects.blockSignals(False)
+        self.load_selected_project() # Force reload fields
+        
+    def load_selected_project(self):
+        row = self.list_projects.currentRow()
+        if row < 0: 
+            self.form_widget.setEnabled(False)
+            return
+        
+        self.form_widget.setEnabled(True)
+        name = self.list_projects.item(row).text()
+        p = self.config_manager.get_project(name)
+        if not p: return
+        
+        self.current_project_original_name = name
+        
+        self.block_signals_inputs(True)
+        self.inp_name.setText(p.get("name"))
+        self.inp_pdf.setText(p.get("pdf_path", ""))
+        self.inp_img_dir.setText(p.get("image_dir", ""))
+        self.inp_left_txt.setText(p.get("text_path_left", ""))
+        self.inp_right_txt.setText(p.get("text_path_right", ""))
+        self.inp_ocr_json.setText(p.get("ocr_json_path", ""))
+        
+        self.spin_start.setValue(int(p.get("start_page", 1)))
+        self.spin_end.setValue(int(p.get("end_page", 1)))
+        self.spin_offset.setValue(int(p.get("page_offset", 0)))
+        
+        self.inp_reg_l.setText(p.get("regex_left", ""))
+        self.inp_reg_r.setText(p.get("regex_right", ""))
+        self.block_signals_inputs(False)
+
+    def save_current_project(self):
+        # We need to know which project we are editing.
+        # Use self.current_project_original_name as key
+        if not self.current_project_original_name: return
+        
+        p = self.config_manager.get_project(self.current_project_original_name)
+        if not p: return
+        
+        # 1. Handle Rename
+        new_name = self.inp_name.text().strip()
+        if new_name and new_name != self.current_project_original_name:
+            if self.config_manager.get_project(new_name):
+                QMessageBox.warning(self, "Error", "Project name already exists!")
+                self.inp_name.setText(self.current_project_original_name) # Revert
+                return
+            else:
+                p["name"] = new_name
+                # If this was active project, update active ref key (handled in manager? No, key string in ConfigManager needs update)
+                # ConfigManager uses list of dicts. "Active Project" is a separate string key.
+                # If we rename, we must update active_project string if it matches.
+                if self.config_manager.data["active_project"] == self.current_project_original_name:
+                    self.config_manager.data["active_project"] = new_name
+                
+                self.current_project_original_name = new_name
+                # Refresh list to show new name (and keep selection)
+                # Trigger refresh at end
+                
+        # 2. Save Fields
+        p["pdf_path"] = self.inp_pdf.text()
+        p["image_dir"] = self.inp_img_dir.text()
+        p["text_path_left"] = self.inp_left_txt.text()
+        p["text_path_right"] = self.inp_right_txt.text()
+        p["ocr_json_path"] = self.inp_ocr_json.text()
+        
+        p["start_page"] = self.spin_start.value()
+        p["end_page"] = self.spin_end.value()
+        p["page_offset"] = self.spin_offset.value()
+        
+        p["regex_left"] = self.inp_reg_l.text()
+        p["regex_right"] = self.inp_reg_r.text()
+        
+        self.config_manager.save()
+        
+        # If renamed, refresh list items
+        current_list_item = self.list_projects.currentItem()
+        if current_list_item and current_list_item.text() != self.current_project_original_name:
+             current_list_item.setText(self.current_project_original_name)
+
+    def block_signals_inputs(self, block):
+        inputs = [self.inp_pdf, self.inp_img_dir, self.inp_left_txt, self.inp_right_txt, 
+                  self.inp_ocr_json, self.inp_reg_l, self.inp_reg_r, self.inp_name,
+                  self.spin_start, self.spin_end, self.spin_offset]
+        for inp in inputs:
+            inp.blockSignals(block)
+
+    def add_project(self):
+        name, ok = QInputDialog.getText(self, "New Project", "Project Name:")
+        if ok and name:
+            if self.config_manager.create_project(name):
+                self.refresh_project_list()
+                # Select new
+                items = self.list_projects.findItems(name, Qt.MatchFlag.MatchExactly)
+                if items:
+                    self.list_projects.setCurrentItem(items[0])
+            else:
+                QMessageBox.warning(self, "Error", "Project name exists or invalid")
+
+    def delete_project(self):
+        row = self.list_projects.currentRow()
+        if row < 0: return
+        name = self.list_projects.item(row).text()
+        
+        ret = QMessageBox.question(self, "Delete", f"Delete project '{name}'?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if ret == QMessageBox.StandardButton.Yes:
+            if self.config_manager.delete_project(name):
+                self.refresh_project_list()
+            else:
+                QMessageBox.warning(self, "Error", "Cannot delete the last project")
 
 
 # ==========================================
@@ -635,8 +1052,19 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("OCR 校对工具 v4 (PyQt6 Refactor)")
         self.resize(1600, 900)
         
-        self.config = DEFAULT_CONFIG.copy()
-        self.load_config()
+        self.resize(1600, 900)
+        
+        # self.config = DEFAULT_CONFIG.copy()
+        # self.load_config()
+        self.config_manager = ConfigManager()
+        self.global_config = self.config_manager.get_global()
+        self.project_config = self.config_manager.get_active_project()
+        
+        # Compat: Map self.config to project_config for easy refactor, 
+        # but manual access to global_config is needed for OCR.
+        # Ideally, we replace all `self.config` with `self.project_config`
+        # and `self.config.get('ocr_...')` with `self.global_config...`
+        
         
         # 数据缓存
         self.pages_left = {}  # {page_num: text}
@@ -664,20 +1092,33 @@ class MainWindow(QMainWindow):
             event.ignore()
         
     def load_config(self):
-        if os.path.exists("config.json"):
-            try:
-                with open("config.json", "r", encoding='utf-8') as f:
-                    self.config.update(json.load(f))
-            except: pass
+        # Deprecated: Handled by ConfigManager
+        self.config_manager.load()
+        self.global_config = self.config_manager.get_global()
+        self.project_config = self.config_manager.get_active_project()
             
     def save_config(self):
-        with open("config.json", "w", encoding='utf-8') as f:
-            json.dump(self.config, f, indent=4)
+        # Deprecated: Handled by ConfigManager
+        self.config_manager.save()
 
     def init_ui(self):
         # --- 工具栏 ---
         toolbar = QToolBar()
         self.addToolBar(toolbar)
+        
+        # Project Controls
+        toolbar.addWidget(QLabel("Project: "))
+        self.combo_project = QComboBox()
+        self.combo_project.setMinimumWidth(150)
+        self.update_project_combo()
+        self.combo_project.activated.connect(self.on_project_switched)
+        toolbar.addWidget(self.combo_project)
+        
+        btn_manage = QPushButton("Settings / Manage")
+        btn_manage.clicked.connect(self.open_project_manager)
+        toolbar.addWidget(btn_manage)
+        
+        toolbar.addSeparator()
         
         # 页码控制
         self.spin_page = QLineEdit()
@@ -702,30 +1143,31 @@ class MainWindow(QMainWindow):
         
         toolbar.addSeparator()
         
-        # 本地 OCR 按钮
-        if HAS_LOCAL_OCR:
-            btn_ocr = QPushButton("运行本地OCR")
-            btn_ocr.clicked.connect(self.run_local_ocr)
-            toolbar.addWidget(btn_ocr)
-            
-        # 远程 OCR 按钮 (仅当配置存在时)
-        if self.config.get("ocr_api_url") and self.config.get("ocr_api_token"):
-            btn_remote_ocr = QPushButton("运行远程OCR")
-            btn_remote_ocr.clicked.connect(self.run_remote_ocr)
-            toolbar.addWidget(btn_remote_ocr)
         
+        # OCR 工具栏
         toolbar.addSeparator()
+        toolbar.addWidget(QLabel(" OCR Engine: "))
+        self.combo_ocr_engine = QComboBox()
+        self.combo_ocr_engine.addItem("Remote API", "remote")
+        if HAS_LOCAL_OCR:
+            self.combo_ocr_engine.addItem("PaddleOCR (Local)", "local")
+            
+        # Select current
+        current_engine = self.global_config.get("ocr_engine", "remote")
+        idx = self.combo_ocr_engine.findData(current_engine)
+        if idx >= 0: self.combo_ocr_engine.setCurrentIndex(idx)
         
-        # 保存按钮 (Removing redundant generic save button as requested)
-        # btn_save = QPushButton("保存左侧")
-        # btn_save.clicked.connect(self.save_left_data)
-        # toolbar.addWidget(btn_save)
+        self.combo_ocr_engine.currentIndexChanged.connect(self.on_ocr_engine_changed)
+        toolbar.addWidget(self.combo_ocr_engine)
         
-        # 批量 OCR 按钮
-        if self.config.get("ocr_api_url") and self.config.get("ocr_api_token"):
-             self.btn_batch = QPushButton("OCR所有缺失页面")
-             self.btn_batch.clicked.connect(self.run_batch_ocr)
-             toolbar.addWidget(self.btn_batch)
+        btn_ocr_cur = QPushButton("OCR当前页面")
+        btn_ocr_cur.clicked.connect(self.run_current_ocr_unified)
+        toolbar.addWidget(btn_ocr_cur)
+        
+        self.btn_batch = QPushButton("OCR所有缺失页面")
+        self.btn_batch.clicked.connect(self.run_batch_ocr)
+        toolbar.addWidget(self.btn_batch)
+
         
         btn_export = QPushButton("导出切图")
         btn_export.clicked.connect(self.export_slices)
@@ -753,12 +1195,12 @@ class MainWindow(QMainWindow):
         
         self.regex_input_left = QLineEdit()
         self.regex_input_left.setPlaceholderText("左侧词头正则")
-        self.regex_input_left.setText(self.config.get("regex_left", ""))
+        self.regex_input_left.setText(self.project_config.get("regex_left", ""))
         self.regex_input_left.editingFinished.connect(self.on_regex_changed)
         
         self.regex_input_right = QLineEdit()
         self.regex_input_right.setPlaceholderText("右侧词头正则")
-        self.regex_input_right.setText(self.config.get("regex_right", ""))
+        self.regex_input_right.setText(self.project_config.get("regex_right", ""))
         self.regex_input_right.editingFinished.connect(self.on_regex_changed)
         
         regex_layout.addWidget(QLabel("L正则:"))
@@ -843,19 +1285,19 @@ class MainWindow(QMainWindow):
 
     def reload_all_data(self):
         # 1. 加载文本
-        self.pages_left = read_text_to_pages(self.config['text_path_left'])
-        self.pages_right_text = read_text_to_pages(self.config['text_path_right'])
+        self.pages_left = read_text_to_pages(self.project_config['text_path_left'])
+        self.pages_right_text = read_text_to_pages(self.project_config['text_path_right'])
         
         # 2. 加载 PDF
-        if self.config['pdf_path'] and os.path.exists(self.config['pdf_path']):
+        if self.project_config['pdf_path'] and os.path.exists(self.project_config['pdf_path']):
             try:
-                self.doc = fitz.open(self.config['pdf_path'])
+                self.doc = fitz.open(self.project_config['pdf_path'])
             except:
                 self.doc = None
         
         # 3. Update Headers
-        self.header_left.set_path(self.config.get('text_path_left', ''))
-        self.header_right.set_path(self.config.get('text_path_right', ''))
+        self.header_left.set_path(self.project_config.get('text_path_left', ''))
+        self.header_right.set_path(self.project_config.get('text_path_right', ''))
 
         self.load_current_page()
 
@@ -863,7 +1305,7 @@ class MainWindow(QMainWindow):
 
     def load_current_page(self):
         # Session-based dirty tracking: No prompts here.
-        page_num = self.config.get('start_page', 1)
+        page_num = self.project_config.get('start_page', 1)
         try:
             page_num = int(self.spin_page.text())
         except: pass
@@ -971,7 +1413,7 @@ class MainWindow(QMainWindow):
     def get_best_page_image_bytes(self, doc, page_num):
         """Extract High-Res or Raw image from PDF"""
         try:
-             idx = page_num + self.config['page_offset'] - 1
+             idx = page_num + self.project_config['page_offset'] - 1
              if 0 < idx <= len(doc):
                  page = doc[idx - 1]
                  
@@ -997,7 +1439,7 @@ class MainWindow(QMainWindow):
             if b:
                 img = QImage.fromData(b)
                 return QPixmap.fromImage(img)
-        img_dir = self.config['image_dir']
+        img_dir = self.project_config['image_dir']
         if img_dir and os.path.exists(img_dir):
             # 尝试 page_1.jpg 或 1.jpg
             names = [f"page_{page_num}", f"{page_num}"]
@@ -1011,7 +1453,7 @@ class MainWindow(QMainWindow):
 
     def load_ocr_json(self, page_num):
         """加载 PaddleOCR 格式 JSON"""
-        path = self.config['ocr_json_path']
+        path = self.project_config['ocr_json_path']
         f_path = os.path.join(path, f"page_{page_num}.json")
         if not os.path.exists(f_path):
             # 尝试直接数字
@@ -1082,8 +1524,8 @@ class MainWindow(QMainWindow):
             self.edit_right.blockSignals(False)
             
             # 渲染词头正则
-            self.highlighter_left.set_regex(self.config.get("regex_left"))
-            self.highlighter_right.set_regex(self.config.get("regex_right"))
+            self.highlighter_left.set_regex(self.project_config.get("regex_left"))
+            self.highlighter_right.set_regex(self.project_config.get("regex_right"))
             
             # 如果不在 OCR 模式，更新 OCR Mapping
             if self.combo_source.currentText() != "OCR Results" and self.ocr_text_full:
@@ -1169,9 +1611,9 @@ class MainWindow(QMainWindow):
         self.run_diff()
 
     def on_regex_changed(self):
-        self.config["regex_left"] = self.regex_input_left.text()
-        self.config["regex_right"] = self.regex_input_right.text()
-        self.save_config()
+        self.project_config["regex_left"] = self.regex_input_left.text()
+        self.project_config["regex_right"] = self.regex_input_right.text()
+        self.config_manager.save()
         self.run_diff()
 
     # ================= 交互增强 (Sync & Highlight) =================
@@ -1365,35 +1807,39 @@ class MainWindow(QMainWindow):
         self.load_current_page()
 
     def save_left_data(self):
-        path = self.config.get('text_path_left')
+        path = self.project_config.get('text_path_left')
         if not path:
              # Provide Save As?
              path, _ = QFileDialog.getSaveFileName(self, "Save Left", "", "Text (*.txt)")
              if path: 
-                 self.config['text_path_left'] = path
+                 self.project_config['text_path_left'] = path
         
         if path:
             write_pages_to_file(self.pages_left, path)
             self.dirty_pages_left.clear()
             QMessageBox.information(self, "保存", f"Left data saved to {path}")
+            self.config_manager.save()
 
     def save_right_data(self):
         if self.combo_source.currentText() != "Text File B":
             QMessageBox.warning(self, "Error", "Right side is not a text file.")
             return
 
-        path = self.config.get('text_path_right')
+        path = self.project_config.get('text_path_right')
         if not path:
              path, _ = QFileDialog.getSaveFileName(self, "Save Right", "", "Text (*.txt)")
              if path: 
-                 self.config['text_path_right'] = path
+                 self.project_config['text_path_right'] = path
         
         if path:
             write_pages_to_file(self.pages_right_text, path)
             self.dirty_pages_right.clear()
             QMessageBox.information(self, "保存", f"Right data saved to {path}")
+            self.config_manager.save()
 
     def run_local_ocr(self):
+        # Deprecated
+        return
         if not HAS_LOCAL_OCR: return
         page_num = int(self.spin_page.text())
         img_path = ""
@@ -1419,7 +1865,7 @@ class MainWindow(QMainWindow):
             data = result[0] if result else []
             
             # 保存到 json
-            save_dir = self.config['ocr_json_path']
+            save_dir = self.project_config['ocr_json_path']
             if not os.path.exists(save_dir): os.makedirs(save_dir)
             json_path = os.path.join(save_dir, f"page_{page_num}.json")
             
@@ -1441,9 +1887,11 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "OCR Error", str(e))
 
     def run_remote_ocr(self):
+        # Deprecated
+        return
         """运行单页远程 OCR (Async)"""
-        api_url = self.config.get("ocr_api_url")
-        token = self.config.get("ocr_api_token")
+        api_url = self.global_config.get("ocr_api_url")
+        token = self.global_config.get("ocr_api_token")
         if not api_url or not token:
             QMessageBox.warning(self, "Config", "Missing URL/Token")
             return
@@ -1465,18 +1913,26 @@ class MainWindow(QMainWindow):
             self.btn_batch.setEnabled(False)
             return
 
-        # Start Logic
-        api_url = self.config.get("ocr_api_url")
-        token = self.config.get("ocr_api_token")
-        if not api_url or not token:
-            QMessageBox.warning(self, "Config", "Missing URL/Token")
-            return
+        # Check prereqs based on engine
+        engine = self.global_config.get("ocr_engine", "remote")
+        
+        if engine == "remote":
+            api_url = self.global_config.get("ocr_api_url")
+            token = self.global_config.get("ocr_api_token")
+            if not api_url or not token:
+                QMessageBox.warning(self, "Config", "Missing URL/Token for Remote OCR")
+                return
+        elif engine == "local":
+            if not HAS_LOCAL_OCR:
+                QMessageBox.warning(self, "Config", "Local OCR module missing")
+                return
+
             
-        start = self.config.get("start_page", 1)
-        end = self.config.get("end_page", 100)
+        start = self.project_config.get("start_page", 1)
+        end = self.project_config.get("end_page", 100)
         
         missing_pages = []
-        save_dir = self.config.get("ocr_json_path", "ocr_results")
+        save_dir = self.project_config.get("ocr_json_path", "ocr_results")
         
         for p in range(start, end + 1):
             if not os.path.exists(os.path.join(save_dir, f"page_{p}.json")):
@@ -1499,17 +1955,13 @@ class MainWindow(QMainWindow):
         self.start_ocr_thread('batch', missing_pages)
 
     def start_ocr_thread(self, mode, pages):
-        self.ocr_thread = OCRWorker(mode, pages, self.config, self.doc) # Pass raw doc? no, pass path or handle in main
-        # Passing self.doc to thread is risky if main thread accesses it. 
-        # But OCRWorker only reads. However, fitz doc might be not thread safe.
-        # Better: OCRWorker opens its own doc (via path).
-        # We need to pass pdf_path.
+        # OCRWorker(mode, pages, project_config, global_config, engine, pdf_path)
+        engine = self.global_config.get("ocr_engine", "remote")
         
-        # Wait, get_best_page_image_bytes needs doc. 
-        # If we pass doc, we must ensure main thread doesn't use it or lock it.
-        # Safest: Let Worker open file.
+        # Ensure pdf path is passed properly or handled in thread
+        pdf_path = self.project_config.get('pdf_path')
         
-        self.ocr_thread = OCRWorker(mode, pages, self.config, self.config.get('pdf_path'))
+        self.ocr_thread = OCRWorker(mode, pages, self.project_config, self.global_config, engine)
         self.ocr_thread.progress.connect(self.on_ocr_progress)
         self.ocr_thread.finished.connect(self.on_ocr_finished)
         self.ocr_thread.start()
@@ -1578,6 +2030,55 @@ class MainWindow(QMainWindow):
             count += 1
             
         QMessageBox.information(self, "Export", f"已导出 {count} 张切片到 {out_dir}")
+
+    def on_ocr_engine_changed(self):
+        engine = self.combo_ocr_engine.currentData()
+        self.global_config["ocr_engine"] = engine
+        self.config_manager.save()
+
+    def run_current_ocr_unified(self):
+        """Unified entry point for Single Page OCR"""
+        try:
+            page_num = int(self.spin_page.text())
+        except: return
+        
+        # Disable button?
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self.start_ocr_thread('single', [page_num])
+
+    def update_project_combo(self):
+        self.combo_project.blockSignals(True)
+        self.combo_project.clear()
+        projects = self.config_manager.get_projects()
+        active = self.config_manager.get_active_project()
+        
+        idx = 0
+        for i, p in enumerate(projects):
+            self.combo_project.addItem(p["name"])
+            if p["name"] == active["name"]:
+                idx = i
+        self.combo_project.setCurrentIndex(idx)
+        self.combo_project.blockSignals(False)
+
+    def on_project_switched(self):
+        name = self.combo_project.currentText()
+        self.config_manager.set_active_project(name)
+        self.project_config = self.config_manager.get_active_project()
+        
+        # Reload
+        self.reload_all_data()
+        QMessageBox.information(self, "Project Switched", f"Switched to {name}")
+
+    def open_project_manager(self):
+        dlg = ProjectManagerDialog(self, self.config_manager)
+        dlg.exec()
+        
+        # After close: Config might have changed
+        self.global_config = self.config_manager.get_global()
+        self.project_config = self.config_manager.get_active_project()
+        
+        self.update_project_combo()
+        self.reload_all_data()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
