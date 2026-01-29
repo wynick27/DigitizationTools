@@ -596,15 +596,15 @@ class OCRWorker(QThread):
             
             try:
                 self.progress.emit(f"Processing page {page_num} ({i+1}/{total})...")
-                
+                real_page_num = page_num + self.project_config.get("page_offset", 0)
                 # 1. Get Image Data (Bytes)
                 img_bytes = None
                 
                 if doc:
                     try:
-                        idx = page_num + self.project_config['page_offset'] - 1
-                        if 0 < idx <= len(doc):
-                            page = doc[idx-1]
+                        
+                        if 0 < real_page_num <= len(doc):
+                            page = doc[real_page_num-1]
                             
                             # Try Raw
                             images = page.get_images()
@@ -621,7 +621,7 @@ class OCRWorker(QThread):
                 if not img_bytes:
                     img_dir = self.project_config.get('image_dir')
                     if img_dir:
-                        names = [f"page_{page_num}", f"{page_num}"]
+                        names = [f"page_{real_page_num}", f"{real_page_num}"]
                         exts = [".jpg", ".png", ".jpeg"]
                         for n in names:
                             for e in exts:
@@ -647,7 +647,7 @@ class OCRWorker(QThread):
                     
                     # Local needs file path usually, or we wrap bytes to temp
                     # PaddleOCRVL expects path
-                    temp_path = os.path.join(save_dir, f"temp_{page_num}.thumb")
+                    temp_path = os.path.join(save_dir, f"temp_{real_page_num}.thumb")
                     with open(temp_path, "wb") as f:
                         f.write(img_bytes)
                         
@@ -688,7 +688,7 @@ class OCRWorker(QThread):
                     result = response.json().get("result")
                 
                 # 4. Save
-                json_path = os.path.join(save_dir, f"page_{page_num}.json")
+                json_path = os.path.join(save_dir, f"page_{real_page_num}.json")
                 with open(json_path, "w", encoding='utf8') as json_file:
                     json.dump(result, json_file, ensure_ascii=False, indent=2)
                     
@@ -1317,15 +1317,13 @@ class MainWindow(QMainWindow):
         self.current_ocr_data = ocr_data # Store for highlighting
         
         # 2. Load Image (High Res)
-        if self.doc:
+        if self.doc or self.project_config.get('image_dir'):
             # Check OCR status
             ocr_state = " (OCR Done)" if ocr_data else " (No OCR)"
             self.statusBar().showMessage(f"Page {page_num} Loaded{ocr_state}")
             
-            img_bytes = self.get_best_page_image_bytes(self.doc, page_num)
-            if img_bytes:
-                img = QImage.fromData(img_bytes)
-                pix = QPixmap.fromImage(img)
+            pix = self.get_page_pixmap(page_num)
+            if pix:
                 self.image_view.load_content(pix, ocr_data)
             else:
                  self.image_view.load_content(None)
@@ -1333,7 +1331,7 @@ class MainWindow(QMainWindow):
         # 3. 构建 OCR 映射 (如果存在)
         self.ocr_text_full = ""
         self.ocr_char_map = [] # [(start, end, bbox), ...]
-        
+
         if ocr_data:
             current_idx = 0
             for item in ocr_data:
@@ -1372,7 +1370,7 @@ class MainWindow(QMainWindow):
         is_ocr_mode = (self.combo_source.currentText() == "OCR Results")
         
         # Draw bboxes (Use red for all detected, or maybe lighter if not in OCR mode)
-        self.image_view.load_content(pix, ocr_data if ocr_data else [])
+        #self.image_view.load_content(pix, ocr_data if ocr_data else [])
         
         # 3. 设置文本
         # 左侧
@@ -1441,8 +1439,9 @@ class MainWindow(QMainWindow):
                 return QPixmap.fromImage(img)
         img_dir = self.project_config['image_dir']
         if img_dir and os.path.exists(img_dir):
+            real_page_num = page_num + self.project_config.get('page_offset', 0)
             # 尝试 page_1.jpg 或 1.jpg
-            names = [f"page_{page_num}", f"{page_num}"]
+            names = [f"page_{real_page_num}", f"{real_page_num}"]
             exts = [".jpg", ".png", ".jpeg"]
             for n in names:
                 for e in exts:
@@ -1454,10 +1453,11 @@ class MainWindow(QMainWindow):
     def load_ocr_json(self, page_num):
         """加载 PaddleOCR 格式 JSON"""
         path = self.project_config['ocr_json_path']
-        f_path = os.path.join(path, f"page_{page_num}.json")
+        real_page_num = page_num + self.project_config.get('page_offset', 0)
+        f_path = os.path.join(path, f"page_{real_page_num}.json")
         if not os.path.exists(f_path):
             # 尝试直接数字
-            f_path = os.path.join(path, f"{page_num}.json")
+            f_path = os.path.join(path, f"{real_page_num}.json")
         
         if os.path.exists(f_path):
             try:
@@ -1837,73 +1837,6 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "保存", f"Right data saved to {path}")
             self.config_manager.save()
 
-    def run_local_ocr(self):
-        # Deprecated
-        return
-        if not HAS_LOCAL_OCR: return
-        page_num = int(self.spin_page.text())
-        img_path = ""
-        
-        # 导出当前页面图片为临时文件供 OCR
-        pix = self.get_page_pixmap(page_num)
-        if not pix:
-            QMessageBox.warning(self, "Error", "没有图片可供 OCR")
-            return
-            
-        temp_img = "temp_ocr.jpg"
-        pix.save(temp_img)
-        
-        try:
-            self.statusBar().showMessage("OCR Running...")
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            
-            ocr = PaddleOCRVL()
-            result = ocr.predict(temp_img)
-            
-            # 转换为标准格式并保存
-            # result 结构 [[[x,y]..], (text, conf)]
-            data = result[0] if result else []
-            
-            # 保存到 json
-            save_dir = self.project_config['ocr_json_path']
-            if not os.path.exists(save_dir): os.makedirs(save_dir)
-            json_path = os.path.join(save_dir, f"page_{page_num}.json")
-            
-            with open(json_path, "w", encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-                
-            QApplication.restoreOverrideCursor()
-            self.statusBar().showMessage("OCR Done.")
-            
-            # 切换模式并刷新
-            self.combo_source.setCurrentText("OCR Results")
-            self.load_current_page()
-            
-        except Exception as e:
-            QApplication.restoreOverrideCursor()
-            print(e)
-            QMessageBox.critical(self, "OCR Error", str(e))
-
-            QMessageBox.critical(self, "OCR Error", str(e))
-
-    def run_remote_ocr(self):
-        # Deprecated
-        return
-        """运行单页远程 OCR (Async)"""
-        api_url = self.global_config.get("ocr_api_url")
-        token = self.global_config.get("ocr_api_token")
-        if not api_url or not token:
-            QMessageBox.warning(self, "Config", "Missing URL/Token")
-            return
-
-        try:
-            page_num = int(self.spin_page.text())
-        except: return
-        
-        # Disable button?
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        self.start_ocr_thread('single', [page_num])
-
     def run_batch_ocr(self):
         """批量 OCR / Cancel"""
         # Toggle Logic: Cancel
@@ -1935,7 +1868,8 @@ class MainWindow(QMainWindow):
         save_dir = self.project_config.get("ocr_json_path", "ocr_results")
         
         for p in range(start, end + 1):
-            if not os.path.exists(os.path.join(save_dir, f"page_{p}.json")):
+            real_page_num = p + self.project_config.get("page_offset", 0)
+            if not os.path.exists(os.path.join(save_dir, f"page_{real_page_num}.json")):
                 missing_pages.append(p)
                 
         if not missing_pages:
