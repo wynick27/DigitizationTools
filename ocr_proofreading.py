@@ -6,6 +6,7 @@ import fitz  # PyMuPDF
 import difflib
 import requests
 import base64
+import time
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QSplitter, QTextEdit, QLabel, QToolBar, QFileDialog, 
@@ -19,6 +20,24 @@ from PyQt6.QtWidgets import QProgressBar
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QEvent, QThread, pyqtSlot
 import bisect
 
+
+# ==========================================
+# 0.5 Unicode Helpers
+# ==========================================
+
+def to_qt_pos(full_text: str, py_pos: int) -> int:
+    """Convert Python string index to Qt TextCursor position (UTF-16 code units)."""
+    head = full_text[:py_pos]
+    return len(head.encode('utf-16-le')) // 2
+
+def to_py_pos(full_text: str, qt_pos: int) -> int:
+    """Convert Qt TextCursor position to Python string index."""
+    curr_qt = 0
+    for i, c in enumerate(full_text):
+        if curr_qt >= qt_pos: 
+            return i
+        curr_qt += 2 if ord(c) > 0xFFFF else 1
+    return len(full_text)
 
 # ==========================================
 # 0. 全局工具与配置管理
@@ -218,11 +237,15 @@ class DiffSyntaxHighlighter(QSyntaxHighlighter):
         
     def set_diff_data(self, opcodes, is_left):
         self.diff_ranges = []
+        text = self.document().toPlainText()
+        
         for tag, i1, i2, j1, j2 in opcodes:
             if tag == 'equal': continue
-            s, e = (i1, i2) if is_left else (j1, j2)
-            if s < e:
-                self.diff_ranges.append((s, e))
+            s_py, e_py = (i1, i2) if is_left else (j1, j2)
+            if s_py < e_py:
+                s_qt = to_qt_pos(text, s_py)
+                e_qt = to_qt_pos(text, e_py)
+                self.diff_ranges.append((s_qt, e_qt))
         
         self.diff_ranges.sort() # Ensure sorted
         self.diff_starts = [r[0] for r in self.diff_ranges]
@@ -302,8 +325,13 @@ class DiffTextEdit(QTextEdit):
     """
     支持 Ctrl+Hover 高亮和 Ctrl+Click 应用补丁的文本框
     """
+    focus_in_signal = pyqtSignal()
     # 信号：点击了某个 Diff 块，请求应用到另一侧 (self_index_range, target_text)
     apply_patch_signal = pyqtSignal(tuple, str)
+
+    def focusInEvent(self, event):
+        self.focus_in_signal.emit()
+        super().focusInEvent(event)
     # 信号：Alt+Click 将本侧内容推送到另一侧 (target_range, my_content)
     push_patch_signal = pyqtSignal(tuple, str)
     
@@ -346,7 +374,11 @@ class DiffTextEdit(QTextEdit):
     def get_opcode_at_position(self, pos):
         """根据鼠标坐标获取对应的 opcode"""
         cursor = self.cursorForPosition(pos)
-        idx = cursor.position()
+        qt_idx = cursor.position()
+        
+        # Convert to Python index for opcode lookup
+        text = self.toPlainText()
+        idx = to_py_pos(text, qt_idx)
         
         # 遍历 opcodes 查找当前索引是否在差异区间内
         for tag, i1, i2, j1, j2 in self.diff_opcodes:
@@ -354,13 +386,9 @@ class DiffTextEdit(QTextEdit):
             
             # 判断是在左侧还是右侧
             if self.side == 'left':
-                # 左侧关注 i1, i2
-                # 对于 insert (左侧为空)，范围是 i1==i2，鼠标很难点中，需要容错？
-                # 这里主要处理 replace/delete
                 if i1 <= idx <= i2:
                     return (tag, i1, i2, j1, j2)
             else:
-                # 右侧关注 j1, j2
                 if j1 <= idx <= j2:
                     return (tag, i1, i2, j1, j2)
         return None
@@ -464,6 +492,7 @@ class DiffTextEdit(QTextEdit):
 # ==========================================
 
 class ImageCanvas(QGraphicsView):
+    bbox_clicked = pyqtSignal(int)
     def __init__(self):
         super().__init__()
         self.scene = QGraphicsScene()
@@ -481,14 +510,14 @@ class ImageCanvas(QGraphicsView):
             self.setSceneRect(0, 0, pixmap.width(), pixmap.height())
             if ocr_data:
                 self.draw_bboxes(ocr_data)
-        self.scale_factor = 1.0
-        self.resetTransform()
+        # self.scale_factor = 1.0 # Removed to persist zoom
+        # self.resetTransform()   # Removed to persist zoom
         
     def draw_bboxes(self, ocr_data):
         pen = QPen(QColor(255, 0, 0, 200))
         pen.setWidth(2)
         
-        for item in ocr_data:
+        for i, item in enumerate(ocr_data):
             # 兼容 PaddleOCR 格式
             # item 可能是 dict {'bbox':...} (v3代码) 或 list [points, (text, conf)]
             x, y, w, h = 0, 0, 0, 0
@@ -511,8 +540,20 @@ class ImageCanvas(QGraphicsView):
             rect = QGraphicsRectItem(x, y, w, h)
             rect.setPen(pen)
             rect.setToolTip(text) # 鼠标悬停显示文字
+            rect.setData(0, i)
             self.scene.addItem(rect)
 
+    def mousePressEvent(self, event):
+        if (event.modifiers() & Qt.KeyboardModifier.ShiftModifier) and (event.button() == Qt.MouseButton.LeftButton):
+             items = self.items(event.pos())
+             for item in items:
+                 idx = item.data(0)
+                 if idx is not None:
+                     self.bbox_clicked.emit(idx)
+                     event.accept()
+                     return
+        super().mousePressEvent(event)
+        
     def wheelEvent(self, event):
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             if event.angleDelta().y() > 0:
@@ -707,6 +748,30 @@ class OCRWorker(QThread):
 
     def stop(self):
         self._is_running = False
+
+class DiffWorker(QThread):
+    result_ready = pyqtSignal(list, list) # opcodes, ocr_opcodes
+
+    def __init__(self, text_l, text_r, ocr_text_full, need_ocr_map):
+        super().__init__()
+        self.text_l = text_l
+        self.text_r = text_r
+        self.ocr_text_full = ocr_text_full
+        self.need_ocr_map = need_ocr_map
+    
+    def run(self):
+        # Main Diff
+        matcher = difflib.SequenceMatcher(None, self.text_l, self.text_r, autojunk=False)
+        opcodes = matcher.get_opcodes()
+        
+        # OCR Mapping Diff
+        ocr_opcodes = []
+        if self.need_ocr_map and self.ocr_text_full:
+             m2 = difflib.SequenceMatcher(None, self.text_l, self.ocr_text_full, autojunk=False)
+             ocr_opcodes = m2.get_opcodes()
+             
+        self.result_ready.emit(opcodes, ocr_opcodes)
+
 
 
 # ==========================================
@@ -1060,6 +1125,9 @@ class MainWindow(QMainWindow):
         self.global_config = self.config_manager.get_global()
         self.project_config = self.config_manager.get_active_project()
         
+        self.last_active_editor = None
+        self._is_navigating_from_image = False
+        
         # Compat: Map self.config to project_config for easy refactor, 
         # but manual access to global_config is needed for OCR.
         # Ideally, we replace all `self.config` with `self.project_config`
@@ -1172,6 +1240,10 @@ class MainWindow(QMainWindow):
         btn_export = QPushButton("导出切图")
         btn_export.clicked.connect(self.export_slices)
         toolbar.addWidget(btn_export)
+        
+        btn_export_txt = QPushButton("导出OCR文本")
+        btn_export_txt.clicked.connect(self.export_ocr_txt)
+        toolbar.addWidget(btn_export_txt)
 
         # --- 主布局 ---
         main_widget = QWidget()
@@ -1278,6 +1350,10 @@ class MainWindow(QMainWindow):
         text_splitter.addWidget(right_container_widget)
         right_layout.addWidget(text_splitter)
         
+        self.image_view.bbox_clicked.connect(self.on_image_bbox_click)
+        self.edit_left.focus_in_signal.connect(self.on_editor_focus)
+        self.edit_right.focus_in_signal.connect(self.on_editor_focus)
+
         splitter.addWidget(right_container)
         splitter.setSizes([600, 1000]) # 初始比例
 
@@ -1398,15 +1474,14 @@ class MainWindow(QMainWindow):
         self.modified_left = False
         self.modified_right = False
         
-        # 4. 执行对比
-        self.run_diff()
+        # 4. 执行对比 (Init Timer first)
+        if not hasattr(self, 'diff_timer'):
+             self.init_diff_timer()
         
-        # 5. 计算 OCR 对齐 (Diff: Left <-> OCR_Full)
-        # 如果当前不是 OCR 模式，我们需要额外的 Diff 数据来做映射
-        if not is_ocr_mode and self.ocr_text_full:
-            self.run_ocr_mapping_diff(left_text)
-        else:
-            self.ocr_diff_opcodes = self.edit_left.diff_opcodes # 复用主 Diff (如果右侧就是OCR)
+        # Force run immediately for first load? Or use deferred?
+        # Use deferred to keep it async
+        self.deferred_run_diff()
+
 
     def get_best_page_image_bytes(self, doc, page_num):
         """Extract High-Res or Raw image from PDF"""
@@ -1478,7 +1553,7 @@ class MainWindow(QMainWindow):
                             data = data["layoutParsingResults"][0]
                         blocks = data.get("prunedResult", {}).get("parsing_res_list", [])
                         for b in blocks:
-                            if b.get('block_label') == 'text':
+                            if b.get('block_label') in ['text','paragraph_title','vertical_text']:
                                 res.append({
                                     'text': b.get('block_content'),
                                     'bbox': b.get('block_bbox')
@@ -1499,39 +1574,66 @@ class MainWindow(QMainWindow):
         matcher = difflib.SequenceMatcher(None, left_text, self.ocr_text_full, autojunk=False)
         self.ocr_diff_opcodes = matcher.get_opcodes()
 
+    def init_diff_timer(self):
+        self.diff_timer = QTimer(self)
+        self.diff_timer.setSingleShot(True)
+        self.diff_timer.setInterval(600) # 600ms debounce
+        self.diff_timer.timeout.connect(self.run_diff_async)
+
     def run_diff(self):
+        # Compatibility wrapper
+        self.deferred_run_diff()
+
+    def deferred_run_diff(self):
+        if hasattr(self, 'diff_timer'):
+            self.diff_timer.start()
+
+    def run_diff_async(self):
         if self._is_updating_diff: return
         self._is_updating_diff = True
         
-        try:
-            text_l = self.edit_left.toPlainText()
-            text_r = self.edit_right.toPlainText()
-            
-            matcher = difflib.SequenceMatcher(None, text_l, text_r, autojunk=False)
-            opcodes = matcher.get_opcodes()
-            
-            # 将 diff 数据传递给编辑器，供交互使用
-            self.edit_left.set_diff_data(opcodes, text_r)
-            self.edit_right.set_diff_data(opcodes, text_l)
-            
-            # 渲染颜色 (使用 Highlighter)
-            # Block signals to prevent feedback loop
-            self.edit_left.blockSignals(True)
-            self.edit_right.blockSignals(True)
-            self.highlighter_left.set_diff_data(opcodes, is_left=True)
-            self.highlighter_right.set_diff_data(opcodes, is_left=False)
-            self.edit_left.blockSignals(False)
-            self.edit_right.blockSignals(False)
-            
-            # 渲染词头正则
-            self.highlighter_left.set_regex(self.project_config.get("regex_left"))
-            self.highlighter_right.set_regex(self.project_config.get("regex_right"))
-            
-            # 如果不在 OCR 模式，更新 OCR Mapping
-            if self.combo_source.currentText() != "OCR Results" and self.ocr_text_full:
-                self.run_ocr_mapping_diff(text_l)
-        finally:
-            self._is_updating_diff = False
+        text_l = self.edit_left.toPlainText()
+        text_r = self.edit_right.toPlainText()
+        
+        need_ocr_map = (self.combo_source.currentText() != "OCR Results" and bool(self.ocr_text_full))
+        
+        self.diff_worker = DiffWorker(text_l, text_r, self.ocr_text_full, need_ocr_map)
+        self.diff_worker.result_ready.connect(self.on_diff_finished)
+        self.diff_worker.finished.connect(self.on_diff_thread_finished)
+        self.diff_worker.start()
+
+    def on_diff_thread_finished(self):
+        self._is_updating_diff = False
+        self.diff_worker = None
+
+    def on_diff_finished(self, opcodes, ocr_opcodes):
+        text_l = self.edit_left.toPlainText()
+        text_r = self.edit_right.toPlainText()
+        
+        # Set Data
+        self.edit_left.set_diff_data(opcodes, text_r)
+        self.edit_right.set_diff_data(opcodes, text_l)
+        
+        # Highlight
+        self.edit_left.blockSignals(True)
+        self.edit_right.blockSignals(True)
+        self.highlighter_left.set_diff_data(opcodes, is_left=True)
+        self.highlighter_right.set_diff_data(opcodes, is_left=False)
+        self.edit_left.blockSignals(False)
+        self.edit_right.blockSignals(False)
+        
+        # Regex
+        self.highlighter_left.set_regex(self.project_config.get("regex_left"))
+        self.highlighter_right.set_regex(self.project_config.get("regex_right"))
+        
+        # OCR Mapping
+        if ocr_opcodes:
+            self.ocr_diff_opcodes = ocr_opcodes
+        else:
+            # If not calculated, maybe we use main diff if right is OCR
+            if self.combo_source.currentText() == "OCR Results":
+                 self.ocr_diff_opcodes = opcodes
+
 
 
     def highlight_editor(self, editor, opcodes, is_left):
@@ -1546,10 +1648,15 @@ class MainWindow(QMainWindow):
 
     def apply_patch(self, editor, rng, target_text):
         """应用 Diff 补丁：将 range 区间的内容替换为 target_text"""
-        start, end = rng
+        start_py, end_py = rng
+        text = editor.toPlainText()
+        
+        start_qt = to_qt_pos(text, start_py)
+        end_qt = to_qt_pos(text, end_py)
+        
         cursor = editor.textCursor()
-        cursor.setPosition(start)
-        cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+        cursor.setPosition(start_qt)
+        cursor.setPosition(end_qt, QTextCursor.MoveMode.KeepAnchor)
         cursor.insertText(target_text)
         # 插入后 textChanged 会触发，自动重新 diff
 
@@ -1578,12 +1685,22 @@ class MainWindow(QMainWindow):
                 return True
         return True
 
+    def update_memory_cache(self):
+        """Update memory dicts from editors"""
+        try:
+            page_num = int(self.spin_page.text())
+            self.pages_left[page_num] = self.edit_left.toPlainText()
+            if self.combo_source.currentText() == "Text File B":
+                 self.pages_right_text[page_num] = self.edit_right.toPlainText()
+        except: pass
+
     def on_text_changed_left(self):
         if not self._is_updating_diff:
             try:
                 p = int(self.spin_page.text())
                 self.dirty_pages_left.add(p)
             except: pass
+            self.update_memory_cache()
         self.deferred_run_diff()
         
     def on_text_changed_right(self):
@@ -1592,23 +1709,8 @@ class MainWindow(QMainWindow):
                 p = int(self.spin_page.text())
                 self.dirty_pages_right.add(p)
             except: pass
+            self.update_memory_cache()
         self.deferred_run_diff()
-
-    def deferred_run_diff(self):
-        # 每次变动都实时同步内存 (old behavior)
-        try:
-            page_num = int(self.spin_page.text())
-            # self.pages_left[page_num] = self.edit_left.toPlainText() # 不要直接改 Source，这违背了“未保存”逻辑
-            # 我们应该仅在 Save 时写入 self.pages_left / Write Dict。
-            # BUT: 程序的逻辑是 page_left 是 dict 缓存。如果切换页面不保存，这些改动就丢了。
-            # 原逻辑是实时写入 pages_left，但 pages_left 只是内存。save_left_data 才是写入磁盘。
-            # 这里的 Unsaved Prompt 指的是写入磁盘。
-            # 所以：我们继续保持实时更新 memory dict 以便运行 diff，但是 save_left_data 负责持久化。
-            self.pages_left[page_num] = self.edit_left.toPlainText()
-            if self.combo_source.currentText() == "Text File B":
-                 self.pages_right_text[page_num] = self.edit_right.toPlainText()
-        except: pass
-        self.run_diff()
 
     def on_regex_changed(self):
         self.project_config["regex_left"] = self.regex_input_left.text()
@@ -1618,25 +1720,36 @@ class MainWindow(QMainWindow):
 
     # ================= 交互增强 (Sync & Highlight) =================
 
-    def get_mapped_index(self, idx, is_left_source):
-        """获取索引映射"""
+    def get_mapped_index(self, qt_idx, is_left_source):
+        """获取索引映射 (Qt Index -> Qt Index)"""
+        # 1. Convert Src Qt -> Src Py
+        src_editor = self.edit_left if is_left_source else self.edit_right
+        src_text = src_editor.toPlainText()
+        py_idx = to_py_pos(src_text, qt_idx)
+        
         opcodes = self.edit_left.diff_opcodes
-        mapped_idx = -1
+        mapped_py_idx = -1
         
         for tag, i1, i2, j1, j2 in opcodes:
-            # src range, dst range
+            # src range, dst range (Py indices)
             s1, s2 = (i1, i2) if is_left_source else (j1, j2)
             d1, d2 = (j1, j2) if is_left_source else (i1, i2)
             
-            if s1 <= idx <= s2:
+            if s1 <= py_idx <= s2:
                 if tag == 'equal':
-                    offset = idx - s1
-                    mapped_idx = d1 + offset
-                    if mapped_idx > d2: mapped_idx = d2
+                    offset = py_idx - s1
+                    mapped_py_idx = d1 + offset
+                    if mapped_py_idx > d2: mapped_py_idx = d2
                 else:
-                    mapped_idx = d1
+                    mapped_py_idx = d1
                 break
-        return mapped_idx
+        
+        if mapped_py_idx == -1: return -1
+        
+        # 2. Convert Dst Py -> Dst Qt
+        dst_editor = self.edit_right if is_left_source else self.edit_left
+        dst_text = dst_editor.toPlainText()
+        return to_qt_pos(dst_text, mapped_py_idx)
 
     def on_scroll(self, source, target):
         """基于内容的对齐滚动"""
@@ -1709,13 +1822,16 @@ class MainWindow(QMainWindow):
         if editor == self.edit_left:
              # Use ocr_diff_opcodes (Left -> OCR)
              opcodes = getattr(self, 'ocr_diff_opcodes', [])
-             src_idx = idx
              
-             # Map src_idx to ocr_idx
+             # Convert Qt Index -> Py Index
+             text = editor.toPlainText()
+             src_py_idx = to_py_pos(text, idx)
+             
+             # Map src_py_idx to ocr_idx
              for tag, i1, i2, j1, j2 in opcodes:
-                 if i1 <= src_idx <= i2:
+                 if i1 <= src_py_idx <= i2:
                      if tag == 'equal':
-                         target_ocr_idx = j1 + (src_idx - i1)
+                         target_ocr_idx = j1 + (src_py_idx - i1)
                          if target_ocr_idx > j2: target_ocr_idx = j2
                      else:
                          target_ocr_idx = j1
@@ -1749,40 +1865,34 @@ class MainWindow(QMainWindow):
                     return
 
     def _handle_right_editor_ocr_scroll(self, editor, idx):
-        # 原有的逻辑：按行号
-        cursor = editor.textCursor()
-        line_num = cursor.blockNumber() # 0-indexed
-        if 0 <= line_num < len(self.current_ocr_data):
-            # ... (Logic to find bbox from current_ocr_data list) ...
-            # Reuse logic implicitly via creating a map first? 
-            # Actually, let's just reuse the generic map logic if possible, 
-            # BUT right editor in OCR mode is strictly line-synced.
-            item = self.current_ocr_data[line_num]
-            x, y, w, h = 0,0,0,0
-            
-            # ... Copy paste old logic ...
-            if isinstance(item, dict) and 'bbox' in item:
-                b = item['bbox']
-                x, y, w, h = b[0], b[1], b[2]-b[0], b[3]-b[1]
-            elif isinstance(item, list) and len(item) == 2:
-                pts = item[0]
-                # ...
-                xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
-                x, y = min(xs), min(ys)
-                w, h = max(xs)-x, max(ys)-y
-                
-            self.image_view.set_highlight_bbox(x, y, w, h)
+        # New Logic: Char based mapping using to_py_pos and ocr_char_map
+        text = editor.toPlainText()
+        py_idx = to_py_pos(text, idx)
+        
+        if not hasattr(self, 'ocr_char_map'): return
+        
+        for mapping in self.ocr_char_map:
+            if mapping['start_index'] <= py_idx <= mapping['end_index'] + 1:
+                bbox = mapping['bbox']
+                x, y, w, h = 0, 0, 0, 0
+                if len(bbox) == 4:
+                     x, y = bbox[0], bbox[1]
+                     w, h = bbox[2]-bbox[0], bbox[3]-bbox[1]
+                self.image_view.set_highlight_bbox(x, y, w, h)
+                return
 
     def on_cursor_left(self):
         idx = self.edit_left.textCursor().position()
         self.request_highlight_other(self.edit_left, idx)
         # 增加：检查左侧光标对应的 BBox
-        self.check_auto_scroll_bbox(self.edit_left, idx)
+        if not self._is_navigating_from_image:
+             self.check_auto_scroll_bbox(self.edit_left, idx)
 
     def on_cursor_right(self):
         idx = self.edit_right.textCursor().position()
         self.request_highlight_other(self.edit_right, idx)
-        self.check_auto_scroll_bbox(self.edit_right, idx)
+        if not self._is_navigating_from_image:
+             self.check_auto_scroll_bbox(self.edit_right, idx)
 
     # ================= 功能 =================
 
@@ -1965,6 +2075,21 @@ class MainWindow(QMainWindow):
             
         QMessageBox.information(self, "Export", f"已导出 {count} 张切片到 {out_dir}")
 
+    def export_ocr_txt(self):
+        """Export OCR text to TXT"""
+        if not self.ocr_text_full:
+             QMessageBox.warning(self, "Export", "No OCR text available.")
+             return
+        
+        filename, _ = QFileDialog.getSaveFileName(self, "Export OCR Text", "ocr_export.txt", "Text Files (*.txt)")
+        if filename:
+            try:
+                with open(filename, 'w', encoding='utf-8') as f:
+                    f.write(self.ocr_text_full)
+                QMessageBox.information(self, "Export", f"Saved to {filename}")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", str(e))
+
     def on_ocr_engine_changed(self):
         engine = self.combo_ocr_engine.currentData()
         self.global_config["ocr_engine"] = engine
@@ -2013,6 +2138,86 @@ class MainWindow(QMainWindow):
         
         self.update_project_combo()
         self.reload_all_data()
+
+    def on_editor_focus(self):
+        self.last_active_editor = self.sender()
+        
+    def on_image_bbox_click(self, ocr_idx):
+        """Handle Shift+Click on Image BBox"""
+        if not hasattr(self, 'ocr_char_map') or not self.ocr_char_map: return
+        
+        # Get Py Index from ocr_idx
+        # ocr_char_map[ocr_idx] corresponds to the block at index ocr_idx?
+        # bbox_clicked emits index in ocr_data list.
+        # But ocr_char_map is flattened per char. 
+        # Wait, I need to map `item index` to `char index`.
+        
+        # Re-check logic: 
+        # load_current_page builds ocr_char_map alongside ocr_text_full.
+        # ocr_char_map is a list of dicts.
+        # But `i` in draw_bboxes is index in `ocr_data`.
+        # `ocr_data` is list of blocks.
+        # So I need to find the char range for block `i`.
+        
+        # Since ocr_char_map is flattened characters? No.
+        # Let's check `load_current_page` logic again.
+        # Line 1337: `for item in ocr_data:`
+        # Line 1363: `self.ocr_char_map.append({...})`
+        # So `ocr_char_map` has SAME length as `ocr_data`. 
+        # It maps Block -> BBox/Indices. (It's not char map, it's Block Map!)
+        # So `ocr_idx` from click IS index in `ocr_char_map`.
+        
+        if ocr_idx < 0 or ocr_idx >= len(self.ocr_char_map): return
+        
+        data = self.ocr_char_map[ocr_idx]
+        start_py_idx = data['start_index']
+        
+        # Determine target
+        target = self.last_active_editor
+        if not target: target = self.edit_left # Default
+        
+        target_pos = -1
+        
+        if target == self.edit_right and self.combo_source.currentText() == "OCR Results":
+             # OCR Mode: Right IS OCR.
+             target_pos = to_qt_pos(self.edit_right.toPlainText(), start_py_idx)
+        else:
+             # Need Mapping: OCR -> Left
+             # opcodes: Left <-> OCR
+             opcodes = getattr(self, 'ocr_diff_opcodes', [])
+             if not opcodes: return
+             
+             # Locate Left Index corresponding to OCR Index `start_py_idx`
+             # OCR is "right" side in ocr_diff_opcodes (j1, j2)
+             left_py_idx = -1
+             for tag, i1, i2, j1, j2 in opcodes:
+                 if j1 <= start_py_idx <= j2:
+                     if tag == 'equal':
+                         left_py_idx = i1 + (start_py_idx - j1)
+                     else:
+                         left_py_idx = i1 # Approximation for changed block
+                     break
+             
+             if left_py_idx != -1:
+                 if target == self.edit_left:
+                     text = self.edit_left.toPlainText()
+                     target_pos = to_qt_pos(text, left_py_idx)
+                 else:
+                     # Target is Right (Text B)
+                     # Map Left -> Right
+                     right_qt_pos = self.get_mapped_index(to_qt_pos(self.edit_left.toPlainText(), left_py_idx), True)
+                     target_pos = right_qt_pos
+        
+        if target_pos != -1:
+            self._is_navigating_from_image = True
+            try:
+                cursor = target.textCursor()
+                cursor.setPosition(target_pos)
+                target.setTextCursor(cursor)
+                target.ensureCursorVisible()
+                target.setFocus() # Bring focus back to text
+            finally:
+                self._is_navigating_from_image = False
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
