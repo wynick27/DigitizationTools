@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QGraphicsRectItem, QGraphicsPixmapItem, QLineEdit, 
                              QFormLayout, QDialog, QDialogButtonBox, QSpinBox, 
                              QTabWidget, QToolBar, QComboBox, QCheckBox, QMenu)
-from PyQt6.QtGui import (QTextCursor, QColor, QSyntaxHighlighter, QTextCharFormat, 
+from PyQt6.QtGui import (QTextCursor, QColor, QSyntaxHighlighter, QTextCharFormat, QTextFormat,
                          QAction, QPixmap, QImage, QPainter, QBrush, QPen, QFont, QImageReader)
 from PyQt6.QtWidgets import QProgressBar
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QEvent, QThread, pyqtSlot
@@ -124,6 +124,8 @@ DEFAULT_PROJECT_CONFIG = {
     "ocr_json_path": "ocr_results",       # OCR 数据目录
     "regex_left": r"^\*\*(.*?)\*\*",
     "regex_right": r"^([a-zA-Z]*?)",
+    "regex_group_left": 0,
+    "regex_group_right": 0,
     "use_pdf_render": False,
 }
 
@@ -439,7 +441,9 @@ class DiffTextEdit(QTextEdit):
         
         selection = QTextEdit.ExtraSelection()
         selection.format.setBackground(QColor("#FFFFAA")) # 淡黄色高亮
-        selection.format.setProperty(QTextFormat.Property.FullWidthSelection, True)
+        fmt = selection.format
+        fmt.setProperty(QTextFormat.Property.FullWidthSelection, True)
+        selection.format = fmt
         selection.cursor = cursor
         selection.cursor.clearSelection() #只是定位
         
@@ -1037,7 +1041,7 @@ class BBoxMerger:
             clean_boxes.append({'x':x, 'y':y, 'w':x2-x, 'h':y2-y, 'r':x2, 'b':y2, 'page':b['page']})
             
         # Sort Y
-        clean_boxes.sort(key=lambda b: (b['y'], b['x']))
+        #clean_boxes.sort(key=lambda b: (b['y'], b['x']))
         
         merged = []
         if not clean_boxes: return []
@@ -1076,7 +1080,7 @@ class BBoxMerger:
             x, y, x2, y2 = bx[0], bx[1], bx[2], bx[3]
             clean_boxes.append({'x':x, 'y':y, 'w':x2-x, 'h':y2-y, 'r':x2, 'b':y2, 'page':b['page']})
             
-        clean_boxes.sort(key=lambda b: (-b['x'], b['y']))
+        # clean_boxes.sort(key=lambda b: (-b['x'], b['y']))
         
         merged = []
         if not clean_boxes: return []
@@ -1189,8 +1193,6 @@ class ImageStitcher:
                     full_img.loadFromData(img_bytes)
                     
                     if not full_img.isNull():
-                        # Crop
-                        # Coordinates (x,y,w,h) in OCR JSON match the source image (extracted or rendered 3x)
                         x, y, w, h = int(b['x']), int(b['y']), int(b['w']), int(b['h'])
                         img_qt = full_img.copy(x, y, w, h)
                         
@@ -1671,16 +1673,13 @@ class ProjectManagerDialog(QDialog):
         self.inp_left_txt = self.add_browse_row("Left Text:", "file", "Text (*.txt)")
         self.inp_right_txt = self.add_browse_row("Right Text:", "file", "Text (*.txt)")
         self.inp_img_dir = self.add_browse_row("Image Dir:", "dir")
-        self.inp_left_txt = self.add_browse_row("Left Text:", "file", "Text (*.txt)")
-        self.inp_right_txt = self.add_browse_row("Right Text:", "file", "Text (*.txt)")
-        self.inp_img_dir = self.add_browse_row("Image Dir:", "dir")
         self.inp_ocr_json = self.add_browse_row("OCR JSON Dir:", "dir")
         self.inp_export_dir = self.add_browse_row("Export Dir:", "dir")
         
         # 3. Numeric Fields
-        self.spin_start = QSpinBox(); self.spin_start.setRange(1, 9999); 
-        self.spin_end = QSpinBox(); self.spin_end.setRange(1, 9999);
-        self.spin_offset = QSpinBox(); self.spin_offset.setRange(-999, 999);
+        self.spin_start = QSpinBox(); self.spin_start.setRange(1, 9999)
+        self.spin_end = QSpinBox(); self.spin_end.setRange(1, 9999)
+        self.spin_offset = QSpinBox(); self.spin_offset.setRange(-999, 999)
         
         self.spin_start.valueChanged.connect(self.save_current_project)
         self.spin_end.valueChanged.connect(self.save_current_project)
@@ -1936,16 +1935,6 @@ class MainWindow(QMainWindow):
         else:
             event.ignore()
         
-    def load_config(self):
-        # Deprecated: Handled by ConfigManager
-        self.config_manager.load()
-        self.global_config = self.config_manager.get_global()
-        self.project_config = self.config_manager.get_active_project()
-            
-    def save_config(self):
-        # Deprecated: Handled by ConfigManager
-        self.config_manager.save()
-
     def init_ui(self):
         # --- 工具栏 ---
         toolbar = QToolBar()
@@ -2181,6 +2170,7 @@ class MainWindow(QMainWindow):
         self.pages_right_text = read_text_to_pages(self.project_config['text_path_right'])
         
         # 2. 加载 PDF
+        self.doc = None
         if self.project_config['pdf_path'] and os.path.exists(self.project_config['pdf_path']):
             try:
                 self.doc = fitz.open(self.project_config['pdf_path'])
@@ -2457,14 +2447,6 @@ class MainWindow(QMainWindow):
                  self.ocr_diff_opcodes = opcodes
 
 
-
-    def highlight_editor(self, editor, opcodes, is_left):
-        # Deprecated: Logic moved to DiffSyntaxHighlighter
-        pass
-
-    def highlight_regex(self, editor, regex_str):
-        # Deprecated: Logic moved to DiffSyntaxHighlighter
-        pass
 
     # ================= 交互 =================
 
@@ -2940,7 +2922,7 @@ class MainWindow(QMainWindow):
              data = self.load_ocr_json(p) # Takes user page num
              if data:
                  t = self._extract_text_from_ocr_data(data)
-                 full_text += f"<Page {p}>\n{t}\n"
+                 full_text += f"<{p}>\n{t}\n"
                  
         filename, _ = QFileDialog.getSaveFileName(self, "Export All OCR", "all_ocr.txt", "Text Files (*.txt)")
         if filename:
