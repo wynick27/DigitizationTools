@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QMessageBox, QLineEdit, QPushButton, QComboBox, QCheckBox,
                              QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsRectItem,
                              QDialog, QFormLayout, QTabWidget, QListWidget, QDialogButtonBox, QInputDialog,
-                             QSpinBox)
+                             QSpinBox, QMenu)
 from PyQt6.QtGui import (QAction, QColor, QFont, QImage, QPixmap, QPen, QTextCursor, 
                          QTextCharFormat, QCursor, QTextFormat, QSyntaxHighlighter)
 from PyQt6.QtWidgets import QProgressBar
@@ -225,7 +225,10 @@ class DiffSyntaxHighlighter(QSyntaxHighlighter):
         super().__init__(document)
         self.diff_ranges = [] # List of tuples (start, end)
         self.diff_starts = [] # List of start positions for bisect
+        self.diff_ranges = [] # List of tuples (start, end)
+        self.diff_starts = [] # List of start positions for bisect
         self.regex_pattern = None
+        self.regex_group = 0
         
         # 预定义格式
         self.diff_fmt = QTextCharFormat()
@@ -234,6 +237,11 @@ class DiffSyntaxHighlighter(QSyntaxHighlighter):
         
         self.regex_fmt = QTextCharFormat()
         self.regex_fmt.setBackground(QColor("#E0F0FF")) # 浅蓝
+        
+        # Merge Format (Diff FG + Regex BG)
+        self.both_fmt = QTextCharFormat()
+        self.both_fmt.setForeground(QColor("red"))
+        self.both_fmt.setBackground(QColor("#E0F0FF"))
         
     def set_diff_data(self, opcodes, is_left):
         self.diff_ranges = []
@@ -251,7 +259,7 @@ class DiffSyntaxHighlighter(QSyntaxHighlighter):
         self.diff_starts = [r[0] for r in self.diff_ranges]
         self.rehighlight()
         
-    def set_regex(self, regex_str):
+    def set_regex(self, regex_str, group_id=0):
         if not regex_str:
             self.regex_pattern = None
         else:
@@ -259,66 +267,85 @@ class DiffSyntaxHighlighter(QSyntaxHighlighter):
                 self.regex_pattern = re.compile(regex_str)
             except:
                 self.regex_pattern = None
+        self.regex_group = group_id
         self.rehighlight()
 
     def highlightBlock(self, text):
-        if not self.diff_ranges and not self.regex_pattern: return
+        length = len(text)
+        if length == 0: return
+
+        # Optimization: use boolean array to track states
+        has_diff = [False] * length
+        has_regex = [False] * length
         
-        block = self.currentBlock()
-        block_start = block.position()
-        block_len = len(text)
-        block_end = block_start + block_len
+        block_start = self.currentBlock().position()
+        block_end = block_start + length
         
-        # 1. Diff Highlighting (Optimized with Bisect)
+        # 1. Fill Diff
         if self.diff_ranges:
-            # Find range of opcodes that might overlap with this block.
-            # bisect_right returns insertion point after x to maintain order.
-            # Any range starting >= block_end essentially cannot overlap (except edge case empty range? invalid here).
             end_idx = bisect.bisect_right(self.diff_starts, block_end)
-            
-            # Where to start?
-            # We need to find the first range that ends > block_start.
-            # Since we only have starts list, we can't do exact bisect on ends.
-            # But diffs are usually sequential. The ranges ending before block_start 
-            # likely have start < block_start.
-            # Let's iterate backwards from end_idx or just check a window. 
-            # Or just iterate from 0 to end_idx? If end_idx is huge, bad.
-            # BUT: In a diff, ranges are strictly increasing.
-            # So range[i].end < range[i+1].start usually (unless strictly overlapping... diff opcodes don't overlap).
-            # So we can just bisect_right find the UPPER bound.
-            # And for lower bound:
-            # The range immediately causing overlap could start way before.
-            # But opcodes don't overlap.
-            # So we can look at bisect_right(starts, block_start) - 1.
-            
             start_search = bisect.bisect_right(self.diff_starts, block_start)
-            if start_search > 0:
-                start_search -= 1 # check the one that started before block
+            if start_search > 0: start_search -= 1
             
-            # Safety cap
             count = 0 
             for i in range(start_search, end_idx):
-                if count > 1000: break # Safety break
+                if count > 1000: break 
                 s, e = self.diff_ranges[i]
                 
-                # Intersect
                 intersect_start = max(s, block_start)
                 intersect_end = min(e, block_end)
                 
                 if intersect_start < intersect_end:
-                    rel_start = intersect_start - block_start
-                    rel_len = intersect_end - intersect_start
-                    self.setFormat(rel_start, rel_len, self.diff_fmt)
-                
+                    rel_s = intersect_start - block_start
+                    rel_e = intersect_end - block_start
+                    has_diff[rel_s:rel_e] = [True] * (rel_e - rel_s)
                 count += 1
         
-        # 2. Regex Highlighting
+        # 2. Fill Regex
         if self.regex_pattern:
             count = 0
             for match in self.regex_pattern.finditer(text):
                 if count > 100: break 
-                self.setFormat(match.start(), match.end() - match.start(), self.regex_fmt)
+                try:
+                    s, e = match.start(self.regex_group), match.end(self.regex_group)
+                except IndexError:
+                    # Fallback if group not found
+                    s, e = match.start(), match.end()
+                    
+                # Bound checks although finditer on text should be within text
+                s = max(0, s); e = min(length, e)
+                if s < e:
+                    has_regex[s:e] = [True] * (e - s)
                 count += 1
+
+        # 3. Apply Formats
+        # Run-Length Encoding approach to minimize setFormat calls
+        current_start = 0
+        current_type = (has_diff[0], has_regex[0]) 
+        
+        for i in range(1, length):
+            new_type = (has_diff[i], has_regex[i])
+            if new_type != current_type:
+                self.apply_format_chunk(current_start, i - current_start, current_type)
+                current_start = i
+                current_type = new_type
+        
+        self.apply_format_chunk(current_start, length - current_start, current_type)
+
+    def apply_format_chunk(self, start, length, flags):
+        is_diff, is_regex = flags
+        if not is_diff and not is_regex: return
+        
+        fmt = None
+        if is_diff and is_regex:
+            fmt = self.both_fmt
+        elif is_diff:
+            fmt = self.diff_fmt
+        elif is_regex:
+            fmt = self.regex_fmt
+            
+        if fmt:
+            self.setFormat(start, length, fmt)
 
 
 class DiffTextEdit(QTextEdit):
@@ -772,6 +799,140 @@ class DiffWorker(QThread):
              
         self.result_ready.emit(opcodes, ocr_opcodes)
 
+# ==========================================
+# 4. 导出逻辑 (Generic Parser)
+# ==========================================
+
+class ExportParser:
+    def __init__(self, pages_dict: dict, regex_str: str, group_id: int = 0):
+        self.pages_dict = pages_dict # {page_num: text}
+        self.group_id = group_id
+        if regex_str:
+            try:
+                self.regex = re.compile(regex_str)
+            except:
+                self.regex = None
+        else:
+            self.regex = None
+        
+    def parse(self):
+        """
+        Returns list of entries:
+        [
+            {
+                "headword": str,
+                "text": str, # merged text
+                "pages": [int],
+                "page_index": int
+            }, ...
+        ]
+        """
+        entries = []
+        if not self.pages_dict or not self.regex: 
+            return entries
+            
+        sorted_pages = sorted(self.pages_dict.keys())
+        current_entry = None
+        
+        # Buffer for text that appears before first headword on non-first page
+        # This text belongs to the PREVIOUS entry (if exists)
+        
+        for page_num in sorted_pages:
+            page_text = self.pages_dict[page_num]
+            lines = page_text.split('\n')
+            
+            # Find all headwords in this page
+            page_headword_indices = [] # list of (line_idx, match_obj)
+            for i, line in enumerate(lines):
+                m = self.regex.search(line)
+                if m:
+                    page_headword_indices.append((i, m))
+                    
+            if not page_headword_indices:
+                # Whole page has no headword -> append to current entry
+                if current_entry:
+                    self._append_text_to_entry(current_entry, lines, page_num)
+                # Else: Orphan text? (Before first entry of first page... ignore or new entry?)
+                continue
+                
+            # Process segments
+            prev_line_idx = 0
+            
+            # 1. Text BEFORE first headword on this page
+            first_hw_line_idx = page_headword_indices[0][0]
+            if first_hw_line_idx > 0:
+                pre_text_lines = lines[0:first_hw_line_idx]
+                if current_entry:
+                    self._append_text_to_entry(current_entry, pre_text_lines, page_num)
+                
+            # 2. Iterate headwords
+            for k, (line_idx, match) in enumerate(page_headword_indices):
+                try:
+                    headword = match.group(self.group_id)
+                except IndexError:
+                    headword = match.group(0)
+                    
+                # Content for this entry ranges from line_idx to next_headword_line_idx
+                
+                content_lines = []
+                line_content = lines[line_idx]
+                content_lines.append(line_content)
+                
+                # Content from next lines
+                start_next = line_idx + 1
+                end_next = len(lines) 
+                
+                if k < len(page_headword_indices) - 1:
+                    end_next = page_headword_indices[k+1][0]
+                    
+                content_lines.extend(lines[start_next:end_next])
+                
+                current_entry = {
+                    "headword": headword,
+                    "text": "", 
+                    "pages": [page_num], # Set
+                    "page_index": k + 1
+                }
+                entries.append(current_entry)
+                
+                # Add content
+                self._append_text_to_entry(current_entry, content_lines, page_num)
+             
+        return entries
+
+    def _append_text_to_entry(self, entry, lines, page_num):
+        # Filter empty lines
+        valid_lines = [l.strip() for l in lines if l.strip()]
+        if not valid_lines: return
+        
+        # Add page number if not present
+        if page_num not in entry["pages"]:
+            entry["pages"].append(page_num)
+            
+        text_chunk = "\n".join(valid_lines)
+        
+        # Merge logic
+        if not entry["text"]:
+            entry["text"] = text_chunk
+        else:
+            # Check previous text ending
+            prev_text = entry["text"]
+            if prev_text.endswith('-'):
+                # Hyphen: Remove hyphen, join directly
+                entry["text"] = prev_text[:-1] + text_chunk
+            else:
+                last_char = prev_text[-1]
+                # CJK Check (Simple range)
+                is_cjk = ('\u4e00' <= last_char <= '\u9fff')
+                
+                if is_cjk:
+                    entry["text"] = prev_text + text_chunk
+                else:
+                    entry["text"] = prev_text + " " + text_chunk
+                    
+
+# ==========================================
+
 
 
 # ==========================================
@@ -916,7 +1077,11 @@ class ProjectManagerDialog(QDialog):
         self.inp_left_txt = self.add_browse_row("Left Text:", "file", "Text (*.txt)")
         self.inp_right_txt = self.add_browse_row("Right Text:", "file", "Text (*.txt)")
         self.inp_img_dir = self.add_browse_row("Image Dir:", "dir")
+        self.inp_left_txt = self.add_browse_row("Left Text:", "file", "Text (*.txt)")
+        self.inp_right_txt = self.add_browse_row("Right Text:", "file", "Text (*.txt)")
+        self.inp_img_dir = self.add_browse_row("Image Dir:", "dir")
         self.inp_ocr_json = self.add_browse_row("OCR JSON Dir:", "dir")
+        self.inp_export_dir = self.add_browse_row("Export Dir:", "dir")
         
         # 3. Numeric Fields
         self.spin_start = QSpinBox(); self.spin_start.setRange(1, 9999); 
@@ -937,8 +1102,17 @@ class ProjectManagerDialog(QDialog):
         self.inp_reg_l.editingFinished.connect(self.save_current_project)
         self.inp_reg_r.editingFinished.connect(self.save_current_project)
         
-        self.form_layout.addRow("Regex Left:", self.inp_reg_l)
-        self.form_layout.addRow("Regex Right:", self.inp_reg_r)
+        # Group IDs
+        self.spin_reg_grp_l = QSpinBox(); self.spin_reg_grp_l.setRange(0, 99);
+        self.spin_reg_grp_r = QSpinBox(); self.spin_reg_grp_r.setRange(0, 99);
+        self.spin_reg_grp_l.valueChanged.connect(self.save_current_project)
+        self.spin_reg_grp_r.valueChanged.connect(self.save_current_project)
+
+        h_l = QHBoxLayout(); h_l.addWidget(self.inp_reg_l); h_l.addWidget(QLabel("Grp:")); h_l.addWidget(self.spin_reg_grp_l)
+        h_r = QHBoxLayout(); h_r.addWidget(self.inp_reg_r); h_r.addWidget(QLabel("Grp:")); h_r.addWidget(self.spin_reg_grp_r)
+        
+        self.form_layout.addRow("Regex Left:", h_l)
+        self.form_layout.addRow("Regex Right:", h_r)
         
         layout.addWidget(self.form_widget, 2)
         
@@ -1017,7 +1191,9 @@ class ProjectManagerDialog(QDialog):
         self.inp_img_dir.setText(p.get("image_dir", ""))
         self.inp_left_txt.setText(p.get("text_path_left", ""))
         self.inp_right_txt.setText(p.get("text_path_right", ""))
+        self.inp_right_txt.setText(p.get("text_path_right", ""))
         self.inp_ocr_json.setText(p.get("ocr_json_path", ""))
+        self.inp_export_dir.setText(p.get("export_dir", ""))
         
         self.spin_start.setValue(int(p.get("start_page", 1)))
         self.spin_end.setValue(int(p.get("end_page", 1)))
@@ -1025,6 +1201,8 @@ class ProjectManagerDialog(QDialog):
         
         self.inp_reg_l.setText(p.get("regex_left", ""))
         self.inp_reg_r.setText(p.get("regex_right", ""))
+        self.spin_reg_grp_l.setValue(int(p.get("regex_group_left", 0)))
+        self.spin_reg_grp_r.setValue(int(p.get("regex_group_right", 0)))
         self.block_signals_inputs(False)
 
     def save_current_project(self):
@@ -1059,7 +1237,9 @@ class ProjectManagerDialog(QDialog):
         p["image_dir"] = self.inp_img_dir.text()
         p["text_path_left"] = self.inp_left_txt.text()
         p["text_path_right"] = self.inp_right_txt.text()
+        p["text_path_right"] = self.inp_right_txt.text()
         p["ocr_json_path"] = self.inp_ocr_json.text()
+        p["export_dir"] = self.inp_export_dir.text()
         
         p["start_page"] = self.spin_start.value()
         p["end_page"] = self.spin_end.value()
@@ -1067,6 +1247,8 @@ class ProjectManagerDialog(QDialog):
         
         p["regex_left"] = self.inp_reg_l.text()
         p["regex_right"] = self.inp_reg_r.text()
+        p["regex_group_left"] = self.spin_reg_grp_l.value()
+        p["regex_group_right"] = self.spin_reg_grp_r.value()
         
         self.config_manager.save()
         
@@ -1077,8 +1259,9 @@ class ProjectManagerDialog(QDialog):
 
     def block_signals_inputs(self, block):
         inputs = [self.inp_pdf, self.inp_img_dir, self.inp_left_txt, self.inp_right_txt, 
-                  self.inp_ocr_json, self.inp_reg_l, self.inp_reg_r, self.inp_name,
-                  self.spin_start, self.spin_end, self.spin_offset]
+                  self.inp_ocr_json, self.inp_export_dir, self.inp_reg_l, self.inp_reg_r, self.inp_name,
+                  self.spin_start, self.spin_end, self.spin_offset,
+                  self.spin_reg_grp_l, self.spin_reg_grp_r]
         for inp in inputs:
             inp.blockSignals(block)
 
@@ -1114,7 +1297,7 @@ class ProjectManagerDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("OCR 校对工具 v4 (PyQt6 Refactor)")
+        self.setWindowTitle("OCR 校对工具 v6")
         self.resize(1600, 900)
         
         self.resize(1600, 900)
@@ -1237,13 +1420,29 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.btn_batch)
 
         
-        btn_export = QPushButton("导出切图")
-        btn_export.clicked.connect(self.export_slices)
-        toolbar.addWidget(btn_export)
         
-        btn_export_txt = QPushButton("导出OCR文本")
-        btn_export_txt.clicked.connect(self.export_ocr_txt)
-        toolbar.addWidget(btn_export_txt)
+        # Export Menu Button
+        self.btn_export_menu = QPushButton("Export...")
+        self.menu_export = QMenu(self)
+        
+        # Actions
+        def add_action(text, func):
+            a = QAction(text, self)
+            a.triggered.connect(func)
+            self.menu_export.addAction(a)
+            
+        add_action("Export Current Page Slices", self.export_slices)
+        add_action("Export Current OCR Text (TXT)", self.export_ocr_dict_current)
+        self.menu_export.addSeparator()
+        add_action("Export ALL OCR Text (TXT)", self.export_all_ocr_txt)
+        self.menu_export.addSeparator()
+        add_action("Export LEFT Text (.json)", lambda: self.export_parsed("left", "json"))
+        add_action("Export RIGHT Text (.json)", lambda: self.export_parsed("right", "json"))
+        add_action("Export LEFT Text (.mdx.txt)", lambda: self.export_parsed("left", "mdx"))
+        add_action("Export RIGHT Text (.mdx.txt)", lambda: self.export_parsed("right", "mdx"))
+        
+        self.btn_export_menu.setMenu(self.menu_export)
+        toolbar.addWidget(self.btn_export_menu)
 
         # --- 主布局 ---
         main_widget = QWidget()
@@ -1277,8 +1476,21 @@ class MainWindow(QMainWindow):
         
         regex_layout.addWidget(QLabel("L正则:"))
         regex_layout.addWidget(self.regex_input_left)
+        
+        self.spin_reg_grp_l = QSpinBox()
+        self.spin_reg_grp_l.setRange(0, 99)
+        self.spin_reg_grp_l.setValue(self.project_config.get("regex_group_left", 0))
+        self.spin_reg_grp_l.valueChanged.connect(self.on_regex_changed)
+        regex_layout.addWidget(self.spin_reg_grp_l)
+        
         regex_layout.addWidget(QLabel("R正则:"))
         regex_layout.addWidget(self.regex_input_right)
+        
+        self.spin_reg_grp_r = QSpinBox()
+        self.spin_reg_grp_r.setRange(0, 99)
+        self.spin_reg_grp_r.setValue(self.project_config.get("regex_group_right", 0))
+        self.spin_reg_grp_r.valueChanged.connect(self.on_regex_changed)
+        regex_layout.addWidget(self.spin_reg_grp_r)
         
         right_layout.addLayout(regex_layout)
         
@@ -1478,6 +1690,10 @@ class MainWindow(QMainWindow):
         if not hasattr(self, 'diff_timer'):
              self.init_diff_timer()
         
+        # Regex (Update Highlighters with Group ID)
+        self.highlighter_left.set_regex(self.project_config.get("regex_left"), self.project_config.get("regex_group_left", 0))
+        self.highlighter_right.set_regex(self.project_config.get("regex_right"), self.project_config.get("regex_group_right", 0))
+
         # Force run immediately for first load? Or use deferred?
         # Use deferred to keep it async
         self.deferred_run_diff()
@@ -1623,8 +1839,9 @@ class MainWindow(QMainWindow):
         self.edit_right.blockSignals(False)
         
         # Regex
-        self.highlighter_left.set_regex(self.project_config.get("regex_left"))
-        self.highlighter_right.set_regex(self.project_config.get("regex_right"))
+        # Regex
+        self.highlighter_left.set_regex(self.project_config.get("regex_left"), self.project_config.get("regex_group_left", 0))
+        self.highlighter_right.set_regex(self.project_config.get("regex_right"), self.project_config.get("regex_group_right", 0))
         
         # OCR Mapping
         if ocr_opcodes:
@@ -1715,7 +1932,14 @@ class MainWindow(QMainWindow):
     def on_regex_changed(self):
         self.project_config["regex_left"] = self.regex_input_left.text()
         self.project_config["regex_right"] = self.regex_input_right.text()
+        self.project_config["regex_group_left"] = self.spin_reg_grp_l.value()
+        self.project_config["regex_group_right"] = self.spin_reg_grp_r.value()
         self.config_manager.save()
+        
+        # Update Highlighters
+        self.highlighter_left.set_regex(self.project_config["regex_left"], self.project_config["regex_group_left"])
+        self.highlighter_right.set_regex(self.project_config["regex_right"], self.project_config["regex_group_right"])
+        
         self.run_diff()
 
     # ================= 交互增强 (Sync & Highlight) =================
@@ -2089,6 +2313,110 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "Export", f"Saved to {filename}")
             except Exception as e:
                 QMessageBox.critical(self, "Error", str(e))
+
+    def export_ocr_dict_current(self):
+        # Alias for old export_ocr_txt but explicit
+        self.export_ocr_txt()
+
+    def export_all_ocr_txt(self):
+        # Dump all available OCR jsons to single text? Or per page?
+        # Usually user wants all text concatenated.
+        save_dir = self.project_config.get("ocr_json_path", "ocr_results")
+        start = self.project_config.get("start_page", 1)
+        end = self.project_config.get("end_page", 100)
+        
+        full_text = ""
+        for p in range(start, end + 1):
+             real_p = p + self.project_config.get("page_offset", 0)
+             # Reuse load_ocr_json logic? But that returns list. 
+             # We need generic method to get text from page.
+             # load_current_page logic duplicates this.
+             # Let's simple load
+             data = self.load_ocr_json(p) # Takes user page num
+             if data:
+                 t = self._extract_text_from_ocr_data(data)
+                 full_text += f"<Page {p}>\n{t}\n"
+                 
+        filename, _ = QFileDialog.getSaveFileName(self, "Export All OCR", "all_ocr.txt", "Text Files (*.txt)")
+        if filename:
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(full_text)
+            QMessageBox.information(self, "Done", "Exported all OCR text.")
+
+    def _extract_text_from_ocr_data(self, ocr_data):
+        # Helper to join text from list
+        txt = []
+        for item in ocr_data:
+             if isinstance(item, dict): txt.append(item.get('text', ''))
+             elif isinstance(item, list): txt.append(item[1][0])
+        return "\n".join(txt)
+        
+    def export_parsed(self, side, fmt):
+        """Export parsed JSON/MDX"""
+        # 1. Get Pages Dict
+        pages = self.pages_left if side == 'left' else self.pages_right_text
+        if not pages:
+            QMessageBox.warning(self, "Error", f"No data for {side} side.")
+            return
+            
+        # 2. Get Regex
+        reg = self.project_config.get("regex_left" if side == 'left' else "regex_right")
+        if not reg:
+            QMessageBox.warning(self, "Error", f"No regex configured for {side} side.")
+            return
+            
+        grp = self.project_config.get("regex_group_left" if side == 'left' else "regex_group_right", 0)
+            
+        # 3. Parse
+        try:
+            parser = ExportParser(pages, reg, grp)
+            entries = parser.parse()
+            
+            if not entries:
+                QMessageBox.warning(self, "Result", "No entries parsing found (check regex).")
+                return
+                
+                
+            # 4. Save
+            project_name = self.project_config.get("name", "project")
+            base_name = f"{project_name}_{side}.{fmt if fmt=='json' else 'txt'}"
+            
+            export_dir = self.project_config.get("export_dir")
+            filename = ""
+            
+            if export_dir and os.path.exists(export_dir):
+                filename = os.path.join(export_dir, base_name)
+                if not self._confirm_overwrite_if_exists(filename): return
+            else:
+                filename, _ = QFileDialog.getSaveFileName(self, f"Export {side.upper()} {fmt.upper()}", base_name, 
+                                                          f"{fmt.upper()} (*.{fmt if fmt=='json' else 'txt'})")
+            
+            if not filename: return
+
+            with open(filename, 'w', encoding='utf-8') as f:
+                if fmt == 'json':
+                    json.dump(entries, f, ensure_ascii=False, indent=2)
+                elif fmt == 'mdx':
+                    for e in entries:
+                        f.write(f"{e['headword']}\n")
+                        f.write(f"{e['text']}\n")
+                        f.write("</>\n")
+                        
+            QMessageBox.information(self, "Success", f"Exported {len(entries)} entries to {filename}")
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(self, "Error", str(e))
+
+    def _confirm_overwrite_if_exists(self, filename):
+        if os.path.exists(filename):
+             ret = QMessageBox.question(self, "Overwrite", f"File exists:\n{filename}\nOverwrite?", 
+                                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+             return ret == QMessageBox.StandardButton.Yes
+        return True
+            
+
 
     def on_ocr_engine_changed(self):
         engine = self.combo_ocr_engine.currentData()
