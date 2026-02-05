@@ -9,7 +9,7 @@ import base64
 import time
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QTextEdit, QLabel, QPushButton, QSplitter, QFileDialog, QInputDialog,
+                             QTextEdit, QPlainTextEdit, QLabel, QPushButton, QSplitter, QFileDialog, QInputDialog,
                              QMessageBox, QListWidget, QGraphicsView, QGraphicsScene, 
                              QGraphicsRectItem, QGraphicsPixmapItem, QLineEdit, 
                              QFormLayout, QDialog, QDialogButtonBox, QSpinBox, 
@@ -403,7 +403,7 @@ class DiffSyntaxHighlighter(QSyntaxHighlighter):
             self.setFormat(start, length, fmt)
 
 
-class DiffTextEdit(QTextEdit):
+class DiffTextEdit(QPlainTextEdit):
     """
     支持 Ctrl+Hover 高亮和 Ctrl+Click 应用补丁的文本框
     """
@@ -1576,7 +1576,7 @@ class FileHeaderWidget(QWidget):
                 self.main_window.project_config['text_path_left'] = filename
             else:
                 self.main_window.project_config['text_path_right'] = filename
-            self.main_window.save_config()
+            self.main_window.config_manager.save()
             self.main_window.reload_all_data()
 
     def save_file(self):
