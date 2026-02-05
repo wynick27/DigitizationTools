@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
 from PyQt6.QtGui import (QTextCursor, QColor, QSyntaxHighlighter, QTextCharFormat, QTextFormat,
                          QAction, QPixmap, QImage, QPainter, QBrush, QPen, QFont, QImageReader)
 from PyQt6.QtWidgets import QProgressBar
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QEvent, QThread, pyqtSlot
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QEvent, QThread, pyqtSlot, QMimeData
 import bisect
 
 
@@ -410,12 +410,19 @@ class DiffTextEdit(QPlainTextEdit):
     focus_in_signal = pyqtSignal()
     # 信号：点击了某个 Diff 块，请求应用到另一侧 (self_index_range, target_text)
     apply_patch_signal = pyqtSignal(tuple, str)
+    # 信号：Alt+Click 将本侧内容推送到另一侧 (target_range, my_content)
+    push_patch_signal = pyqtSignal(tuple, str)
 
     def focusInEvent(self, event):
         self.focus_in_signal.emit()
         super().focusInEvent(event)
-    # 信号：Alt+Click 将本侧内容推送到另一侧 (target_range, my_content)
-    push_patch_signal = pyqtSignal(tuple, str)
+    
+    # Signals for hover and click
+    patch_clicked = pyqtSignal(object) # opcode
+    push_clicked = pyqtSignal(object) # opcode
+    
+    # Signal for Sync Merge Actions: (indices_list, action_type)
+    merge_action_signal = pyqtSignal(list, str)
     
     def __init__(self, side="left"):
         super().__init__()
@@ -506,6 +513,20 @@ class DiffTextEdit(QPlainTextEdit):
         self.setExtraSelections([])
 
     def mousePressEvent(self, event):
+        # Merge Mode Interaction
+        if getattr(self, 'is_merge_mode', False):
+            cursor = self.cursorForPosition(event.pos())
+            modifiers = QApplication.keyboardModifiers()
+            
+            if modifiers & Qt.KeyboardModifier.ControlModifier:
+                # Ctrl+Click: Apply (Accept Insert, Remove Delete)
+                self.handle_merge_click(cursor, action='apply')
+                return
+            elif modifiers & Qt.KeyboardModifier.AltModifier:
+                # Alt+Click: Reject (Remove Insert, Restore Delete)
+                self.handle_merge_click(cursor, action='reject')
+                return
+                
         # 处理 Ctrl + Click
         modifiers = QApplication.keyboardModifiers()
         if (modifiers & Qt.KeyboardModifier.ControlModifier) and event.button() == Qt.MouseButton.LeftButton:
@@ -569,6 +590,256 @@ class DiffTextEdit(QPlainTextEdit):
             
         # 发射信号: (目标区间, 要替换成的内容)
         self.push_patch_signal.emit(target_range, text_to_push)
+
+    def enter_merge_mode(self, merged_text, formats):
+        """
+        进入合并视图模式：
+        1. 备份当前文本
+        2. 设置为 merged_text
+        3. 应用 formats (Green for Insert, Red Strike for Delete)
+        4. 设置只读
+        """
+        self.original_text_backup = self.toPlainText()
+        self.setPlainText(merged_text)
+        self.setReadOnly(True)
+        self.is_merge_mode = True
+        self.merge_cursors = [] # List of {'type': 'insert'|'delete', 'cursor': QTextCursor}
+        
+        # Cursor & Format Setup
+        cursor = self.textCursor()
+        
+        # Colors
+        bg_insert = QColor("#E6FFE6") # Light Green
+        bg_delete = QColor("#FFE6E6") # Light Red
+        
+        fmt_insert = QTextCharFormat()
+        fmt_insert.setForeground(QColor("green"))
+        fmt_insert.setBackground(bg_insert)
+        
+        fmt_delete = QTextCharFormat()
+        fmt_delete.setForeground(QColor("red"))
+        fmt_delete.setBackground(bg_delete)
+        fmt_delete.setFontStrikeOut(True)
+        
+        for start, length, ftype in formats:
+            # Create persistent cursor for this chunk
+            chunk_cursor = QTextCursor(self.document())
+            chunk_cursor.setPosition(start)
+            chunk_cursor.movePosition(QTextCursor.MoveOperation.Right, QTextCursor.MoveMode.KeepAnchor, length)
+            
+            self.merge_cursors.append({
+                'type': ftype,
+                'cursor': chunk_cursor
+            })
+            
+            if ftype == 'insert':
+                chunk_cursor.setCharFormat(fmt_insert)
+            elif ftype == 'delete':
+                chunk_cursor.setCharFormat(fmt_delete)
+
+    def exit_merge_mode(self, commit=True):
+        """
+        退出合并视图：
+        commit=True: 提交当前的修改状态（保留已接受的更改，移除未接受的插入，保留未接受的删除）。
+        commit=False: 丢弃所有修改，恢复备份。
+        """
+        self.is_merge_mode = False
+        
+        if not commit:
+            # Discard changes, restore backup
+            if hasattr(self, 'original_text_backup') and self.original_text_backup is not None:
+                self.setPlainText(self.original_text_backup)
+                self.original_text_backup = None
+            has_changes = False
+        else:
+            # Commit Logic
+            # Check if effective text changed?
+            # Easiest way: Compare current plain text (after cleanup) with backup.
+            # But we haven't cleaned up yet.
+            
+            # 1. Gather pending inserts
+            pending_inserts = [item['cursor'] for item in self.merge_cursors if item['type'] == 'insert']
+            
+            # 2. Sort by position descending to remove safely
+            pending_inserts.sort(key=lambda c: c.selectionStart(), reverse=True)
+            
+            # 3. Remove them
+            for c in pending_inserts:
+                c.removeSelectedText()
+            
+            # Now text is "final". Compare with backup.
+            current_text = self.toPlainText()
+            has_changes = (current_text != self.original_text_backup)
+            
+            self.original_text_backup = None # Discard backup (We committed changes)
+            
+        self.merge_cursors = []
+        
+        # Reset Format to defaults
+        cursor = self.textCursor()
+        cursor.select(QTextCursor.SelectionType.Document)
+        fmt = QTextCharFormat() # Clean format
+        cursor.setCharFormat(fmt)
+        self.setCurrentCharFormat(fmt)
+        
+        self.setReadOnly(False)
+        return has_changes
+
+    def handle_merge_click(self, click_cursor, action):
+        """
+        Find which chunk is clicked and apply action.
+        If the chunk is part of a Replace (Insert + Delete pair), handle both.
+        """
+        pos = click_cursor.position()
+        target_idx = -1
+        target = None
+        
+        # Iterate cursors to find match
+        for i, item in enumerate(self.merge_cursors):
+            c = item['cursor']
+            if c.selectionStart() <= pos <= c.selectionEnd():
+                target = item
+                target_idx = i
+                break
+        
+        if not target: return
+        
+        # Check for adjacent companion (Atomic Replace)
+        group = [target_idx]
+        
+        # Check Next
+        if target_idx + 1 < len(self.merge_cursors):
+            nex = self.merge_cursors[target_idx+1]
+            if target['cursor'].selectionEnd() == nex['cursor'].selectionStart():
+                if target['type'] != nex['type']:
+                    group.append(target_idx + 1)
+        
+        # Check Prev
+        if len(group) == 1 and target_idx - 1 >= 0:
+            prev = self.merge_cursors[target_idx-1]
+            if prev['cursor'].selectionEnd() == target['cursor'].selectionStart():
+                 if target['type'] != prev['type']:
+                     group.append(target_idx - 1)
+                     
+        group.sort(reverse=True)
+        
+        # Execute Locally
+        self.execute_merge_action(group, action)
+        
+        # Broadcast Sync
+        self.merge_action_signal.emit(group, action)
+
+    def apply_sync_merge_action(self, indices, action):
+        """
+        Slot to receive sync action from other editor.
+        Because Right Editor is a "Reverse Diff" of Left Editor (and vice versa),
+        the actions must be INVERTED to maintain state consistency.
+        Apply <-> Reject.
+        """
+        if not getattr(self, 'is_merge_mode', False): return
+        
+        # Invert Action
+        my_action = 'reject' if action == 'apply' else 'apply'
+        self.execute_merge_action(indices, my_action)
+
+    def execute_merge_action(self, indices, action):
+        """
+        Core logic to apply/reject logic on specific cursor indices.
+        Indices must be sorted descending to avoid shift issues (though we use objects from list).
+        Waits, indices refer to self.merge_cursors list. 
+        If side A and Side B are in sync, self.merge_cursors should be identical in content and order.
+        """
+        # Validate indices
+        valid_indices = [i for i in indices if 0 <= i < len(self.merge_cursors)]
+        if not valid_indices: return
+        
+        # Retrieve items first
+        items_to_process = [self.merge_cursors[i] for i in valid_indices]
+        
+        for item in items_to_process:
+            c = item['cursor']
+            ctype = item['type']
+            
+            if action == 'apply':
+                # Apply Change
+                if ctype == 'insert':
+                    # Accept Insertion: Make it normal text
+                    fmt = QTextCharFormat() # Clear
+                    c.setCharFormat(fmt)
+                elif ctype == 'delete':
+                    # Accept Deletion: Remove text
+                    c.removeSelectedText()
+                    
+            elif action == 'reject':
+                # Reject Change
+                if ctype == 'insert':
+                    # Reject Insertion: Remove text
+                    c.removeSelectedText()
+                elif ctype == 'delete':
+                    # Reject Deletion: Keep text
+                    fmt = QTextCharFormat() # Clear
+                    c.setCharFormat(fmt)
+
+            # Remove from list
+            try:
+                self.merge_cursors.remove(item)
+            except ValueError:
+                pass
+
+    def copy(self):
+        """
+        Override copy slot to safely handle text extraction in Merge Mode.
+        """
+        if not getattr(self, 'is_merge_mode', False):
+            super().copy()
+            return
+            
+        cursor = self.textCursor()
+        if not cursor.hasSelection():
+            return
+            
+        # Safe extraction using cached cursors
+        start = cursor.selectionStart()
+        end = cursor.selectionEnd()
+        full_text = self.toPlainText()
+        
+        insert_ranges = []
+        # Filter valid insert cursors
+        valid_cursors = [item for item in self.merge_cursors if item['type'] == 'insert']
+        
+        for item in valid_cursors:
+            c = item['cursor']
+            # Safety check
+            if c.isNull(): continue
+            
+            c_start = c.selectionStart()
+            if c_start >= end: 
+                 # passed selection
+                 pass 
+            else:
+                c_end = c.selectionEnd()
+                if c_end > start:
+                    # Intersection
+                    i_start = max(start, c_start)
+                    i_end = min(end, c_end)
+                    if i_start < i_end:
+                        insert_ranges.append((i_start, i_end))
+        
+        insert_ranges.sort()
+        
+        result_parts = []
+        current_pos = start
+        
+        for r_start, r_end in insert_ranges:
+            if current_pos < r_start:
+                result_parts.append(full_text[current_pos:r_start])
+            current_pos = r_end
+            
+        if current_pos < end:
+            result_parts.append(full_text[current_pos:end])
+            
+        final_text = "".join(result_parts)
+        QApplication.clipboard().setText(final_text)
 
 
 # ==========================================
@@ -1903,6 +2174,7 @@ class MainWindow(QMainWindow):
         
         self.last_active_editor = None
         self._is_navigating_from_image = False
+        self.merge_mode = False
         
         # Compat: Map self.config to project_config for easy refactor, 
         # but manual access to global_config is needed for OCR.
@@ -2001,6 +2273,11 @@ class MainWindow(QMainWindow):
         self.btn_batch = QPushButton("OCR所有缺失页面")
         self.btn_batch.clicked.connect(self.run_batch_ocr)
         toolbar.addWidget(self.btn_batch)
+        
+        toolbar.addSeparator()
+        self.action_merge_view = QAction("Merge View", self, checkable=True)
+        self.action_merge_view.triggered.connect(self.toggle_merge_view)
+        toolbar.addAction(self.action_merge_view)
 
         
         
@@ -2121,6 +2398,10 @@ class MainWindow(QMainWindow):
         # 绑定信号
         self.edit_left.textChanged.connect(self.on_text_changed_left)
         self.edit_right.textChanged.connect(self.on_text_changed_right)
+        
+        # Connect Sync Signals
+        self.edit_left.merge_action_signal.connect(self.edit_right.apply_sync_merge_action)
+        self.edit_right.merge_action_signal.connect(self.edit_left.apply_sync_merge_action)
         
         # 绑定 Patch 信号
         self.edit_left.apply_patch_signal.connect(lambda r, t: self.apply_patch(self.edit_left, r, t))
@@ -2291,6 +2572,10 @@ class MainWindow(QMainWindow):
         # Force run immediately for first load? Or use deferred?
         # Use deferred to keep it async
         self.deferred_run_diff()
+        
+        # Persistence: If Merge Mode was active, re-apply it logic
+        if getattr(self, 'merge_mode', False):
+            self.toggle_merge_view(True)
 
 
     def get_best_page_image_bytes(self, doc, page_num):
@@ -2388,7 +2673,7 @@ class MainWindow(QMainWindow):
     def init_diff_timer(self):
         self.diff_timer = QTimer(self)
         self.diff_timer.setSingleShot(True)
-        self.diff_timer.setInterval(600) # 600ms debounce
+        self.diff_timer.setInterval(200) # 200ms debounce
         self.diff_timer.timeout.connect(self.run_diff_async)
 
     def run_diff(self):
@@ -2445,6 +2730,105 @@ class MainWindow(QMainWindow):
             # If not calculated, maybe we use main diff if right is OCR
             if self.combo_source.currentText() == "OCR Results":
                  self.ocr_diff_opcodes = opcodes
+
+    def toggle_merge_view(self, checked):
+        self.merge_mode = checked
+        
+        if self.merge_mode:
+            # Enter Merge Mode
+            # Block signals to prevent "Dirty" flag during setup
+            self.edit_left.blockSignals(True)
+            self.edit_right.blockSignals(True)
+            
+            # Get current texts and opcodes
+            text_l = self.edit_left.toPlainText()
+            text_r = self.edit_right.toPlainText()
+            
+            # Always calc sync to ensure opcodes match current text exactly
+            matcher = difflib.SequenceMatcher(None, text_l, text_r, autojunk=False)
+            opcodes = matcher.get_opcodes()
+                
+            merged_text_l, formats_l = self.generate_merge_data(text_l, text_r, opcodes)
+
+            # Generate Reverse Diff for Right Editor (Symmetric View)
+            # Diff R -> L
+            matcher_rev = difflib.SequenceMatcher(None, text_r, text_l, autojunk=False)
+            opcodes_rev = matcher_rev.get_opcodes()
+            
+            merged_text_r, formats_r = self.generate_merge_data(text_r, text_l, opcodes_rev)
+            
+            self.edit_left.enter_merge_mode(merged_text_l, formats_l)
+            self.edit_right.enter_merge_mode(merged_text_r, formats_r)
+            
+            # Hide Highlighters (clear document?)
+            self.highlighter_left.set_diff_data([], True)
+            self.highlighter_right.set_diff_data([], False)
+            self.highlighter_left.set_regex(None)
+            self.highlighter_right.set_regex(None)
+            
+            self.edit_left.blockSignals(False)
+            self.edit_right.blockSignals(False)
+            
+        else:
+            # Exit Merge Mode
+            self.edit_left.blockSignals(True)
+            self.edit_right.blockSignals(True)
+            
+            # Left: Commit changes (User edits)
+            changed_l = self.edit_left.exit_merge_mode(commit=True)
+            # Right: Discard changes (Keep as Reference)
+            changed_r = self.edit_right.exit_merge_mode(commit=False)
+            
+            self.edit_left.blockSignals(False)
+            self.edit_right.blockSignals(False)
+            
+            # Manually trigger changed signal ONLY if changes actually happened commit
+            if changed_l:
+                self.on_text_changed_left()
+            
+            # Trigger refresh to restore highlights
+            self.deferred_run_diff()
+
+    def generate_merge_data(self, text_a, text_b, opcodes):
+        """
+        Generate merged text and format list.
+        Green: Inserted (from B)
+        Red Strike: Deleted (from A)
+        """
+        merged = []
+        formats = [] # (start, len, type)
+        curr_len = 0
+        
+        for tag, i1, i2, j1, j2 in opcodes:
+            if tag == 'equal':
+                segment = text_a[i1:i2]
+                merged.append(segment)
+                curr_len += len(segment)
+            elif tag == 'delete':
+                segment = text_a[i1:i2]
+                merged.append(segment)
+                formats.append((curr_len, len(segment), 'delete'))
+                curr_len += len(segment)
+            elif tag == 'insert':
+                segment = text_b[j1:j2]
+                merged.append(segment)
+                formats.append((curr_len, len(segment), 'insert'))
+                curr_len += len(segment)
+            elif tag == 'replace':
+                # Insert then Delete
+                seg_ins = text_b[j1:j2]
+                seg_del = text_a[i1:i2]
+                
+                merged.append(seg_ins)
+                formats.append((curr_len, len(seg_ins), 'insert'))
+                curr_len += len(seg_ins)
+                
+                merged.append(seg_del)
+                formats.append((curr_len, len(seg_del), 'delete'))
+                curr_len += len(seg_del)
+                
+        return "".join(merged), formats
+
 
 
 
