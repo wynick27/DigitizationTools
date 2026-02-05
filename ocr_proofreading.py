@@ -15,9 +15,9 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QFormLayout, QDialog, QDialogButtonBox, QSpinBox, 
                              QTabWidget, QToolBar, QComboBox, QCheckBox, QMenu)
 from PyQt6.QtGui import (QTextCursor, QColor, QSyntaxHighlighter, QTextCharFormat, QTextFormat,
-                         QAction, QPixmap, QImage, QPainter, QBrush, QPen, QFont, QImageReader)
+                         QAction, QPixmap, QImage, QPainter, QBrush, QPen, QFont, QImageReader, QTextOption)
 from PyQt6.QtWidgets import QProgressBar
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QEvent, QThread, pyqtSlot, QMimeData
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QEvent, QThread, pyqtSlot, QSize, QRect, QPoint, QMimeData
 import bisect
 
 
@@ -403,6 +403,18 @@ class DiffSyntaxHighlighter(QSyntaxHighlighter):
             self.setFormat(start, length, fmt)
 
 
+class LineNumberArea(QWidget):
+    def __init__(self, editor):
+        super().__init__(editor)
+        self.codeEditor = editor
+
+    def sizeHint(self):
+        return QSize(self.codeEditor.line_number_area_width(), 0)
+
+    def paintEvent(self, event):
+        self.codeEditor.lineNumberAreaPaintEvent(event)
+
+
 class DiffTextEdit(QPlainTextEdit):
     """
     支持 Ctrl+Hover 高亮和 Ctrl+Click 应用补丁的文本框
@@ -434,6 +446,62 @@ class DiffTextEdit(QPlainTextEdit):
         # 启用鼠标追踪以支持 Hover
         self.setMouseTracking(True)
         self._hovering_diff = False
+
+        # 启用鼠标追踪以支持 Hover
+        self.setMouseTracking(True)
+        self._hovering_diff = False
+        
+        self.line_number_area = LineNumberArea(self)
+        self.blockCountChanged.connect(self.update_line_number_area_width)
+        self.updateRequest.connect(self.update_line_number_area)
+        self.update_line_number_area_width(0)
+
+    def line_number_area_width(self):
+        digits = 1
+        max_val = max(1, self.blockCount())
+        while max_val >= 10:
+            max_val //= 10
+            digits += 1
+        space = 3 + self.fontMetrics().horizontalAdvance('9') * digits + 5 # Margin
+        return space
+
+    def update_line_number_area_width(self, new_block_count):
+        self.setViewportMargins(self.line_number_area_width(), 0, 0, 0)
+
+    def update_line_number_area(self, rect, dy):
+        if dy:
+            self.line_number_area.scroll(0, dy)
+        else:
+            self.line_number_area.update(0, rect.y(), self.line_number_area.width(), rect.height())
+        if rect.contains(self.viewport().rect()):
+            self.update_line_number_area_width(0)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        cr = self.contentsRect()
+        self.line_number_area.setGeometry(QRect(cr.left(), cr.top(), self.line_number_area_width(), cr.height()))
+
+    def lineNumberAreaPaintEvent(self, event):
+        painter = QPainter(self.line_number_area)
+        painter.fillRect(event.rect(), QColor("#F0F0F0")) # Background
+
+        block = self.firstVisibleBlock()
+        block_number = block.blockNumber()
+        top = self.blockBoundingGeometry(block).translated(self.contentOffset()).top()
+        bottom = top + self.blockBoundingRect(block).height()
+
+        painter.setPen(Qt.GlobalColor.black)
+        
+        while block.isValid() and top <= event.rect().bottom():
+            if block.isVisible() and bottom >= event.rect().top():
+                number = str(block_number + 1)
+                painter.drawText(0, int(top), self.line_number_area.width() - 3, self.fontMetrics().height(),
+                                 Qt.AlignmentFlag.AlignRight, number)
+            
+            block = block.next()
+            top = bottom
+            bottom = top + self.blockBoundingRect(block).height()
+            block_number += 1
 
     def highlight_line_at_index(self, idx):
         """高亮指定字符索引所在的行"""
@@ -1839,6 +1907,8 @@ class FileHeaderWidget(QWidget):
         self.path_edit.setText(path)
         
     def browse_file(self):
+        if not self.main_window.check_unsaved_changes():
+            return
         filename, _ = QFileDialog.getOpenFileName(self, "Open File", "", "Text Files (*.txt);;All Files (*)")
         if filename:
             self.set_path(filename)
@@ -2174,6 +2244,7 @@ class MainWindow(QMainWindow):
         
         self.last_active_editor = None
         self._is_navigating_from_image = False
+        self._is_loading = False
         self.merge_mode = False
         
         # Compat: Map self.config to project_config for easy refactor, 
@@ -2251,6 +2322,15 @@ class MainWindow(QMainWindow):
         
         
         # OCR 工具栏
+        toolbar.addSeparator()
+        toolbar.addSeparator()
+        
+        # Word Wrap Toggle
+        self.cb_word_wrap = QCheckBox("Wrap")
+        self.cb_word_wrap.setChecked(True) # Default On
+        self.cb_word_wrap.toggled.connect(self.toggle_word_wrap)
+        toolbar.addWidget(self.cb_word_wrap)
+        
         toolbar.addSeparator()
         toolbar.addWidget(QLabel(" OCR Engine: "))
         self.combo_ocr_engine = QComboBox()
@@ -2462,116 +2542,122 @@ class MainWindow(QMainWindow):
         self.header_left.set_path(self.project_config.get('text_path_left', ''))
         self.header_right.set_path(self.project_config.get('text_path_right', ''))
 
+        self.dirty_pages_left.clear()
+        self.dirty_pages_right.clear()
         self.load_current_page()
 
  
 
     def load_current_page(self):
         # Session-based dirty tracking: No prompts here.
-        page_num = self.project_config.get('start_page', 1)
+        self._is_loading = True
         try:
-            page_num = int(self.spin_page.text())
-        except: pass
-        
-        self.spin_page.setText(str(page_num))
-        
-        # 1. Load OCR Data
-        ocr_data = self.load_ocr_json(page_num)
-        self.current_ocr_data = ocr_data # Store for highlighting
-        
-        # 2. Load Image (High Res)
-        if self.doc or self.project_config.get('image_dir'):
-            # Check OCR status
-            ocr_state = " (OCR Done)" if ocr_data else " (No OCR)"
-            self.statusBar().showMessage(f"Page {page_num} Loaded{ocr_state}")
+            page_num = self.project_config.get('start_page', 1)
+            try:
+                page_num = int(self.spin_page.text())
+            except: pass
             
-            pix = self.get_page_pixmap(page_num)
-            if pix:
-                self.image_view.load_content(pix, ocr_data)
-            else:
-                 self.image_view.load_content(None)
+            self.spin_page.setText(str(page_num))
         
-        # 3. 构建 OCR 映射 (如果存在)
-        self.ocr_text_full = ""
-        self.ocr_char_map = [] # [(start, end, bbox), ...]
-
-        if ocr_data:
-            current_idx = 0
-            for item in ocr_data:
-                text, bbox = "", []
-                if isinstance(item, dict):
-                    text = item.get('text', '')
-                    bbox = item.get('bbox', [])
-                elif isinstance(item, list) and len(item) == 2:
-                    text = item[1][0]
-                    # Parse Paddle points to rect
-                    pts = item[0]
-                    xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
-                    bbox = [min(xs), min(ys), max(xs), max(ys)]
+            # 1. Load OCR Data
+            ocr_data = self.load_ocr_json(page_num)
+            self.current_ocr_data = ocr_data # Store for highlighting
+            
+            # 2. Load Image (High Res)
+            if self.doc or self.project_config.get('image_dir'):
+                # Check OCR status
+                ocr_state = " (OCR Done)" if ocr_data else " (No OCR)"
+                self.statusBar().showMessage(f"Page {page_num} Loaded{ocr_state}")
                 
-                # Append with newline
-                chunk = text + "\n"
-                length = len(chunk)
-                # Map range [current, current+length) -> bbox
-                # bbox format for map: [x1, y1, x2, y2] usually
-                # We need x,y,w,h or x1,y1,x2,y2. Let's store [x,y,w,h] for easy use
-                if len(bbox) == 4:
-                     # Check if it is x1,y1,x2,y2 (Paddle usually points.. but here normalized)
-                     # My load_ocr_json returns [x,y,w,h] for dict? Let's check load_ocr_json
-                     # Wait, load_ocr_json logic for layout parser returns [x,y,x2,y2]??
-                     # Let's standardize bbox in process loop below
-                     pass
-                     
-                self.ocr_text_full += chunk
-                self.ocr_char_map.append({
-                    'start_index': current_idx,
-                    'end_index': current_idx + len(text), # exclude newline for click mapping
-                    'bbox': bbox
-                })
-                current_idx += length
-        
-        is_ocr_mode = (self.combo_source.currentText() == "OCR Results")
-        
-        # Draw bboxes (Use red for all detected, or maybe lighter if not in OCR mode)
-        #self.image_view.load_content(pix, ocr_data if ocr_data else [])
-        
-        # 3. 设置文本
-        # 左侧
-        left_text = self.pages_left.get(page_num, "")
-        
-        # 右侧
-        right_text = ""
-        if is_ocr_mode:
-            # Simple join from full text (which includes newlines)
-             right_text = self.ocr_text_full
-        else:
-            right_text = self.pages_right_text.get(page_num, "")
+                pix = self.get_page_pixmap(page_num)
+                if pix:
+                    self.image_view.load_content(pix, ocr_data)
+                else:
+                    self.image_view.load_content(None)
+            
+            # 3. 构建 OCR 映射 (如果存在)
+            self.ocr_text_full = ""
+            self.ocr_char_map = [] # [(start, end, bbox), ...]
 
-        # 避免触发 textChanged 导致死循环 (以及标记 modified)
-        self.edit_left.blockSignals(True)
-        self.edit_right.blockSignals(True)
-        
-        self.edit_left.setPlainText(left_text)
-        self.edit_right.setPlainText(right_text)
-        
-        self.edit_left.blockSignals(False)
-        self.edit_right.blockSignals(False)
-        
-        # 重置脏标记
-        self.modified_left = False
-        self.modified_right = False
-        
-        # 4. 执行对比 (Init Timer first)
-        if not hasattr(self, 'diff_timer'):
-             self.init_diff_timer()
-        
-        # Regex (Update Highlighters with Group ID)
-        self.highlighter_left.set_regex(self.project_config.get("regex_left"), self.project_config.get("regex_group_left", 0))
-        self.highlighter_right.set_regex(self.project_config.get("regex_right"), self.project_config.get("regex_group_right", 0))
+            if ocr_data:
+                current_idx = 0
+                for item in ocr_data:
+                    text, bbox = "", []
+                    if isinstance(item, dict):
+                        text = item.get('text', '')
+                        bbox = item.get('bbox', [])
+                    elif isinstance(item, list) and len(item) == 2:
+                        text = item[1][0]
+                        # Parse Paddle points to rect
+                        pts = item[0]
+                        xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+                        bbox = [min(xs), min(ys), max(xs), max(ys)]
+                    
+                    # Append with newline
+                    chunk = text + "\n"
+                    length = len(chunk)
+                    # Map range [current, current+length) -> bbox
+                    # bbox format for map: [x1, y1, x2, y2] usually
+                    # We need x,y,w,h or x1,y1,x2,y2. Let's store [x,y,w,h] for easy use
+                    if len(bbox) == 4:
+                        # Check if it is x1,y1,x2,y2 (Paddle usually points.. but here normalized)
+                        # My load_ocr_json returns [x,y,w,h] for dict? Let's check load_ocr_json
+                        # Wait, load_ocr_json logic for layout parser returns [x,y,x2,y2]??
+                        # Let's standardize bbox in process loop below
+                        pass
+                        
+                    self.ocr_text_full += chunk
+                    self.ocr_char_map.append({
+                        'start_index': current_idx,
+                        'end_index': current_idx + len(text), # exclude newline for click mapping
+                        'bbox': bbox
+                    })
+                    current_idx += length
+            
+            is_ocr_mode = (self.combo_source.currentText() == "OCR Results")
+            
+            # Draw bboxes (Use red for all detected, or maybe lighter if not in OCR mode)
+            #self.image_view.load_content(pix, ocr_data if ocr_data else [])
+            
+            # 3. 设置文本
+            # 左侧
+            left_text = self.pages_left.get(page_num, "")
+            
+            # 右侧
+            right_text = ""
+            if is_ocr_mode:
+                # Simple join from full text (which includes newlines)
+                right_text = self.ocr_text_full
+            else:
+                right_text = self.pages_right_text.get(page_num, "")
 
-        # Force run immediately for first load? Or use deferred?
-        # Use deferred to keep it async
-        self.deferred_run_diff()
+            # 避免触发 textChanged 导致死循环 (以及标记 modified)
+            self.edit_left.blockSignals(True)
+            self.edit_right.blockSignals(True)
+            
+            self.edit_left.setPlainText(left_text)
+            self.edit_right.setPlainText(right_text)
+            
+            self.edit_left.blockSignals(False)
+            self.edit_right.blockSignals(False)
+            
+            # 重置脏标记
+            self.modified_left = False
+            self.modified_right = False
+            
+            # 4. 执行对比 (Init Timer first)
+            if not hasattr(self, 'diff_timer'):
+                self.init_diff_timer()
+            
+            # Regex (Update Highlighters with Group ID)
+            self.highlighter_left.set_regex(self.project_config.get("regex_left"), self.project_config.get("regex_group_left", 0))
+            self.highlighter_right.set_regex(self.project_config.get("regex_right"), self.project_config.get("regex_group_right", 0))
+
+            # Force run immediately for first load? Or use deferred?
+            # Use deferred to keep it async
+            self.deferred_run_diff()
+        finally:
+            self._is_loading = False
         
         # Persistence: If Merge Mode was active, re-apply it logic
         if getattr(self, 'merge_mode', False):
@@ -2834,6 +2920,15 @@ class MainWindow(QMainWindow):
 
     # ================= 交互 =================
 
+    def toggle_word_wrap(self, checked):
+        mode = QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere if checked else QTextOption.WrapMode.NoWrap
+        self.edit_left.setWordWrapMode(mode)
+        self.edit_right.setWordWrapMode(mode)
+        # QPlainTextEdit standard: setLineWrapMode(QPlainTextEdit.LineWrapMode)
+        mode_pte = QPlainTextEdit.LineWrapMode.WidgetWidth if checked else QPlainTextEdit.LineWrapMode.NoWrap
+        self.edit_left.setLineWrapMode(mode_pte)
+        self.edit_right.setLineWrapMode(mode_pte)
+
     def apply_patch(self, editor, rng, target_text):
         """应用 Diff 补丁：将 range 区间的内容替换为 target_text"""
         start_py, end_py = rng
@@ -2883,6 +2978,7 @@ class MainWindow(QMainWindow):
         except: pass
 
     def on_text_changed_left(self):
+        if self._is_loading: return
         if not self._is_updating_diff:
             try:
                 p = int(self.spin_page.text())
@@ -2892,6 +2988,7 @@ class MainWindow(QMainWindow):
         self.deferred_run_diff()
         
     def on_text_changed_right(self):
+        if self._is_loading: return
         if not self._is_updating_diff:
             try:
                 p = int(self.spin_page.text())
@@ -2912,6 +3009,16 @@ class MainWindow(QMainWindow):
         self.highlighter_right.set_regex(self.project_config["regex_right"], self.project_config["regex_group_right"])
         
         self.run_diff()
+
+    def toggle_word_wrap(self, checked):
+        mode = QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere if checked else QTextOption.WrapMode.NoWrap
+        self.edit_left.setWordWrapMode(mode)
+        self.edit_right.setWordWrapMode(mode)
+        # QPlainTextEdit standard: setLineWrapMode(QPlainTextEdit.LineWrapMode)
+        mode_pte = QPlainTextEdit.LineWrapMode.WidgetWidth if checked else QPlainTextEdit.LineWrapMode.NoWrap
+        self.edit_left.setLineWrapMode(mode_pte)
+        self.edit_right.setLineWrapMode(mode_pte)
+
 
     # ================= 交互增强 (Sync & Highlight) =================
 
@@ -2947,39 +3054,21 @@ class MainWindow(QMainWindow):
         return to_qt_pos(dst_text, mapped_py_idx)
 
     def on_scroll(self, source, target):
-        """基于内容的对齐滚动"""
+        """Percentage-based scroll sync"""
         if self._is_program_scrolling: return
         
-        # 获取 Source 视口最顶端的字符索引
-        # cursorForPosition(0,0) 获取的是 visual line 的开始
-        # 为了更准确，可以取一点 margin，比如 (5, 5)
-        top_cursor = source.cursorForPosition(source.viewport().rect().topLeft())
-        src_idx = top_cursor.position()
+        self._is_program_scrolling = True
         
-        is_left = (source == self.edit_left)
+        # Calculate ratio
+        s_bar = source.verticalScrollBar()
+        t_bar = target.verticalScrollBar()
         
-        # 映射到 Target
-        dst_idx = self.get_mapped_index(src_idx, is_left)
-        
-        if dst_idx >= 0:
-            self._is_program_scrolling = True
+        if s_bar.maximum() > 0:
+            ratio = s_bar.value() / s_bar.maximum()
+            t_val = int(ratio * t_bar.maximum())
+            t_bar.setValue(t_val)
             
-            # 计算目标位置的 Y 坐标
-            # 方法：找到 dst_idx 所在的 block，获取其 bounding rect
-            doc = target.document()
-            block = doc.findBlock(dst_idx)
-            layout = doc.documentLayout()
-            
-            # blockBoundingRect 返回的是相对于文档的坐标
-            block_rect = layout.blockBoundingRect(block)
-            
-            # 也可以更精细：如果是 wrap 过的长行，blockBoundingRect 是整个 block 的
-            # 我们只需要大致对齐 block 即可
-            target_y = block_rect.y()
-            
-            target.verticalScrollBar().setValue(int(target_y))
-            
-            self._is_program_scrolling = False
+        self._is_program_scrolling = False
 
     def request_highlight_other(self, source_editor, idx):
         """根据当前光标位置，高亮另一侧对应位置"""
@@ -2994,6 +3083,19 @@ class MainWindow(QMainWindow):
         
         if mapped_idx >= 0:
             target_editor.highlight_line_at_index(mapped_idx)
+            
+            # Ensure Visible
+            cursor = target_editor.textCursor()
+            cursor.setPosition(mapped_idx)
+            
+            # Check if visual rect is in viewport
+            r = target_editor.cursorRect(cursor)
+            viewport_rect = target_editor.viewport().rect()
+            
+            if not viewport_rect.contains(r):
+                # Move actual cursor to center it
+                target_editor.setTextCursor(cursor)
+                target_editor.centerCursor()
         else:
             # 如果没找到映射（比如超出范围），也清除对面
             target_editor.clear_highlight()
@@ -3484,6 +3586,13 @@ class MainWindow(QMainWindow):
         self.combo_project.blockSignals(False)
 
     def on_project_switched(self):
+        if not self.check_unsaved_changes():
+            # Revert combo box
+            old_name = self.project_config["name"]
+            idx = self.combo_project.findText(old_name)
+            if idx >= 0: self.combo_project.setCurrentIndex(idx)
+            return
+
         name = self.combo_project.currentText()
         self.config_manager.set_active_project(name)
         self.project_config = self.config_manager.get_active_project()
@@ -3493,6 +3602,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Project Switched", f"Switched to {name}")
 
     def open_project_manager(self):
+        if not self.check_unsaved_changes(): return
         dlg = ProjectManagerDialog(self, self.config_manager)
         dlg.exec()
         
