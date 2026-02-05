@@ -15,9 +15,9 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QFormLayout, QDialog, QDialogButtonBox, QSpinBox, 
                              QTabWidget, QToolBar, QComboBox, QCheckBox, QMenu)
 from PyQt6.QtGui import (QTextCursor, QColor, QSyntaxHighlighter, QTextCharFormat, QTextFormat,
-                         QAction, QPixmap, QImage, QPainter, QBrush, QPen, QFont, QImageReader)
+                         QAction, QPixmap, QImage, QPainter, QBrush, QPen, QFont, QImageReader, QTextOption)
 from PyQt6.QtWidgets import QProgressBar
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QEvent, QThread, pyqtSlot
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QEvent, QThread, pyqtSlot, QSize, QRect
 import bisect
 
 
@@ -403,6 +403,18 @@ class DiffSyntaxHighlighter(QSyntaxHighlighter):
             self.setFormat(start, length, fmt)
 
 
+class LineNumberArea(QWidget):
+    def __init__(self, editor):
+        super().__init__(editor)
+        self.codeEditor = editor
+
+    def sizeHint(self):
+        return QSize(self.codeEditor.line_number_area_width(), 0)
+
+    def paintEvent(self, event):
+        self.codeEditor.lineNumberAreaPaintEvent(event)
+
+
 class DiffTextEdit(QPlainTextEdit):
     """
     支持 Ctrl+Hover 高亮和 Ctrl+Click 应用补丁的文本框
@@ -427,6 +439,62 @@ class DiffTextEdit(QPlainTextEdit):
         # 启用鼠标追踪以支持 Hover
         self.setMouseTracking(True)
         self._hovering_diff = False
+
+        # 启用鼠标追踪以支持 Hover
+        self.setMouseTracking(True)
+        self._hovering_diff = False
+        
+        self.line_number_area = LineNumberArea(self)
+        self.blockCountChanged.connect(self.update_line_number_area_width)
+        self.updateRequest.connect(self.update_line_number_area)
+        self.update_line_number_area_width(0)
+
+    def line_number_area_width(self):
+        digits = 1
+        max_val = max(1, self.blockCount())
+        while max_val >= 10:
+            max_val //= 10
+            digits += 1
+        space = 3 + self.fontMetrics().horizontalAdvance('9') * digits + 5 # Margin
+        return space
+
+    def update_line_number_area_width(self, new_block_count):
+        self.setViewportMargins(self.line_number_area_width(), 0, 0, 0)
+
+    def update_line_number_area(self, rect, dy):
+        if dy:
+            self.line_number_area.scroll(0, dy)
+        else:
+            self.line_number_area.update(0, rect.y(), self.line_number_area.width(), rect.height())
+        if rect.contains(self.viewport().rect()):
+            self.update_line_number_area_width(0)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        cr = self.contentsRect()
+        self.line_number_area.setGeometry(QRect(cr.left(), cr.top(), self.line_number_area_width(), cr.height()))
+
+    def lineNumberAreaPaintEvent(self, event):
+        painter = QPainter(self.line_number_area)
+        painter.fillRect(event.rect(), QColor("#F0F0F0")) # Background
+
+        block = self.firstVisibleBlock()
+        block_number = block.blockNumber()
+        top = self.blockBoundingGeometry(block).translated(self.contentOffset()).top()
+        bottom = top + self.blockBoundingRect(block).height()
+
+        painter.setPen(Qt.GlobalColor.black)
+        
+        while block.isValid() and top <= event.rect().bottom():
+            if block.isVisible() and bottom >= event.rect().top():
+                number = str(block_number + 1)
+                painter.drawText(0, int(top), self.line_number_area.width() - 3, self.fontMetrics().height(),
+                                 Qt.AlignmentFlag.AlignRight, number)
+            
+            block = block.next()
+            top = bottom
+            bottom = top + self.blockBoundingRect(block).height()
+            block_number += 1
 
     def highlight_line_at_index(self, idx):
         """高亮指定字符索引所在的行"""
@@ -1983,6 +2051,15 @@ class MainWindow(QMainWindow):
         
         # OCR 工具栏
         toolbar.addSeparator()
+        toolbar.addSeparator()
+        
+        # Word Wrap Toggle
+        self.cb_word_wrap = QCheckBox("Wrap")
+        self.cb_word_wrap.setChecked(True) # Default On
+        self.cb_word_wrap.toggled.connect(self.toggle_word_wrap)
+        toolbar.addWidget(self.cb_word_wrap)
+        
+        toolbar.addSeparator()
         toolbar.addWidget(QLabel(" OCR Engine: "))
         self.combo_ocr_engine = QComboBox()
         self.combo_ocr_engine.addItem("Remote API", "remote")
@@ -2459,6 +2536,15 @@ class MainWindow(QMainWindow):
 
     # ================= 交互 =================
 
+    def toggle_word_wrap(self, checked):
+        mode = QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere if checked else QTextOption.WrapMode.NoWrap
+        self.edit_left.setWordWrapMode(mode)
+        self.edit_right.setWordWrapMode(mode)
+        # QPlainTextEdit standard: setLineWrapMode(QPlainTextEdit.LineWrapMode)
+        mode_pte = QPlainTextEdit.LineWrapMode.WidgetWidth if checked else QPlainTextEdit.LineWrapMode.NoWrap
+        self.edit_left.setLineWrapMode(mode_pte)
+        self.edit_right.setLineWrapMode(mode_pte)
+
     def apply_patch(self, editor, rng, target_text):
         """应用 Diff 补丁：将 range 区间的内容替换为 target_text"""
         start_py, end_py = rng
@@ -2539,6 +2625,16 @@ class MainWindow(QMainWindow):
         self.highlighter_right.set_regex(self.project_config["regex_right"], self.project_config["regex_group_right"])
         
         self.run_diff()
+
+    def toggle_word_wrap(self, checked):
+        mode = QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere if checked else QTextOption.WrapMode.NoWrap
+        self.edit_left.setWordWrapMode(mode)
+        self.edit_right.setWordWrapMode(mode)
+        # QPlainTextEdit standard: setLineWrapMode(QPlainTextEdit.LineWrapMode)
+        mode_pte = QPlainTextEdit.LineWrapMode.WidgetWidth if checked else QPlainTextEdit.LineWrapMode.NoWrap
+        self.edit_left.setLineWrapMode(mode_pte)
+        self.edit_right.setLineWrapMode(mode_pte)
+
 
     # ================= 交互增强 (Sync & Highlight) =================
 
