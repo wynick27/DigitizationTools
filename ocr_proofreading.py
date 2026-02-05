@@ -1568,6 +1568,8 @@ class FileHeaderWidget(QWidget):
         self.path_edit.setText(path)
         
     def browse_file(self):
+        if not self.main_window.check_unsaved_changes():
+            return
         filename, _ = QFileDialog.getOpenFileName(self, "Open File", "", "Text Files (*.txt);;All Files (*)")
         if filename:
             self.set_path(filename)
@@ -1903,6 +1905,7 @@ class MainWindow(QMainWindow):
         
         self.last_active_editor = None
         self._is_navigating_from_image = False
+        self._is_loading = False
         
         # Compat: Map self.config to project_config for easy refactor, 
         # but manual access to global_config is needed for OCR.
@@ -2181,116 +2184,122 @@ class MainWindow(QMainWindow):
         self.header_left.set_path(self.project_config.get('text_path_left', ''))
         self.header_right.set_path(self.project_config.get('text_path_right', ''))
 
+        self.dirty_pages_left.clear()
+        self.dirty_pages_right.clear()
         self.load_current_page()
 
  
 
     def load_current_page(self):
         # Session-based dirty tracking: No prompts here.
-        page_num = self.project_config.get('start_page', 1)
+        self._is_loading = True
         try:
-            page_num = int(self.spin_page.text())
-        except: pass
-        
-        self.spin_page.setText(str(page_num))
-        
-        # 1. Load OCR Data
-        ocr_data = self.load_ocr_json(page_num)
-        self.current_ocr_data = ocr_data # Store for highlighting
-        
-        # 2. Load Image (High Res)
-        if self.doc or self.project_config.get('image_dir'):
-            # Check OCR status
-            ocr_state = " (OCR Done)" if ocr_data else " (No OCR)"
-            self.statusBar().showMessage(f"Page {page_num} Loaded{ocr_state}")
+            page_num = self.project_config.get('start_page', 1)
+            try:
+                page_num = int(self.spin_page.text())
+            except: pass
             
-            pix = self.get_page_pixmap(page_num)
-            if pix:
-                self.image_view.load_content(pix, ocr_data)
-            else:
-                 self.image_view.load_content(None)
+            self.spin_page.setText(str(page_num))
         
-        # 3. 构建 OCR 映射 (如果存在)
-        self.ocr_text_full = ""
-        self.ocr_char_map = [] # [(start, end, bbox), ...]
-
-        if ocr_data:
-            current_idx = 0
-            for item in ocr_data:
-                text, bbox = "", []
-                if isinstance(item, dict):
-                    text = item.get('text', '')
-                    bbox = item.get('bbox', [])
-                elif isinstance(item, list) and len(item) == 2:
-                    text = item[1][0]
-                    # Parse Paddle points to rect
-                    pts = item[0]
-                    xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
-                    bbox = [min(xs), min(ys), max(xs), max(ys)]
+            # 1. Load OCR Data
+            ocr_data = self.load_ocr_json(page_num)
+            self.current_ocr_data = ocr_data # Store for highlighting
+            
+            # 2. Load Image (High Res)
+            if self.doc or self.project_config.get('image_dir'):
+                # Check OCR status
+                ocr_state = " (OCR Done)" if ocr_data else " (No OCR)"
+                self.statusBar().showMessage(f"Page {page_num} Loaded{ocr_state}")
                 
-                # Append with newline
-                chunk = text + "\n"
-                length = len(chunk)
-                # Map range [current, current+length) -> bbox
-                # bbox format for map: [x1, y1, x2, y2] usually
-                # We need x,y,w,h or x1,y1,x2,y2. Let's store [x,y,w,h] for easy use
-                if len(bbox) == 4:
-                     # Check if it is x1,y1,x2,y2 (Paddle usually points.. but here normalized)
-                     # My load_ocr_json returns [x,y,w,h] for dict? Let's check load_ocr_json
-                     # Wait, load_ocr_json logic for layout parser returns [x,y,x2,y2]??
-                     # Let's standardize bbox in process loop below
-                     pass
-                     
-                self.ocr_text_full += chunk
-                self.ocr_char_map.append({
-                    'start_index': current_idx,
-                    'end_index': current_idx + len(text), # exclude newline for click mapping
-                    'bbox': bbox
-                })
-                current_idx += length
-        
-        is_ocr_mode = (self.combo_source.currentText() == "OCR Results")
-        
-        # Draw bboxes (Use red for all detected, or maybe lighter if not in OCR mode)
-        #self.image_view.load_content(pix, ocr_data if ocr_data else [])
-        
-        # 3. 设置文本
-        # 左侧
-        left_text = self.pages_left.get(page_num, "")
-        
-        # 右侧
-        right_text = ""
-        if is_ocr_mode:
-            # Simple join from full text (which includes newlines)
-             right_text = self.ocr_text_full
-        else:
-            right_text = self.pages_right_text.get(page_num, "")
+                pix = self.get_page_pixmap(page_num)
+                if pix:
+                    self.image_view.load_content(pix, ocr_data)
+                else:
+                    self.image_view.load_content(None)
+            
+            # 3. 构建 OCR 映射 (如果存在)
+            self.ocr_text_full = ""
+            self.ocr_char_map = [] # [(start, end, bbox), ...]
 
-        # 避免触发 textChanged 导致死循环 (以及标记 modified)
-        self.edit_left.blockSignals(True)
-        self.edit_right.blockSignals(True)
-        
-        self.edit_left.setPlainText(left_text)
-        self.edit_right.setPlainText(right_text)
-        
-        self.edit_left.blockSignals(False)
-        self.edit_right.blockSignals(False)
-        
-        # 重置脏标记
-        self.modified_left = False
-        self.modified_right = False
-        
-        # 4. 执行对比 (Init Timer first)
-        if not hasattr(self, 'diff_timer'):
-             self.init_diff_timer()
-        
-        # Regex (Update Highlighters with Group ID)
-        self.highlighter_left.set_regex(self.project_config.get("regex_left"), self.project_config.get("regex_group_left", 0))
-        self.highlighter_right.set_regex(self.project_config.get("regex_right"), self.project_config.get("regex_group_right", 0))
+            if ocr_data:
+                current_idx = 0
+                for item in ocr_data:
+                    text, bbox = "", []
+                    if isinstance(item, dict):
+                        text = item.get('text', '')
+                        bbox = item.get('bbox', [])
+                    elif isinstance(item, list) and len(item) == 2:
+                        text = item[1][0]
+                        # Parse Paddle points to rect
+                        pts = item[0]
+                        xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+                        bbox = [min(xs), min(ys), max(xs), max(ys)]
+                    
+                    # Append with newline
+                    chunk = text + "\n"
+                    length = len(chunk)
+                    # Map range [current, current+length) -> bbox
+                    # bbox format for map: [x1, y1, x2, y2] usually
+                    # We need x,y,w,h or x1,y1,x2,y2. Let's store [x,y,w,h] for easy use
+                    if len(bbox) == 4:
+                        # Check if it is x1,y1,x2,y2 (Paddle usually points.. but here normalized)
+                        # My load_ocr_json returns [x,y,w,h] for dict? Let's check load_ocr_json
+                        # Wait, load_ocr_json logic for layout parser returns [x,y,x2,y2]??
+                        # Let's standardize bbox in process loop below
+                        pass
+                        
+                    self.ocr_text_full += chunk
+                    self.ocr_char_map.append({
+                        'start_index': current_idx,
+                        'end_index': current_idx + len(text), # exclude newline for click mapping
+                        'bbox': bbox
+                    })
+                    current_idx += length
+            
+            is_ocr_mode = (self.combo_source.currentText() == "OCR Results")
+            
+            # Draw bboxes (Use red for all detected, or maybe lighter if not in OCR mode)
+            #self.image_view.load_content(pix, ocr_data if ocr_data else [])
+            
+            # 3. 设置文本
+            # 左侧
+            left_text = self.pages_left.get(page_num, "")
+            
+            # 右侧
+            right_text = ""
+            if is_ocr_mode:
+                # Simple join from full text (which includes newlines)
+                right_text = self.ocr_text_full
+            else:
+                right_text = self.pages_right_text.get(page_num, "")
 
-        # Force run immediately for first load? Or use deferred?
-        # Use deferred to keep it async
-        self.deferred_run_diff()
+            # 避免触发 textChanged 导致死循环 (以及标记 modified)
+            self.edit_left.blockSignals(True)
+            self.edit_right.blockSignals(True)
+            
+            self.edit_left.setPlainText(left_text)
+            self.edit_right.setPlainText(right_text)
+            
+            self.edit_left.blockSignals(False)
+            self.edit_right.blockSignals(False)
+            
+            # 重置脏标记
+            self.modified_left = False
+            self.modified_right = False
+            
+            # 4. 执行对比 (Init Timer first)
+            if not hasattr(self, 'diff_timer'):
+                self.init_diff_timer()
+            
+            # Regex (Update Highlighters with Group ID)
+            self.highlighter_left.set_regex(self.project_config.get("regex_left"), self.project_config.get("regex_group_left", 0))
+            self.highlighter_right.set_regex(self.project_config.get("regex_right"), self.project_config.get("regex_group_right", 0))
+
+            # Force run immediately for first load? Or use deferred?
+            # Use deferred to keep it async
+            self.deferred_run_diff()
+        finally:
+            self._is_loading = False
 
 
     def get_best_page_image_bytes(self, doc, page_num):
@@ -2499,6 +2508,7 @@ class MainWindow(QMainWindow):
         except: pass
 
     def on_text_changed_left(self):
+        if self._is_loading: return
         if not self._is_updating_diff:
             try:
                 p = int(self.spin_page.text())
@@ -2508,6 +2518,7 @@ class MainWindow(QMainWindow):
         self.deferred_run_diff()
         
     def on_text_changed_right(self):
+        if self._is_loading: return
         if not self._is_updating_diff:
             try:
                 p = int(self.spin_page.text())
@@ -3100,6 +3111,13 @@ class MainWindow(QMainWindow):
         self.combo_project.blockSignals(False)
 
     def on_project_switched(self):
+        if not self.check_unsaved_changes():
+            # Revert combo box
+            old_name = self.project_config["name"]
+            idx = self.combo_project.findText(old_name)
+            if idx >= 0: self.combo_project.setCurrentIndex(idx)
+            return
+
         name = self.combo_project.currentText()
         self.config_manager.set_active_project(name)
         self.project_config = self.config_manager.get_active_project()
@@ -3109,6 +3127,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Project Switched", f"Switched to {name}")
 
     def open_project_manager(self):
+        if not self.check_unsaved_changes(): return
         dlg = ProjectManagerDialog(self, self.config_manager)
         dlg.exec()
         
