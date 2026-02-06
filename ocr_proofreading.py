@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QFormLayout, QDialog, QDialogButtonBox, QSpinBox, 
                              QTabWidget, QToolBar, QComboBox, QCheckBox, QMenu,
                              QRadioButton, QButtonGroup, QGroupBox, QListWidgetItem, QGridLayout,
-                             QTableView, QHeaderView, QAbstractItemView, QStyle)
+                             QTableView, QHeaderView, QAbstractItemView, QStyle, QProgressDialog)
 from PyQt6.QtGui import (QTextCursor, QColor, QSyntaxHighlighter, QTextCharFormat, QTextFormat,
                          QAction, QPixmap, QImage, QPainter, QBrush, QPen, QFont, QImageReader, QTextOption,
                          QAbstractTextDocumentLayout, QTextDocument, QPalette)
@@ -2053,8 +2053,115 @@ class ProjectManagerDialog(QDialog):
 # ==========================================
 
 # ==========================================
-# 2.5 Config & Templates
+# 2.5 Config & Templates & Workers
 # ==========================================
+
+class ReviewDiffWorker(QThread):
+    progress = pyqtSignal(int)
+    finished = pyqtSignal(list, str) # items, msg
+    
+    def __init__(self, pages, pages_left, pages_right, target_is_left, 
+                 regex_old, regex_new, 
+                 check_insert, check_delete, check_replace):
+        super().__init__()
+        self.pages = pages
+        self.pages_left = pages_left
+        self.pages_right = pages_right
+        self.target_is_left = target_is_left
+        self.regex_old = regex_old
+        self.regex_new = regex_new
+        self.chk_insert = check_insert
+        self.chk_delete = check_delete
+        self.chk_replace = check_replace
+        
+        self.is_running = True
+        self.items = []
+        
+    def run(self):
+        try:
+            total = len(self.pages)
+            for i, p in enumerate(self.pages):
+                if self.isInterruptionRequested(): break
+                
+                self.progress.emit(i + 1)
+                
+                # Get Texts
+                t_l = self.pages_left.get(p, "")
+                t_r = self.pages_right.get(p, "")
+                
+                text_a = ""
+                text_b = ""
+                if self.target_is_left:
+                     # Target=Left. Turn Left into Right.
+                     text_a = t_l
+                     text_b = t_r
+                else:
+                     # Target=Right. Turn Right into Left.
+                     text_a = t_r
+                     text_b = t_l
+                
+                self._generate_diff_items(p, text_a, text_b)
+                
+            self.finished.emit(self.items, "Done")
+            
+        except Exception as e:
+            self.finished.emit([], str(e))
+            
+    def _generate_diff_items(self, page_num, text_a, text_b):
+        matcher = difflib.SequenceMatcher(None, text_a, text_b, autojunk=False)
+        opcodes = matcher.get_opcodes()
+        
+        import html
+        
+        for tag, i1, i2, j1, j2 in opcodes:
+             if self.isInterruptionRequested(): break
+             if tag == 'equal': continue
+            
+             # Check Types
+             if tag == 'replace' and not self.chk_replace: continue
+             if tag == 'delete' and not self.chk_delete: continue
+             if tag == 'insert' and not self.chk_insert: continue
+            
+             old_segment = text_a[i1:i2]
+             new_segment = text_b[j1:j2]
+            
+             # Regex Filters
+             if self.regex_old and old_segment:
+                 if not self.regex_old.search(old_segment): continue
+             if self.regex_old and not old_segment: continue
+            
+             if self.regex_new and new_segment:
+                 if not self.regex_new.search(new_segment): continue
+             if self.regex_new and not new_segment: continue
+            
+             # Context
+             c_start = max(0, i1 - 10)
+             c_end = min(len(text_a), i2 + 10)
+             prefix = html.escape(text_a[c_start:i1])
+             suffix = html.escape(text_a[i2:c_end])
+             seg_old_esc = html.escape(old_segment)
+             seg_new_esc = html.escape(new_segment)
+             
+             style_del = "background-color:#ffcccc; text-decoration:line-through;"
+             style_ins = "background-color:#ccffcc;"
+            
+             diff_html = ""
+             if tag == 'replace':
+                  diff_html = f"{prefix}<span style='{style_del}'>{seg_old_esc}</span> <span style='{style_ins}'>{seg_new_esc}</span>{suffix}"
+             elif tag == 'delete':
+                  diff_html = f"{prefix}<span style='{style_del}'>{seg_old_esc}</span>{suffix}"
+             elif tag == 'insert':
+                  diff_html = f"{prefix}<span style='{style_ins}'>{seg_new_esc}</span>{suffix}"
+            
+             item_data = {
+                'page_num': page_num,
+                'span': (i1, i2), 
+                'original': old_segment,
+                'new': new_segment,
+                'context_html': diff_html,
+                'checked': True
+             }
+             self.items.append(item_data)
 
 class TemplateManager:
     def __init__(self, filename="replace_templates.json"):
@@ -2386,20 +2493,24 @@ class FindReplaceDialog(QDialog):
         self.init_tab_standard()
         self.tabs.addTab(self.tab_standard, "Standard / Regex")
         
-        # Tab: Batch Templates
         self.tab_batch = QWidget()
         self.init_tab_batch()
         self.tabs.addTab(self.tab_batch, "Batch / Templates")
         
+        # Tab: Diff Filter
+        self.tab_diff = QWidget()
+        self.init_tab_diff()
+        self.tabs.addTab(self.tab_diff, "Diff Filter")
+        
         # Scope Selection
-        scope_group = QGroupBox("Target Text")
-        scope_layout = QHBoxLayout(scope_group)
+        self.scope_group = QGroupBox("Target Text")
+        scope_layout = QHBoxLayout(self.scope_group)
         self.rb_left = QRadioButton("Left Text")
         self.rb_right = QRadioButton("Right Text")
         self.rb_right.setChecked(True)
         scope_layout.addWidget(self.rb_left)
         scope_layout.addWidget(self.rb_right)
-        main_layout.addWidget(scope_group)
+        main_layout.addWidget(self.scope_group)
         
         # Review Area (Integrated)
         self.review_group = QGroupBox("Review Replacements")
@@ -2674,6 +2785,55 @@ class FindReplaceDialog(QDialog):
         layout.addStretch()
         layout.addWidget(btn_run_page)
         layout.addWidget(btn_run_global)
+
+    def init_tab_diff(self):
+        """Diff Filter UI"""
+        layout = QVBoxLayout(self.tab_diff)
+        
+        # 1. Opcode Selection
+        grp_op = QGroupBox("Select Changes to Apply (Opcodes)")
+        l_op = QHBoxLayout(grp_op)
+        self.chk_diff_insert = QCheckBox("Insert (Added text)")
+        self.chk_diff_delete = QCheckBox("Delete (Removed text)")
+        self.chk_diff_replace = QCheckBox("Replace (Modified text)")
+        self.chk_diff_insert.setChecked(True)
+        self.chk_diff_delete.setChecked(True)
+        self.chk_diff_replace.setChecked(True)
+        
+        l_op.addWidget(self.chk_diff_insert)
+        l_op.addWidget(self.chk_diff_delete)
+        l_op.addWidget(self.chk_diff_replace)
+        layout.addWidget(grp_op)
+        
+        # 2. Content Filters
+        grp_filter = QGroupBox("Content Filter (Regex)")
+        form = QFormLayout(grp_filter)
+        
+        # Original Text Filter (For Delete & Replace)
+        self.txt_diff_filter_old = QLineEdit()
+        self.txt_diff_filter_old.setPlaceholderText("Regex to match Original Text (Empty = All)")
+        form.addRow("Original Match:", self.txt_diff_filter_old)
+        
+        # New Text Filter (For Insert & Replace)
+        self.txt_diff_filter_new = QLineEdit()
+        self.txt_diff_filter_new.setPlaceholderText("Regex to match New Text (Empty = All)")
+        form.addRow("New Text Match:", self.txt_diff_filter_new)
+        
+        layout.addWidget(grp_filter)
+        
+        # 3. Actions
+        h_btn = QHBoxLayout()
+        btn_diff_page = QPushButton("Review Diff (Current Page)")
+        btn_diff_global = QPushButton("Review Diff (Global)")
+        
+        btn_diff_page.clicked.connect(lambda: self.on_review_diff(False))
+        btn_diff_global.clicked.connect(lambda: self.on_review_diff(True))
+        
+        h_btn.addWidget(btn_diff_page)
+        h_btn.addWidget(btn_diff_global)
+        layout.addLayout(h_btn)
+        
+        layout.addStretch()
 
     def refresh_combo_templates(self):
         curr = self.combo_template.currentText()
@@ -3030,12 +3190,14 @@ class FindReplaceDialog(QDialog):
 
         # 3. Show Review UI
         self.tabs.setVisible(False)
+        self.scope_group.setVisible(False)
         self.review_group.setVisible(True)
         self.status_label.setText(f"Found {len(self.current_review_items)} changes.")
         
     def close_review(self):
         self.review_group.setVisible(False)
         self.tabs.setVisible(True)
+        self.scope_group.setVisible(True)
         self.status_label.setText("Review cancelled.")
         self.review_table.setModel(None) # Clear memory
         
@@ -3176,6 +3338,102 @@ class FindReplaceDialog(QDialog):
             }
             # Add directly to list, Model is set afterwards
             self.current_review_items.append(item_data)
+
+    def on_review_diff(self, is_global):
+        """Handler for Diff Filter Review"""
+        self.review_group.setVisible(False)
+        self.current_review_items = []
+        self.review_is_global = is_global
+        
+        # 1. Compile filters
+        regex_old = None
+        regex_new = None
+        pat_old = self.txt_diff_filter_old.text()
+        pat_new = self.txt_diff_filter_new.text()
+        
+        try:
+             if pat_old: regex_old = re.compile(pat_old)
+             if pat_new: regex_new = re.compile(pat_new)
+        except Exception as e:
+             QMessageBox.critical(self, "Regex Error", str(e))
+             return
+
+        # 2. Determine target side
+        # Use selection from "Target Text" groupbox which dictates "Target" side.
+        # But for Diff, we usually compare Left vs Right.
+        # If Target=Right, we modify Right to match Left? Or vice versa?
+        # Standard: applying changes TO Target.
+        # Implies Source is the OTHER side.
+        
+        target_is_left = self.rb_left.isChecked()
+        target_side = "Left" if target_is_left else "Right"
+        
+        # 3. Pages
+        start_page = self.mainwindow.project_config.get('start_page', 1)
+        end_page = self.mainwindow.project_config.get('end_page', 1) # Default 1? No usually max.
+        
+        # For current page:
+        if not is_global:
+            try:
+                p = int(self.mainwindow.spin_page.text())
+                pages = [p]
+            except: pages = []
+        else:
+             # Need to know max pages?
+             # From project config or scan?
+             # Let's use start/end from config if available, or scan memory.
+             # Memory pages keys.
+             keys_l = set(self.mainwindow.pages_left.keys())
+             keys_r = set(self.mainwindow.pages_right_text.keys())
+             all_pages = sorted(list(keys_l | keys_r))
+             pages = all_pages
+             
+        # 4. Process
+        # 4. Start Worker
+        self.progress_dialog = QProgressDialog("Analyzing differences...", "Cancel", 0, len(pages), self)
+        self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self.progress_dialog.setMinimumDuration(200)
+        self.progress_dialog.setValue(0)
+        
+        self.diff_worker_thread = ReviewDiffWorker(
+            pages, 
+            self.mainwindow.pages_left, 
+            self.mainwindow.pages_right_text,
+            target_is_left,
+            regex_old, regex_new,
+            self.chk_diff_insert.isChecked(),
+            self.chk_diff_delete.isChecked(),
+            self.chk_diff_replace.isChecked()
+        )
+        
+        self.diff_worker_thread.progress.connect(self.progress_dialog.setValue)
+        self.diff_worker_thread.finished.connect(self.on_diff_worker_finished)
+        self.progress_dialog.canceled.connect(self.diff_worker_thread.requestInterruption)
+        
+        self.diff_worker_thread.start()
+
+    def on_diff_worker_finished(self, items, msg):
+        self.diff_worker_thread = None
+        self.progress_dialog.close()
+        
+        if msg != "Done" and msg != "Cancelled": 
+             if msg: QMessageBox.warning(self, "Diff Info", msg)
+        
+        self.current_review_items = items
+        
+        if not items:
+            self.status_label.setText("No diff items found.")
+            return
+
+        self.model = ReviewTableModel(self.current_review_items)
+        self.review_table.setModel(self.model)
+        
+        self.tabs.setVisible(False)
+        self.scope_group.setVisible(False)
+        self.review_group.setVisible(True)
+        self.status_label.setText(f"Found {len(self.current_review_items)} diff items.")
+        
+
 
     def get_target_editor(self):
         if self.rb_left.isChecked():
