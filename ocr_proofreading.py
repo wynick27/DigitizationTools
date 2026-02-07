@@ -3447,11 +3447,18 @@ class FindReplaceDialog(QDialog):
         if 0 <= row < len(self.current_review_items):
             item = self.current_review_items[row]
             page_num = item.get('page_num')
-            
-            # Jump to page in main window
             if page_num:
                 self.mainwindow.spin_page.setText(str(page_num))
                 self.mainwindow.jump_page()
+
+    def reset_review_ui(self):
+        """Reset the review UI to initial search state"""
+        self.review_group.setVisible(False)
+        self.tabs.setVisible(True)
+        self.scope_group.setVisible(True)
+        self.current_review_items = []
+        self.review_table.setModel(None)
+        self.status_label.setText("Review reset due to project switch.")
 
     def get_target_editor(self):
         if self.rb_left.isChecked():
@@ -3900,6 +3907,9 @@ class MainWindow(QMainWindow):
     # ================= 逻辑处理 =================
 
     def reload_all_data(self):
+        # Prevent auto-save of old content into new data
+        self.current_loaded_page = None
+        
         # 1. 加载文本
         self.pages_left = read_text_to_pages(self.project_config['text_path_left'])
         self.pages_right_text = read_text_to_pages(self.project_config['text_path_right'])
@@ -4611,29 +4621,49 @@ class MainWindow(QMainWindow):
         # Ensure pdf path is passed properly or handled in thread
         pdf_path = self.project_config.get('pdf_path')
         
-        self.ocr_thread = OCRWorker(mode, pages, self.project_config, self.global_config, engine)
-        self.ocr_thread.progress.connect(self.on_ocr_progress)
-        self.ocr_thread.finished.connect(self.on_ocr_finished)
+        worker = OCRWorker(mode, pages, self.project_config, self.global_config, engine)
+        worker.project_name = self.project_config.get("name") # Tag with project name
+        worker.progress.connect(self.on_ocr_progress)
+        worker.finished.connect(self.on_ocr_finished)
+        
+        self.ocr_thread = worker
         self.ocr_thread.start()
 
     def on_ocr_progress(self, msg):
-        self.statusBar().showMessage(msg)
-        if hasattr(self, 'ocr_thread') and self.ocr_thread.mode == 'batch':
+        worker = self.sender()
+        if not worker: return
+        
+        # Display global progress with project context
+        proj_name = getattr(worker, 'project_name', 'Unknown')
+        self.statusBar().showMessage(f"[{proj_name}] {msg}")
+        
+        # Update progress bar for any batch job
+        if worker.mode == 'batch':
              val = self.progress_bar.value()
              self.progress_bar.setValue(val + 1)
 
     def on_ocr_finished(self, success, msg):
-        QApplication.restoreOverrideCursor()
-        self.statusBar().showMessage(msg, 5000)
+        worker = self.sender()
+        if not worker: return
         
-        # Reset Batch UI
-        if hasattr(self, 'btn_batch'):
-            self.btn_batch.setText("OCR所有缺失页面")
-            self.btn_batch.setEnabled(True)
-        self.progress_bar.setVisible(False)
+        is_current_project = (getattr(worker, 'project_name', None) == self.project_config.get("name"))
+
+        if is_current_project:
+            QApplication.restoreOverrideCursor()
+            self.statusBar().showMessage(msg, 5000)
+            
+            # Reset Batch UI
+            if hasattr(self, 'btn_batch'):
+                self.btn_batch.setText("OCR所有缺失页面")
+                self.btn_batch.setEnabled(True)
+            self.progress_bar.setVisible(False)
+        else:
+            # Background completion for other project
+            print(f"Background OCR finished for {getattr(worker, 'project_name', 'Unknown')}")
+            return # Do not update UI
         
         if success:
-            if self.ocr_thread.mode == 'single':
+            if worker.mode == 'single':
                 # Reload current page
                 self.combo_source.setCurrentText("OCR Results")
                 self.load_current_page()
@@ -4641,9 +4671,11 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "Batch Done", msg)
         else:
             if "Program interrupted" not in msg: # Don't error on manual stop
-                 QMessageBox.critical(self, "OCR Failed", msg)
+                 if is_current_project:
+                    QMessageBox.critical(self, "OCR Failed", msg)
         
-        self.ocr_thread = None
+        if self.ocr_thread == worker:
+            self.ocr_thread = None
 
     def export_slices(self):
         """如果当前是 OCR 模式且有 BBox 数据，则切割"""
@@ -4905,6 +4937,14 @@ class MainWindow(QMainWindow):
         name = self.combo_project.currentText()
         self.config_manager.set_active_project(name)
         self.project_config = self.config_manager.get_active_project()
+        
+        # Cleanup Old Project State
+        if self.find_replace_dialog:
+            self.find_replace_dialog.reset_review_ui()
+            
+        # Reset View to Start Page
+        start_p = self.project_config.get('start_page', 1)
+        self.spin_page.setText(str(start_p))
         
         # Reload
         self.reload_all_data()
