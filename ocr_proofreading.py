@@ -77,29 +77,25 @@ class ReviewTableModel(QAbstractTableModel):
 class HtmlDelegate(QStyledItemDelegate):
     def paint(self, painter, option, index):
         if index.column() == 2:
-            options = QTextOption()
-            options.setWrapMode(QTextOption.WrapMode.WordWrap)
-            
             painter.save()
             
             doc = QTextDocument()
-            doc.setHtml(index.model()._data[index.row()].get('context_html', ''))
-            doc.setTextWidth(option.rect.width())
+            html = index.model()._data[index.row()].get('context_html', '')
+            
+            width = option.rect.width()
+            if width <= 0: width = 200
+            
+            doc.setHtml(html)
+            doc.setTextWidth(width)
             doc.setDefaultFont(option.font)
             
-            # Translate painter to correct position
             painter.translate(option.rect.topLeft())
             
-            # Clip
-            # painter.setClipRect(QRect(0,0, option.rect.width(), option.rect.height()))
+            # Custom Selection Highlight
+            if option.state & QStyle.StateFlag.State_Selected:
+                 painter.fillRect(QRect(0, 0, width, int(doc.size().height())), QColor("#E0E0FF"))
             
             ctx = QAbstractTextDocumentLayout.PaintContext()
-            
-            # Highlight selection
-            if option.state & QStyle.StateFlag.State_Selected:
-                painter.fillRect(QRect(0,0, option.rect.width(), option.rect.height()), option.palette.highlight())
-                # doc.setDefaultStyleSheet("body { color: white; }") # Optional
-                
             doc.documentLayout().draw(painter, ctx)
             painter.restore()
         else:
@@ -109,11 +105,15 @@ class HtmlDelegate(QStyledItemDelegate):
         if index.column() == 2:
             doc = QTextDocument()
             doc.setHtml(index.model()._data[index.row()].get('context_html', ''))
-            doc.setTextWidth(option.rect.width())
+            
+            width = option.rect.width()
+            if width <= 0: width = 200
+            
+            doc.setTextWidth(width)
             doc.setDefaultFont(option.font)
-            # Add some padding
+            
             h = int(doc.size().height())
-            return QSize(int(doc.idealWidth()), h + 10)
+            return QSize(int(doc.idealWidth()), h + 15)
         return super().sizeHint(option, index)
 
 # ==========================================
@@ -2524,6 +2524,9 @@ class FindReplaceDialog(QDialog):
         # Custom Delegate
         self.review_table.setItemDelegate(HtmlDelegate(self.review_table))
         
+        # Double click to jump
+        self.review_table.doubleClicked.connect(self.on_review_table_dbl_click)
+        
         rev_layout.addWidget(self.review_table)
         
         h_rev = QHBoxLayout()
@@ -3431,9 +3434,24 @@ class FindReplaceDialog(QDialog):
         self.tabs.setVisible(False)
         self.scope_group.setVisible(False)
         self.review_group.setVisible(True)
+        self.review_table.resizeRowsToContents()
         self.status_label.setText(f"Found {len(self.current_review_items)} diff items.")
         
 
+
+    def on_review_table_dbl_click(self, index):
+        """Double click to jump to page"""
+        if not index.isValid(): return
+        
+        row = index.row()
+        if 0 <= row < len(self.current_review_items):
+            item = self.current_review_items[row]
+            page_num = item.get('page_num')
+            
+            # Jump to page in main window
+            if page_num:
+                self.mainwindow.spin_page.setText(str(page_num))
+                self.mainwindow.jump_page()
 
     def get_target_editor(self):
         if self.rb_left.isChecked():
@@ -3615,6 +3633,7 @@ class MainWindow(QMainWindow):
         self.global_undo_stack = [] 
         self.find_replace_dialog = None
         self.last_manual_edit_time = 0
+        self.current_loaded_page = None # Track actual loaded page index
         
         # 初始化界面
         self.init_ui()
@@ -3905,12 +3924,18 @@ class MainWindow(QMainWindow):
 
     def load_current_page(self):
         # Session-based dirty tracking: No prompts here.
+        # Save previous page first
+        self.save_current_page_data()
+
         self._is_loading = True
         try:
             page_num = self.project_config.get('start_page', 1)
             try:
                 page_num = int(self.spin_page.text())
             except: pass
+            
+            # Update tracker
+            self.current_loaded_page = page_num
             
             self.spin_page.setText(str(page_num))
         
@@ -4110,7 +4135,7 @@ class MainWindow(QMainWindow):
     def init_diff_timer(self):
         self.diff_timer = QTimer(self)
         self.diff_timer.setSingleShot(True)
-        self.diff_timer.setInterval(600) # 600ms debounce
+        self.diff_timer.setInterval(200) # 200ms debounce
         self.diff_timer.timeout.connect(self.run_diff_async)
 
     def run_diff(self):
@@ -4232,7 +4257,8 @@ class MainWindow(QMainWindow):
     def update_memory_cache(self):
         """Update memory dicts from editors"""
         try:
-            page_num = int(self.spin_page.text())
+            page_num = self.current_loaded_page
+            # Logic handled in save_current_page_data mostly, but for live updates:
             self.pages_left[page_num] = self.edit_left.toPlainText()
             if self.combo_source.currentText() == "Text File B":
                  self.pages_right_text[page_num] = self.edit_right.toPlainText()
@@ -4296,18 +4322,18 @@ class MainWindow(QMainWindow):
         mapped_py_idx = -1
         
         for tag, i1, i2, j1, j2 in opcodes:
-            # src range, dst range (Py indices)
-            s1, s2 = (i1, i2) if is_left_source else (j1, j2)
-            d1, d2 = (j1, j2) if is_left_source else (i1, i2)
-            
-            if s1 <= py_idx <= s2:
-                if tag == 'equal':
-                    offset = py_idx - s1
-                    mapped_py_idx = d1 + offset
-                    if mapped_py_idx > d2: mapped_py_idx = d2
-                else:
-                    mapped_py_idx = d1
-                break
+             # src range, dst range (Py indices)
+             s1, s2 = (i1, i2) if is_left_source else (j1, j2)
+             d1, d2 = (j1, j2) if is_left_source else (i1, i2)
+             
+             if s1 <= py_idx <= s2:
+                 if tag == 'equal':
+                     offset = py_idx - s1
+                     mapped_py_idx = d1 + offset
+                     if mapped_py_idx > d2: mapped_py_idx = d2
+                 else:
+                     mapped_py_idx = d1
+                 break
         
         if mapped_py_idx == -1: return -1
         
@@ -4315,6 +4341,26 @@ class MainWindow(QMainWindow):
         dst_editor = self.edit_right if is_left_source else self.edit_left
         dst_text = dst_editor.toPlainText()
         return to_qt_pos(dst_text, mapped_py_idx)
+
+    def save_current_page_data(self):
+        """Explicitly save editor content to memory dicts if changed"""
+        if self.current_loaded_page is None: return
+        p = self.current_loaded_page
+        
+        # Left
+        current_left = self.edit_left.toPlainText()
+        saved_left = self.pages_left.get(p, "")
+        if current_left != saved_left:
+            self.pages_left[p] = current_left
+            self.mark_page_dirty(p, True)
+            
+        # Right (Only if Text File B source)
+        if self.combo_source.currentText() == "Text File B":
+            current_right = self.edit_right.toPlainText()
+            saved_right = self.pages_right_text.get(p, "")
+            if current_right != saved_right:
+                 self.pages_right_text[p] = current_right
+                 self.mark_page_dirty(p, False)
 
     def on_scroll(self, source, target):
         """Percentage-based scroll sync"""
