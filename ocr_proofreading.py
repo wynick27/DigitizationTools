@@ -15,7 +15,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QFormLayout, QDialog, QDialogButtonBox, QSpinBox, 
                              QTabWidget, QToolBar, QComboBox, QCheckBox, QMenu,
                              QRadioButton, QButtonGroup, QGroupBox, QListWidgetItem, QGridLayout,
-                             QTableView, QHeaderView, QAbstractItemView, QStyle, QProgressDialog, QSizePolicy)
+                             QTableView, QHeaderView, QAbstractItemView, QStyle, QProgressDialog, QSizePolicy,
+                             QStackedWidget)
 from PyQt6.QtGui import (QTextCursor, QColor, QSyntaxHighlighter, QTextCharFormat, QTextFormat,
                          QAction, QPixmap, QImage, QPainter, QBrush, QPen, QFont, QImageReader, QTextOption,
                          QAbstractTextDocumentLayout, QTextDocument, QPalette)
@@ -23,107 +24,17 @@ from PyQt6.QtWidgets import QProgressBar, QStyledItemDelegate
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QEvent, QThread, pyqtSlot, QSize, QRect, QPoint, QAbstractTableModel, QModelIndex
 import bisect
 
+from ocr_lib.app_logic.find_replace import FindReplaceDialog
+from ocr_lib.core.image_utils import get_page_image
+from ocr_lib.core.text_utils import TextStripper
+from ocr_lib.app_logic.workers import DiffWorker, OCRWorker
+from ocr_lib.app_logic.image_export import TextToBBoxMapper, BBoxMerger, ImageStitcher
+
 
 
 # ==========================================
-# 0.2 Review Model / View
+# 0.2 Review Model / View (Refactored to ocr_lib)
 # ==========================================
-class ReviewTableModel(QAbstractTableModel):
-    def __init__(self, data):
-        super().__init__()
-        self._data = data # List of dicts
-        self._headers = ["", "Page", "Line", "Col", "Change Context"]
-
-    def rowCount(self, parent=None):
-        return len(self._data)
-
-    def columnCount(self, parent=None):
-        return 5
-
-    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
-        if not index.isValid(): return None
-        row = index.row()
-        col = index.column()
-        item = self._data[row]
-        
-        if role == Qt.ItemDataRole.DisplayRole:
-            if col == 1: return str(item['page_num'])
-            if col == 2: return str(item.get('line', ''))
-            if col == 3: return str(item.get('col', ''))
-            # Col 4 Handled by Delegate
-            return None
-        
-        if role == Qt.ItemDataRole.CheckStateRole and col == 0:
-            return Qt.CheckState.Checked if item['checked'] else Qt.CheckState.Unchecked
-            
-        return None
-
-    def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
-        if role == Qt.ItemDataRole.CheckStateRole and index.column() == 0:
-            self._data[index.row()]['checked'] = (value == Qt.CheckState.Checked.value)
-            self.dataChanged.emit(index, index, [role])
-            return True
-        return False
-
-    def headerData(self, section, orientation, role):
-        if role == Qt.ItemDataRole.DisplayRole and orientation == Qt.Orientation.Horizontal:
-            return self._headers[section]
-        return None
-
-    def flags(self, index):
-        f = super().flags(index)
-        if index.column() == 0:
-            f |= Qt.ItemFlag.ItemIsUserCheckable
-        return f
-
-class HtmlDelegate(QStyledItemDelegate):
-    def paint(self, painter, option, index):
-        if index.column() == 4:
-            painter.save()
-            
-            doc = QTextDocument()
-            html = index.model()._data[index.row()].get('context_html', '')
-            
-            # Subtract padding
-            width = option.rect.width() - 10
-            if width <= 0: width = 200
-            
-            doc.setHtml(html)
-            doc.setTextWidth(width)
-            doc.setDefaultFont(option.font)
-            
-            painter.translate(option.rect.topLeft() + QPoint(5, 5))
-            
-            # Custom Selection Highlight
-            if option.state & QStyle.StateFlag.State_Selected:
-                 painter.fillRect(QRect(-5, -5, width+10, int(doc.size().height())+10), QColor("#E0E0FF"))
-            
-            ctx = QAbstractTextDocumentLayout.PaintContext()
-            doc.documentLayout().draw(painter, ctx)
-            painter.restore()
-        else:
-            super().paint(painter, option, index)
-
-    def sizeHint(self, option, index):
-        if index.column() == 4:
-            doc = QTextDocument()
-            doc.setHtml(index.model()._data[index.row()].get('context_html', ''))
-            
-            # Use specific column width from the view if available
-            width = option.rect.width()
-            if self.parent(): # Assuming parent is the view
-                 width = self.parent().columnWidth(4)
-                 
-            # Allow some padding in calculation
-            text_width = width - 10
-            if text_width <= 50: text_width = 400 # Default fallback
-            
-            doc.setTextWidth(text_width)
-            doc.setDefaultFont(option.font)
-            
-            h = int(doc.size().height())
-            return QSize(int(doc.idealWidth()), h + 15) # Add padding
-        return super().sizeHint(option, index)
 
 # ==========================================
 # 0.5 Unicode Helpers
@@ -688,20 +599,126 @@ class DiffTextEdit(QPlainTextEdit):
     def mousePressEvent(self, event):
         # 处理 Ctrl + Click
         modifiers = QApplication.keyboardModifiers()
-        if (modifiers & Qt.KeyboardModifier.ControlModifier) and event.button() == Qt.MouseButton.LeftButton:
+        if modifiers & Qt.KeyboardModifier.ControlModifier:
             opcode = self.get_opcode_at_position(event.pos())
             if opcode:
-                self.handle_patch_click(opcode)
-                return # 拦截事件，不移动光标
+                tag, i1, i2, j1, j2 = opcode
+                # Apply Patch Logic
+                # Left Click: Apply Change?
+                # Right now, emit signal
+                
+                # Extract text from OTHER side
+                # For Left Editor, other side is Right.
+                # If Replace/Insert, we need text from Right(j1:j2)
+                # But self.other_text_content needs to be set!
+                
+                start_idx, end_idx = (i1, i2) if self.side == 'left' else (j1, j2)
+                
+                target_text = ""
+                if tag == 'replace':
+                    # Need corresponding text from OTHER side
+                    o_start, o_end = (j1, j2) if self.side == 'left' else (i1, i2)
+                    if self.other_text_content:
+                        target_text = self.other_text_content[o_start:o_end]
+                elif tag == 'delete':
+                    target_text = "" # Delete means replace with empty
+                elif tag == 'insert':
+                     # Insert means we are missing something present in other side
+                     o_start, o_end = (j1, j2) if self.side == 'left' else (i1, i2)
+                     if self.other_text_content:
+                        target_text = self.other_text_content[o_start:o_end]
+                        
+                self.apply_patch_signal.emit((start_idx, end_idx), target_text)
+                return
 
-        # 处理 Alt + Click (Push)
-        if (modifiers & Qt.KeyboardModifier.AltModifier) and event.button() == Qt.MouseButton.LeftButton:
+        super().mousePressEvent(event)
+
+
+class PreviewTextEdit(QTextEdit):
+    """
+    Rich Text Preview with Diff Interaction Support
+    Inherits QTextEdit instead of QPlainTextEdit
+    """
+    # Signals mirroring DiffTextEdit for compatibility
+    apply_patch_signal = pyqtSignal(tuple, str)
+    # Scroll Sync Signal
+    scroll_sync_signal = pyqtSignal(int)
+    
+    def __init__(self, side="left"):
+        super().__init__()
+        self.side = side
+        self.diff_opcodes = []
+        self.other_text_content = "" # Raw text of other side
+        self.setFont(QFont("Consolas", 11))
+        self.setMouseTracking(True)
+        
+    def set_diff_data(self, opcodes, other_text):
+        self.diff_opcodes = opcodes
+        self.other_text_content = other_text
+        
+    def get_opcode_at_position(self, pos):
+        # QTextEdit cursor lookup
+        cursor = self.cursorForPosition(pos)
+        qt_idx = cursor.position()
+        
+        # Approximate mapping: using PlainText index
+        # This might be slightly off for Rich Text / HTML if hidden tags exist?
+        # extra logic needed for exact mapping?
+        # For now, assume toPlainText() index aligns with OpCode index (which is based on stripped/plain text)
+        
+        # But wait, opcodes are based on STRIPPED text if ignore_tags is On.
+        # Preview displays STRIPPED text? No, Preview displays RENDERED text.
+        # If we used setMarkdown, the text content IS the stripped text (mostly).
+        # So we can try mapping directly.
+        
+        idx = qt_idx # Simplify for now
+        
+        for tag, i1, i2, j1, j2 in self.diff_opcodes:
+            if tag == 'equal': continue
+            
+            if self.side == 'left':
+                if i1 <= idx <= i2:
+                    return (tag, i1, i2, j1, j2)
+            else:
+                if j1 <= idx <= j2:
+                    return (tag, i1, i2, j1, j2)
+        return None
+
+    def mouseMoveEvent(self, event):
+        modifiers = QApplication.keyboardModifiers()
+        if modifiers & Qt.KeyboardModifier.ControlModifier:
+            if self.get_opcode_at_position(event.pos()):
+                self.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
+            else:
+                self.viewport().setCursor(Qt.CursorShape.IBeamCursor)
+        else:
+            self.viewport().setCursor(Qt.CursorShape.IBeamCursor)
+        super().mouseMoveEvent(event)
+
+    def mousePressEvent(self, event):
+        modifiers = QApplication.keyboardModifiers()
+        if modifiers & Qt.KeyboardModifier.ControlModifier:
             opcode = self.get_opcode_at_position(event.pos())
             if opcode:
-                self.handle_push_click(opcode)
+                # Same Logic as DiffTextEdit
+                tag, i1, i2, j1, j2 = opcode
+                start_idx, end_idx = (i1, i2) if self.side == 'left' else (j1, j2)
+                
+                target_text = ""
+                if tag == 'replace' or tag == 'insert':
+                    o_start, o_end = (j1, j2) if self.side == 'left' else (i1, i2)
+                    if self.other_text_content:
+                        target_text = self.other_text_content[o_start:o_end]
+                        
+                self.apply_patch_signal.emit((start_idx, end_idx), target_text)
                 return
                 
         super().mousePressEvent(event)
+        
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+             event.ignore() # Let parent handle zoom? or impl zoom
+        else:
+             super().wheelEvent(event)
 
     def handle_patch_click(self, opcode):
         tag, i1, i2, j1, j2 = opcode
@@ -858,576 +875,15 @@ class ImageCanvas(QGraphicsView):
             self.ensure_visible_bbox(x, y, w, h)
 
 
-# ==========================================
-# 2.2 OCR Worker (Async)
-# ==========================================
-
-class OCRWorker(QThread):
-    progress = pyqtSignal(str)
-    finished = pyqtSignal(bool, str) # success, message
-    
-    def __init__(self, mode, page_list, project_config, global_config, engine="remote"):
-        super().__init__()
-        self.mode = mode # 'single' or 'batch'
-        self.page_list = page_list # list of page numbers (int)
-        self.project_config = project_config
-        self.global_config = global_config
-        self.engine = engine
-        self.pdf_path = project_config.get('pdf_path')
-        self._is_running = True
-
-    def run(self):
-        doc = None
-        # Thread-safe PDF opening
-        if self.pdf_path and os.path.exists(self.pdf_path):
-            try:
-                doc = fitz.open(self.pdf_path)
-            except: pass
-            
-            
-        api_url = self.global_config.get("ocr_api_url")
-        token = self.global_config.get("ocr_api_token")
-        
-        save_dir = self.project_config.get("ocr_json_path", "ocr_results")
-        if not os.path.exists(save_dir): 
-            try: os.makedirs(save_dir)
-            except: pass
-            
-        total = len(self.page_list)
-        success_count = 0
-        
-        for i, page_num in enumerate(self.page_list):
-            if not self._is_running: break
-            
-            try:
-                self.progress.emit(f"Processing page {page_num} ({i+1}/{total})...")
-                real_page_num = page_num + self.project_config.get("page_offset", 0)
-                
-                # 1. Get Image Data (Bytes) using helper
-                img_dir = self.project_config.get('image_dir')
-                img_bytes = get_page_image(doc, img_dir, real_page_num)
-                            
-                if not img_bytes:
-                    if self.mode == 'single':
-                        raise Exception(f"No image found for page {page_num}")
-                    else:
-                        continue # Skip in batch
-                
-                result = None
-                
-                # --- Execution ---
-                if self.engine == "local":
-                    if not HAS_LOCAL_OCR:
-                        raise Exception("Local OCR module not loaded.")
-                    
-                    # Local needs file path usually, or we wrap bytes to temp
-                    # PaddleOCRVL expects path
-                    temp_path = os.path.join(save_dir, f"temp_{real_page_num}.thumb")
-                    with open(temp_path, "wb") as f:
-                        f.write(img_bytes)
-                        
-                    try:
-                        ocr = PaddleOCRVL() # Warning: instantiating inside thread? 
-                        # Ideally PaddleOCR is thread-safe or lightweight.
-                        # If init is heavy, should be done once.
-                        # But PaddleOCRVL wrapper might handle it.
-                        res = ocr.predict(temp_path)
-                        result = res[0] if res else []
-                    finally:
-                         if os.path.exists(temp_path): os.remove(temp_path)
-                         
-                else:
-                    # Remote API
-                    file_data = base64.b64encode(img_bytes).decode("ascii")
-                    headers = {
-                        "Authorization": f"token {token}",
-                        "Content-Type": "application/json"
-                    }
-                    payload = {
-                        "file": file_data,
-                        "fileType": 1,
-                        "useDocOrientationClassify": False,
-                        "useDocUnwarping": False,
-                        "useChartRecognition": False,
-                    }
-    
-                    response = requests.post(api_url, json=payload, headers=headers)
-                    
-                    if response.status_code != 200:
-                        if self.mode == 'single':
-                             raise Exception(f"Remote Error: {response.text}")
-                        else:
-                             print(f"Page {page_num} Error: {response.text}")
-                             continue
-    
-                    result = response.json().get("result")
-                
-                # 4. Save
-                json_path = os.path.join(save_dir, f"page_{real_page_num}.json")
-                with open(json_path, "w", encoding='utf8') as json_file:
-                    json.dump(result, json_file, ensure_ascii=False, indent=2)
-                    
-                success_count += 1
-                
-            except Exception as e:
-                print(f"OCR Error page {page_num}: {e}")
-                if self.mode == 'single':
-                    self.finished.emit(False, str(e))
-                    return
-                # Batch continues
-
-                
-        if doc: doc.close()
-        self.finished.emit(True, f"Batch OCR Done. {success_count}/{total} processed.")
-
-    def stop(self):
-        self._is_running = False
-
-class DiffWorker(QThread):
-    result_ready = pyqtSignal(list, list) # opcodes, ocr_opcodes
-
-    def __init__(self, text_l, text_r, ocr_text_full, need_ocr_map):
-        super().__init__()
-        self.text_l = text_l
-        self.text_r = text_r
-        self.ocr_text_full = ocr_text_full
-        self.need_ocr_map = need_ocr_map
-    
-    def run(self):
-        # Main Diff
-        matcher = difflib.SequenceMatcher(None, self.text_l, self.text_r, autojunk=False)
-        opcodes = matcher.get_opcodes()
-        
-        # OCR Mapping Diff
-        ocr_opcodes = []
-        if self.need_ocr_map and self.ocr_text_full:
-             m2 = difflib.SequenceMatcher(None, self.text_l, self.ocr_text_full, autojunk=False)
-             ocr_opcodes = m2.get_opcodes()
-             
-        self.result_ready.emit(opcodes, ocr_opcodes)
 
 # ==========================================
-# 4. Smart Image Export Helpers
+# 2.2 OCR Worker (Async) - Imported from ocr_lib
 # ==========================================
 
-class TextToBBoxMapper:
-    def __init__(self, ocr_json_dir, page_offset):
-        self.ocr_json_dir = ocr_json_dir
-        self.page_offset = page_offset
-        self.cache = {} # page_num -> list of {text, bbox, label}
+# ==========================================
+# 4. Smart Image Export Helpers - Imported from ocr_lib
+# ==========================================
 
-    def load_page_data(self, page_num):
-        if page_num in self.cache: return self.cache[page_num]
-        
-        real_page_num = page_num + self.page_offset
-        candidates = [f"page_{real_page_num}.json", f"{real_page_num}.json"]
-        data = []
-        
-        f_path = None
-        for n in candidates:
-             p = os.path.join(self.ocr_json_dir, n)
-             if os.path.exists(p):
-                 f_path = p
-                 break
-        
-        if f_path:
-            try:
-                with open(f_path, 'r', encoding='utf-8') as f:
-                    raw = json.load(f)
-                    
-                # Normalize
-                if isinstance(raw, list):
-                    # Standard Paddle: [[pts, (text, conf)], ...]
-                    for item in raw:
-                         if len(item) == 2:
-                             pts = item[0]
-                             xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
-                             bbox = [min(xs), min(ys), max(xs), max(ys)]
-                             txt = item[1][0]
-                             data.append({"text": txt, "bbox": bbox, "block_label": "text"})
-                elif isinstance(raw, dict):
-                     # Layout Parser
-                     blocks = []
-                     if "fullContent" in raw:
-                         blocks = raw.get("fullContent", {}).get("prunedResult", {}).get("parsing_res_list", [])
-                     
-                     if not blocks and "layoutParsingResults" in raw:
-                         # Fallback
-                         blocks = raw.get("layoutParsingResults", [{}])[0].get("prunedResult", {}).get("parsing_res_list", [])
-                     
-                     for b in blocks:
-                         if b.get('block_label') in ['text','paragraph_title','vertical_text']:
-                             data.append({
-                                 "text": b.get('block_content'),
-                                 "bbox": b.get('block_bbox'),
-                                 "block_label": b.get('block_label')
-                             })
-            except: pass
-            
-        self.cache[page_num] = data
-        return data
-
-
-    def get_page_text_map(self, page_num):
-        """
-        Returns:
-            blocks: List of block dicts
-            full_text: Concatenated string of all blocks
-            char_map: List where char_map[i] = block_index for full_text[i]
-        """
-        blocks = self.load_page_data(page_num)
-        full_text = ""
-        char_map = []
-        
-        for i, b in enumerate(blocks):
-            txt = b['text']
-            # We treat blocks as simply concatenated.
-            # Alignments will skip jumps between blocks naturally.
-            full_text += txt
-            char_map.extend([i] * len(txt))
-            
-        return blocks, full_text, char_map
-
-    def find_bboxes(self, entry_text, page_nums):
-        """
-        Map entry text to bboxes using diff alignment.
-        """
-        result_boxes = [] 
-        matched_block_indices = set() # (page, block_idx)
-        
-        # Pre-cleaning Entry Text?
-        # If we clean spaces, we lose map accuracy if we don't map back.
-        # But OCR usually lacks formatting spaces.
-        # Strategy: Match raw-ish texts.
-        
-        # Remove massive whitespace from entry to improve match quality with raw OCR
-        # But keep mapped relationships? 
-        # Actually SequenceMatcher with autojunk=True (or False) handles it.
-        # Let's use the entry_text as source query.
-        
-        clean_entry = entry_text.strip()
-        if not clean_entry: return []
-        
-        for page_num in page_nums:
-            blocks, page_text, char_map = self.get_page_text_map(page_num)
-            if not page_text: continue
-            
-            matcher = difflib.SequenceMatcher(None, clean_entry, page_text, autojunk=False)
-            
-            for i, j, n in matcher.get_matching_blocks():
-                if n == 0: continue
-                # Filter noise: single character matches that are common?
-                # e.g. matching a single punctuation.
-                if n < 2:
-                     # Check if it's CJK? CJK single char is significant.
-                     # ASCII single char is noise.
-                     chunk = clean_entry[i:i+n]
-                     if len(chunk.encode('utf-8')) == len(chunk): # Likely ASCII
-                         continue
-                
-                # Identify touched blocks
-                # Range in page_text: [j, j+n]
-                # Map to block indices
-                
-                # Boundary check
-                # char_map length might be less than j+n? No, indices are valid.
-                
-                affected = char_map[j : j+n]
-                for block_idx in affected:
-                    key = (page_num, block_idx)
-                    if key not in matched_block_indices:
-                        matched_block_indices.add(key)
-                        b = blocks[block_idx]
-                        result_boxes.append({
-                            "bbox": b['bbox'],
-                            "page": page_num,
-                            "label": b.get('block_label', 'text'),
-                            # Store index for sorting?
-                            "sort_key": (page_num, block_idx) # OCR order usually top-down/right-left
-                        })
-                        
-        # Sort results?
-        # Usually we want reading order.
-        # The page_nums iteration gives page order.
-        # Inside page, block_idx usually follows OCR reading order.
-        result_boxes.sort(key=lambda x: x["sort_key"])
-        
-        return result_boxes
-
-class BBoxMerger:
-    def merge(self, boxes):
-        """
-        Merge bboxes based on V/H rules.
-        boxes: list of {bbox: [x,y,w,h], page: int, label: str}
-        """
-        if not boxes: return []
-        
-        # Separate by page first?
-        # A Headword might span pages. Merging across pages is impossible for stitching (different source images).
-        # We will stitch per page (or just collect all merged boxes with page info).
-        
-        # Group by page
-        by_page = {}
-        for b in boxes:
-            p = b['page']
-            if p not in by_page: by_page[p] = []
-            by_page[p].append(b)
-            
-        final_merged = []
-        
-        for p in sorted(by_page.keys()):
-            page_boxes = by_page[p]
-            if not page_boxes: continue
-            
-            # Use label of first box to decide V/H ?
-            is_vertical = any(b['label'] == 'vertical_text' for b in page_boxes)
-            
-            if is_vertical:
-                merged = self._merge_vertical(page_boxes)
-            else:
-                merged = self._merge_horizontal(page_boxes)
-            final_merged.extend(merged)
-            
-        return final_merged
-
-    def _merge_horizontal(self, boxes):
-        # Sort Top-Down (y), then Left-Right (x)
-        # BBox format assumed [x, y, w, h] from loader (or list) -> Wait, layout loader uses [x,y,w,h]?
-        # Check load_ocr_json: "bbox": b.get('block_bbox') -> Usually [x,y,w,h] for layout parser?
-        # Need to be sure. My loader above: Paddle [x1,y1,x2,y2] -> converted to [x,min_y,w,h].
-        # Layout parser 'block_bbox'? Usually [x_min, y_min, w, h] or [x,y,r,b]? 
-        # CAUTION: If it's [x, y, w, h], fine. User code assumes it.
-        
-        # Let's standardize to x,y,w,h internally in Mapper loop?
-        # In Mapper: `bbox = [min(xs), min(ys), max(xs), max(ys)]` -> This is x1,y1,x2,y2.
-        # But `w = max-min`. 
-        # Wait, my TextToBBoxMapper code above:
-        # `bbox = [min(xs), min(ys), max(xs), max(ys)]` -> This is actually [x1, y1, x2, y2]. 
-        # Rect is (x1, y1, x2-x1, y2-y1).
-        
-        # Fix Mapper output to be x,y,w,h
-        pass # Will fix in next method override or ensure logic handles xyxy
-        
-        # Assume boxes have x,y,w,h (processed) or we handle it here.
-        # Let's normalize inside Merge.
-        
-        clean_boxes = []
-        for b in boxes:
-            bx = b['bbox']
-            # If length 4. Is it xywh or xyxy?
-            # Paddle loader above made it [min_x, min_y, max_x, max_y].
-            # Rect Logic: x=bx[0], y=bx[1], w=bx[2]-bx[0], h=bx[3]-bx[1].
-            x, y, x2, y2 = bx[0], bx[1], bx[2], bx[3] # Assuming xyxy from mapper
-            clean_boxes.append({'x':x, 'y':y, 'w':x2-x, 'h':y2-y, 'r':x2, 'b':y2, 'page':b['page']})
-            
-        # Sort Y
-        #clean_boxes.sort(key=lambda b: (b['y'], b['x']))
-        
-        merged = []
-        if not clean_boxes: return []
-        
-        curr = clean_boxes[0]
-        
-        for i in range(1, len(clean_boxes)):
-            nex = clean_boxes[i]
-            
-            # Horizontal Merge Rule:
-            # Same column (left aligned approx)
-            # Vertical gap small
-            
-            x_diff = abs(curr['x'] - nex['x'])
-            y_gap = nex['y'] - curr['b']
-            
-            if x_diff < 50 and y_gap < 50: # Thresholds?
-                # Merge
-                new_x = min(curr['x'], nex['x'])
-                new_y = min(curr['y'], nex['y'])
-                new_r = max(curr['r'], nex['r'])
-                new_b = max(curr['b'], nex['b'])
-                curr = {'x':new_x, 'y':new_y, 'w':new_r-new_x, 'h':new_b-new_y, 'r':new_r, 'b':new_b, 'page':curr['page']}
-            else:
-                merged.append(curr)
-                curr = nex
-        merged.append(curr)
-        return merged
-
-    def _merge_vertical(self, boxes):
-        # Sort Right-to-Left (x desc), then Top-Bottom
-        
-        clean_boxes = []
-        for b in boxes:
-            bx = b['bbox']
-            x, y, x2, y2 = bx[0], bx[1], bx[2], bx[3]
-            clean_boxes.append({'x':x, 'y':y, 'w':x2-x, 'h':y2-y, 'r':x2, 'b':y2, 'page':b['page']})
-            
-        # clean_boxes.sort(key=lambda b: (-b['x'], b['y']))
-        
-        merged = []
-        if not clean_boxes: return []
-        
-        curr = clean_boxes[0]
-        
-        for i in range(1, len(clean_boxes)):
-            nex = clean_boxes[i]
-            
-            # Vertical Merge Rule:
-            # User: "Front Box Left" and "Back Box Right" close -> Same column?
-            # i.e. `curr.x` (left edge) approx `nex.r` (right edge)? No, that's wrapping.
-            # Vertical text columns are adjacent horizontally.
-            # If they are in the SAME column, they share X range?
-            # But usually Vertical Text is strictly column based.
-            
-            # Rule: If X-range overlaps significantly?
-            # Or User Rule: "Right to Left merge".
-            # The input said: "前一个矩形框左侧和后一个矩形框右侧差别不大... 在同一栏".
-            # "Prev Left" approx "Next Right"?
-            # If Prev is strictly to the RIGHT of Next (R-L order), then Prev.Left > Next.Right.
-            # If "Diff small": Gap is small.
-            
-            gap = curr['x'] - nex['r'] # Gap between Prev Left and Next Right
-            
-            # Vertical overlap?
-            y_overlap = max(0, min(curr['b'], nex['b']) - max(curr['y'], nex['y']))
-            
-            # Merge if adjacent columns? Wait. "Merge into one image... width is sum".
-            # If we merge, we create a Super BBox that spans both columns?
-            # OR do we merge fragmented boxes within a column?
-            # User requirement: "Export slicing... merge pictures... width is sum".
-            # This implies the Stitcher does the visual merge. BBoxMerger just groupings?
-            # "合并矩形框... 完成后一个词条仍然对应多个矩形框".
-            # So BBoxMerger is reducing fragmentation.
-            
-            # Interpretation:
-            # - Horizontal: Multiline text in one column -> Merge into one big box (for that column).
-            # - Vertical: Multi-column text -> Merge?
-            # User says: "If same column -> merge".
-            # And "One entry corresponds to multiple bboxes" (after merge).
-            # So we DON'T merge across columns (usually).
-            
-            # Check if same column for Vertical Text:
-            # Similar X range.
-            x_center_1 = curr['x'] + curr['w']/2
-            x_center_2 = nex['x'] + nex['w']/2
-            
-            if abs(x_center_1 - x_center_2) < 20: # Same column
-                 # Merge vertically (extend height)
-                 new_y = min(curr['y'], nex['y'])
-                 new_b = max(curr['b'], nex['b'])
-                 new_x = min(curr['x'], nex['x'])
-                 new_r = max(curr['r'], nex['r'])
-                 
-                 curr = {'x':new_x, 'y':new_y, 'w':new_r-new_x, 'h':new_b-new_y, 'r':new_r, 'b':new_b, 'page':curr['page']}
-            else:
-                 merged.append(curr)
-                 curr = nex
-                 
-        merged.append(curr)
-        return merged
-
-class ImageStitcher:
-    def predict_size(self, boxes, is_vertical_text):
-        """
-        Predict stitched image size without processing.
-        Returns (width, height)
-        """
-        if not boxes: return 0, 0
-        
-        padding = 10
-        if is_vertical_text:
-            # Right-to-Left (Horizontal Stack)
-            # Width = Sum of widths + padding
-            # Height = Max height
-            # Note: The QImage in stitch adds +20 (canvas padding)
-            max_h = max(b['h'] for b in boxes)
-            total_w = sum(b['w'] for b in boxes) + padding * (len(boxes)-1)
-            return int(total_w + 20), int(max_h + 20)
-        else:
-            # Top-to-Bottom (Vertical Stack)
-            # Width = Max width
-            # Height = Sum of heights + padding
-            max_w = max(b['w'] for b in boxes)
-            total_h = sum(b['h'] for b in boxes) + padding * (len(boxes)-1)
-            return int(max_w + 20), int(total_h + 20)
-
-    def stitch(self, boxes, doc, img_dir, page_offset, is_vertical_text):
-        """
-        Crop and stitch.
-        boxes: list of merged {x,y,w,h,page}
-        doc: PDF doc (High Res)
-        img_dir: Image Dir fallback
-        """
-        slices = []
-        for b in boxes:
-            # Get Image
-            page_num = b['page']
-            real_p = page_num + page_offset
-            
-            img_qt = None
-            
-            try:
-                # Use shared helper to get full page image
-                img_bytes = get_page_image(doc, img_dir, real_p)
-                
-                if img_bytes:
-                    full_img = QImage()
-                    full_img.loadFromData(img_bytes)
-                    
-                    if not full_img.isNull():
-                        x, y, w, h = int(b['x']), int(b['y']), int(b['w']), int(b['h'])
-                        img_qt = full_img.copy(x, y, w, h)
-                        
-            except Exception as e:
-                print(f"Stitch crop error: {e}")
-                pass
-            
-            if img_qt and not img_qt.isNull():
-                slices.append(img_qt)
-            
-        if not slices: return None
-        
-        padding = 10
-        
-        if is_vertical_text:
-            # Stitch Right-to-Left (Horizontal Stack)
-            # Canvas
-            max_h = max(s.height() for s in slices)
-            total_w = sum(s.width() for s in slices) + padding * (len(slices)-1)
-            
-            final_img = QImage(total_w + 20, max_h + 20, QImage.Format.Format_RGB888)
-            final_img.fill(QColor("white"))
-            
-            painter = QPainter(final_img)
-            # Enable smooth pixmap transform? 
-            # painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-            
-            current_x = final_img.width() - 10 # Start from Right
-            
-            for s in slices:
-                x = current_x - s.width()
-                y = 10 # Top padding
-                painter.drawImage(x, y, s)
-                current_x = x - padding
-            painter.end()
-            
-        else:
-            # Stitch Top-to-Bottom (Vertical Stack)
-            max_w = max(s.width() for s in slices)
-            total_h = sum(s.height() for s in slices) + padding * (len(slices)-1)
-            
-            final_img = QImage(max_w + 20, total_h + 20, QImage.Format.Format_RGB888)
-            final_img.fill(QColor("white"))
-            
-            painter = QPainter(final_img)
-            
-            current_y = 10
-            
-            for s in slices:
-                x = 10 
-                painter.drawImage(x, current_y, s)
-                current_y += s.height() + padding
-            painter.end()
-            
-        return final_img
 
 
 class ImageExportWorker(QThread):
@@ -2069,1941 +1525,6 @@ class ProjectManagerDialog(QDialog):
 # 3. 主窗口
 # ==========================================
 
-# ==========================================
-# 2.5 Config & Templates & Workers
-# ==========================================
-
-class ReviewDiffWorker(QThread):
-    progress = pyqtSignal(int)
-    finished = pyqtSignal(list, str) # items, msg
-    
-    def __init__(self, pages, pages_left, pages_right, target_is_left, 
-                 regex_old, regex_new, 
-                 check_insert, check_delete, check_replace):
-        super().__init__()
-        self.pages = pages
-        self.pages_left = pages_left
-        self.pages_right = pages_right
-        self.target_is_left = target_is_left
-        self.regex_old = regex_old
-        self.regex_new = regex_new
-        self.chk_insert = check_insert
-        self.chk_delete = check_delete
-        self.chk_replace = check_replace
-        
-        self.is_running = True
-        self.items = []
-        
-    def run(self):
-        try:
-            total = len(self.pages)
-            for i, p in enumerate(self.pages):
-                if self.isInterruptionRequested(): break
-                
-                self.progress.emit(i + 1)
-                
-                # Get Texts
-                t_l = self.pages_left.get(p, "")
-                t_r = self.pages_right.get(p, "")
-                
-                text_a = ""
-                text_b = ""
-                if self.target_is_left:
-                     # Target=Left. Turn Left into Right.
-                     text_a = t_l
-                     text_b = t_r
-                else:
-                     # Target=Right. Turn Right into Left.
-                     text_a = t_r
-                     text_b = t_l
-                
-                self._generate_diff_items(p, text_a, text_b)
-                
-            self.finished.emit(self.items, "Done")
-            
-        except Exception as e:
-            self.finished.emit([], str(e))
-            
-    def _generate_diff_items(self, page_num, text_a, text_b):
-        matcher = difflib.SequenceMatcher(None, text_a, text_b, autojunk=False)
-        opcodes = matcher.get_opcodes()
-        
-        import html
-        
-        for tag, i1, i2, j1, j2 in opcodes:
-             if self.isInterruptionRequested(): break
-             if tag == 'equal': continue
-            
-             # Check Types
-             if tag == 'replace' and not self.chk_replace: continue
-             if tag == 'delete' and not self.chk_delete: continue
-             if tag == 'insert' and not self.chk_insert: continue
-            
-             old_segment = text_a[i1:i2]
-             new_segment = text_b[j1:j2]
-            
-             # Regex Filters
-             if self.regex_old and old_segment:
-                 if not self.regex_old.search(old_segment): continue
-             if self.regex_old and not old_segment: continue
-            
-             if self.regex_new and new_segment:
-                 if not self.regex_new.search(new_segment): continue
-             if self.regex_new and not new_segment: continue
-            
-             # Context
-             c_start = max(0, i1 - 10)
-             c_end = min(len(text_a), i2 + 10)
-             prefix = html.escape(text_a[c_start:i1])
-             suffix = html.escape(text_a[i2:c_end])
-             seg_old_esc = html.escape(old_segment)
-             seg_new_esc = html.escape(new_segment)
-             
-             style_del = "background-color:#ffcccc; text-decoration:line-through;"
-             style_ins = "background-color:#ccffcc;"
-            
-             diff_html = ""
-             if tag == 'replace':
-                  diff_html = f"{prefix}<span style='{style_del}'>{seg_old_esc}</span> <span style='{style_ins}'>{seg_new_esc}</span>{suffix}"
-             elif tag == 'delete':
-                  diff_html = f"{prefix}<span style='{style_del}'>{seg_old_esc}</span>{suffix}"
-             elif tag == 'insert':
-                  diff_html = f"{prefix}<span style='{style_ins}'>{seg_new_esc}</span>{suffix}"
-            
-             item_data = {
-                'page_num': page_num,
-                'span': (i1, i2), 
-                'original': old_segment,
-                'new': new_segment,
-                'context_html': diff_html,
-                'checked': True
-             }
-             self.items.append(item_data)
-
-class TemplateManager:
-    def __init__(self, filename="replace_templates.json"):
-        self.filename = filename
-        self.templates = {} # {name: [rules]}
-        self.load()
-        
-    def load(self):
-        if os.path.exists(self.filename):
-            try:
-                with open(self.filename, 'r', encoding='utf-8') as f:
-                    self.templates = json.load(f)
-            except: self.templates = {}
-        else:
-            self.templates = {}
-            
-    def save(self):
-        try:
-            with open(self.filename, 'w', encoding='utf-8') as f:
-                json.dump(self.templates, f, ensure_ascii=False, indent=2)
-        except: pass
-        
-    def get_template_names(self):
-        return sorted(list(self.templates.keys()))
-        
-    def get_rules(self, name):
-        return self.templates.get(name, [])
-        
-    def set_template(self, name, rules):
-        self.templates[name] = rules
-        self.save()
-
-    def delete_template(self, name):
-        if name in self.templates:
-            del self.templates[name]
-            self.save()
-
-
-class TemplateEditorDialog(QDialog):
-    def __init__(self, parent=None, template_manager=None, template_name=None):
-        super().__init__(parent)
-        self.setWindowTitle("Edit Template")
-        self.resize(700, 500)
-        self.manager = template_manager
-        self.current_name = template_name
-        self.rules = []
-        if template_name:
-            import copy
-            self.rules = copy.deepcopy(self.manager.get_rules(template_name))
-            
-        self.init_ui()
-        
-    def init_ui(self):
-        layout = QVBoxLayout(self)
-        
-        # Name
-        h_name = QHBoxLayout()
-        h_name.addWidget(QLabel("Template Name:"))
-        self.txt_name = QLineEdit()
-        if self.current_name: self.txt_name.setText(self.current_name)
-        h_name.addWidget(self.txt_name)
-        layout.addLayout(h_name)
-        
-
-        
-        # Rules List
-        self.list_rules = QListWidget()
-        self.list_rules.itemDoubleClicked.connect(self.edit_rule)
-        layout.addWidget(self.list_rules)
-        self.refresh_list()
-        
-        # Buttons
-        h_btns = QHBoxLayout()
-        btn_add = QPushButton("Add Rule")
-        btn_add.clicked.connect(self.add_rule)
-        btn_del = QPushButton("Delete Rule")
-        btn_del.clicked.connect(self.delete_rule)
-        btn_up = QPushButton("Move Up")
-        btn_up.clicked.connect(self.move_up)
-        btn_down = QPushButton("Move Down")
-        btn_down.clicked.connect(self.move_down)
-        
-        h_btns.addWidget(btn_add)
-        h_btns.addWidget(btn_del)
-        h_btns.addWidget(btn_up)
-        h_btns.addWidget(btn_down)
-        layout.addLayout(h_btns)
-        
-        # Dialog Buttons
-        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
-        btns.accepted.connect(self.save_and_close)
-        btns.rejected.connect(self.reject)
-        layout.addWidget(btns)
-        
-    def refresh_list(self):
-        self.list_rules.clear()
-        for i, rule in enumerate(self.rules):
-            # Summary string
-            pat = rule.get('find', '')
-            repl = rule.get('replace', '')
-            mode = rule.get('search_mode', 'Normal')
-            item = QListWidgetItem(f"{i+1}. [{mode}] '{pat}' -> '{repl}'")
-            item.setData(Qt.ItemDataRole.UserRole, i)
-            self.list_rules.addItem(item)
-            
-    def add_rule(self):
-        # Open simple dialog to get rule details
-        dlg = RuleEditDialog(self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            self.rules.append(dlg.get_data())
-            self.refresh_list()
-            
-    def edit_rule(self, item):
-        idx = item.data(Qt.ItemDataRole.UserRole)
-        rule = self.rules[idx]
-        dlg = RuleEditDialog(self, rule)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            self.rules[idx] = dlg.get_data()
-            self.refresh_list()
-            
-    def delete_rule(self):
-        row = self.list_rules.currentRow()
-        if row >= 0:
-            self.rules.pop(row)
-            self.refresh_list()
-            
-    def move_up(self):
-        row = self.list_rules.currentRow()
-        if row > 0:
-            self.rules[row], self.rules[row-1] = self.rules[row-1], self.rules[row]
-            self.refresh_list()
-            self.list_rules.setCurrentRow(row-1)
-
-    def move_down(self):
-        row = self.list_rules.currentRow()
-        if row < len(self.rules) - 1:
-            self.rules[row], self.rules[row+1] = self.rules[row+1], self.rules[row]
-            self.refresh_list()
-            self.list_rules.setCurrentRow(row+1)
-
-    def save_and_close(self):
-        name = self.txt_name.text().strip()
-        if not name:
-            QMessageBox.warning(self, "Error", "Template Name required")
-            return
-            
-        self.manager.set_template(name, self.rules)
-        self.accept()
-
-
-class RuleEditDialog(QDialog):
-    def __init__(self, parent=None, rule_data=None):
-        super().__init__(parent)
-        self.setWindowTitle("Edit Rule")
-        self.rule = rule_data or {}
-        self.init_ui()
-        
-    def init_ui(self):
-        layout = QFormLayout(self)
-        
-        self.txt_find = QLineEdit(self.rule.get('find', ''))
-        self.txt_repl = QLineEdit(self.rule.get('replace', ''))
-        
-        self.cmb_search_mode = QComboBox()
-        self.cmb_search_mode.addItems(["Normal", "Extended", "Regex"])
-        self.cmb_search_mode.setCurrentText(self.rule.get('search_mode', 'Normal'))
-        
-        self.cmb_repl_mode = QComboBox()
-        self.cmb_repl_mode.addItems(["Normal", "Regex Group", "Python Lambda", "Translate"])
-        self.cmb_repl_mode.setCurrentText(self.rule.get('replace_mode', 'Normal'))
-        
-        self.chk_case = QCheckBox("Case Sensitive")
-        self.chk_case.setChecked(self.rule.get('case_sensitive', False))
-        
-        self.chk_word = QCheckBox("Whole Word")
-        self.chk_word.setChecked(self.rule.get('whole_word', False))
-        
-        self.txt_source = QLineEdit(self.rule.get('source', ''))
-        
-        layout.addRow("Find / Filter:", self.txt_find)
-        self.lbl_source = QLabel("Source Chars:")
-        self.lbl_find = layout.labelForField(self.txt_find)
-        
-        # We need custom insertion for Source Chars row to be able to hide it?
-        # FormLayout allows hiding rows? Yes setVisible on widgets.
-        
-        layout.addRow(self.lbl_source, self.txt_source)
-        layout.addRow("Replace / Target:", self.txt_repl)
-        self.lbl_replace = layout.labelForField(self.txt_repl)
-        
-        layout.addRow("Search Mode:", self.cmb_search_mode)
-        layout.addRow("Replace Mode:", self.cmb_repl_mode)
-        layout.addRow("", self.chk_case)
-        layout.addRow("", self.chk_word)
-        
-        self.cmb_repl_mode.currentTextChanged.connect(self.update_ui)
-        self.update_ui(self.cmb_repl_mode.currentText())
-        
-        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        btns.accepted.connect(self.accept)
-        btns.rejected.connect(self.reject)
-        layout.addRow(btns)
-
-    def update_ui(self, mode):
-        is_translate = "Translate" in mode
-        self.lbl_source.setVisible(is_translate)
-        self.txt_source.setVisible(is_translate)
-        
-        if is_translate:
-            self.lbl_find.setText("Filter (Opt):")
-            self.lbl_replace.setText("Target Chars:")
-            self.txt_find.setPlaceholderText("Filter Pattern (Optional)")
-        else:
-            self.lbl_find.setText("Find:")
-            self.lbl_replace.setText("Replace:")
-            self.txt_find.setPlaceholderText("")
-        
-    def get_data(self):
-        return {
-            'find': self.txt_find.text(),
-            'replace': self.txt_repl.text(),
-            'source': self.txt_source.text(),
-            'search_mode': self.cmb_search_mode.currentText(),
-            'replace_mode': self.cmb_repl_mode.currentText(),
-            'case_sensitive': self.chk_case.isChecked(),
-            'whole_word': self.chk_word.isChecked()
-        }
-
-
-class ReviewDialog(QDialog):
-    def __init__(self, parent=None, replacements=None):
-        super().__init__(parent)
-        self.setWindowTitle("Review Replacements")
-        self.resize(800, 600)
-        self.replacements = replacements if replacements else []
-        self.init_ui()
-
-    def init_ui(self):
-        layout = QVBoxLayout(self)
-        
-        # Summary
-        layout.addWidget(QLabel(f"Found {len(self.replacements)} replacements. Uncheck to skip."))
-        
-        self.list_widget = QListWidget()
-        layout.addWidget(self.list_widget)
-        
-        # Controls
-        btn_layout = QHBoxLayout()
-        btn_all = QPushButton("Select All"); btn_all.clicked.connect(self.select_all)
-        btn_none = QPushButton("Deselect All"); btn_none.clicked.connect(self.deselect_all)
-        btn_layout.addWidget(btn_all)
-        btn_layout.addWidget(btn_none)
-        btn_layout.addStretch()
-        layout.addLayout(btn_layout)
-        
-        # Populate
-        for item in self.replacements:
-            self.add_item(item)
-            
-        # Dialog Buttons
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-        
-    def add_item(self, data):
-        lw_item = QListWidgetItem(self.list_widget)
-        widget = QWidget()
-        hbox = QHBoxLayout(widget)
-        hbox.setContentsMargins(2, 2, 2, 2)
-        
-        cb = QCheckBox()
-        cb.setChecked(True)
-        cb.toggled.connect(lambda c: self.update_check(data, c))
-        
-        # Context Label (Rich Text)
-        lbl = QLabel(data.get('context_html', ''))
-        lbl.setWordWrap(True)
-        lbl.setTextFormat(Qt.TextFormat.RichText)
-        lbl.setStyleSheet("border-bottom: 1px solid #eee;")
-        
-        # Page info
-        lbl_info = QLabel(f"Page {data.get('page_num')}")
-        lbl_info.setFixedWidth(60)
-        lbl_info.setStyleSheet("color: #888;")
-        
-        hbox.addWidget(cb)
-        hbox.addWidget(lbl_info)
-        hbox.addWidget(lbl, 1) # Stretch label
-        
-        widget.setLayout(hbox)
-        lw_item.setSizeHint(widget.sizeHint())
-        self.list_widget.setItemWidget(lw_item, widget)
-        
-    def update_check(self, data, checked):
-        data['checked'] = checked
-        
-    def select_all(self):
-        for i in range(self.list_widget.count()):
-            item = self.list_widget.item(i)
-            widget = self.list_widget.itemWidget(item)
-            cb = widget.findChild(QCheckBox)
-            if cb: cb.setChecked(True)
-            
-    def deselect_all(self):
-        for i in range(self.list_widget.count()):
-            item = self.list_widget.item(i)
-            widget = self.list_widget.itemWidget(item)
-            cb = widget.findChild(QCheckBox)
-            if cb: cb.setChecked(False)
-
-
-class FindReplaceDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Find and Replace")
-        self.resize(500, 450)
-        self.setModal(False)
-        self.mainwindow = parent
-        self.init_ui()
-
-    def init_ui(self):
-        main_layout = QVBoxLayout(self)
-        
-        # Tabs for Modes
-        self.tabs = QTabWidget()
-        main_layout.addWidget(self.tabs)
-        
-        # Tab 1: Standard
-        self.tab_standard = QWidget()
-        self.init_tab_standard()
-        self.tabs.addTab(self.tab_standard, "Standard / Regex")
-        
-        self.tab_batch = QWidget()
-        self.init_tab_batch()
-        self.tabs.addTab(self.tab_batch, "Batch / Templates")
-        
-        # Tab: Diff Filter
-        self.tab_diff = QWidget()
-        self.init_tab_diff()
-        self.tabs.addTab(self.tab_diff, "Diff Filter")
-        
-        # Scope Selection
-        self.scope_group = QGroupBox("Target Text")
-        scope_layout = QHBoxLayout(self.scope_group)
-        self.rb_left = QRadioButton("Left Text")
-        self.rb_right = QRadioButton("Right Text")
-        self.rb_right.setChecked(True)
-        scope_layout.addWidget(self.rb_left)
-        scope_layout.addWidget(self.rb_right)
-        main_layout.addWidget(self.scope_group)
-        
-        # Review Area (Integrated)
-        self.review_group = QGroupBox("Review Replacements")
-        self.review_group.setVisible(False)
-        rev_layout = QVBoxLayout(self.review_group)
-        
-        # Selection Controls (Wrapper for hiding)
-        self.review_top_widget = QWidget()
-        h_sel = QHBoxLayout(self.review_top_widget)
-        h_sel.setContentsMargins(0,0,0,0)
-        
-        self.btn_sel_all = QPushButton("Select All")
-        self.btn_sel_all.clicked.connect(self.select_all_review)
-        self.btn_sel_none = QPushButton("Select None")
-        self.btn_sel_none.clicked.connect(self.deselect_all_review)
-        self.btn_sel_toggle = QPushButton("Toggle Selection (Space)")
-        self.btn_sel_toggle.clicked.connect(self.toggle_review_selection)
-        self.btn_sel_toggle.setShortcut("Space")
-        
-        h_sel.addWidget(self.btn_sel_all)
-        h_sel.addWidget(self.btn_sel_none)
-        h_sel.addWidget(self.btn_sel_toggle)
-        h_sel.addStretch()
-        
-        rev_layout.addWidget(self.review_top_widget)
-        
-        self.review_table = QTableView()
-        self.review_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.review_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.review_table.verticalHeader().setVisible(False)
-        self.review_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        self.review_table.horizontalHeader().setStretchLastSection(True)
-        # Custom Delegate
-        self.review_table.setItemDelegate(HtmlDelegate(self.review_table))
-        
-        # Double click to jump
-        self.review_table.doubleClicked.connect(self.on_review_table_dbl_click)
-        
-        rev_layout.addWidget(self.review_table)
-        
-        h_rev = QHBoxLayout()
-        self.btn_rev_apply = QPushButton("Apply Selected")
-        self.btn_rev_apply.clicked.connect(self.apply_review_selection)
-        self.btn_rev_cancel = QPushButton("Cancel Review")
-        self.btn_rev_cancel.clicked.connect(self.close_review)
-        h_rev.addWidget(self.btn_rev_apply)
-        h_rev.addWidget(self.btn_rev_cancel)
-        rev_layout.addLayout(h_rev)
-        
-        main_layout.addWidget(self.review_group)
-
-        # Status
-        self.status_label = QLabel("")
-        main_layout.addWidget(self.status_label)
-        
-        # Initialize Template Manager
-        self.template_manager = TemplateManager()
-        self.refresh_combo_templates()
-        
-        # Load History
-        self.load_history()
-        
-    def load_history(self):
-        """Load Find/Replace history from global config"""
-        f_hist = self.mainwindow.global_config.get("find_history", [])
-        r_hist = self.mainwindow.global_config.get("replace_history", [])
-        
-        self.cb_find.clear()
-        self.cb_find.addItems(f_hist)
-        self.cb_find.setCurrentIndex(-1)
-        
-        self.cb_replace.clear()
-        self.cb_replace.addItems(r_hist)
-        self.cb_replace.setCurrentIndex(-1)
-        
-    def save_search_history(self):
-        """Save current find/replace terms to history"""
-        f_txt = self.cb_find.currentText().strip()
-        r_txt = self.cb_replace.currentText().strip()
-        
-        f_hist = self.mainwindow.global_config.get("find_history", [])
-        r_hist = self.mainwindow.global_config.get("replace_history", [])
-        
-        # Helper to update list
-        def update_list(lst, item):
-            if not item: return False
-            changed = False
-            if item in lst:
-                lst.remove(item)
-                changed = True
-            lst.insert(0, item)
-            # Limit size
-            while len(lst) > 20: 
-                lst.pop()
-                changed = True
-            return True # Always true if item added
-            
-        f_changed = update_list(f_hist, f_txt)
-        r_changed = update_list(r_hist, r_txt)
-        
-        if f_changed or r_changed:
-            self.mainwindow.global_config["find_history"] = f_hist
-            self.mainwindow.global_config["replace_history"] = r_hist
-            self.mainwindow.config_manager.save()
-            
-            # Dynamic UI Refresh
-            # Block signals to prevent recursion if we had currentIndexChanged connected
-            self.cb_find.blockSignals(True)
-            self.cb_replace.blockSignals(True)
-            
-            curr_f = self.cb_find.currentText()
-            curr_r = self.cb_replace.currentText()
-            
-            self.cb_find.clear()
-            self.cb_find.addItems(f_hist)
-            self.cb_find.setEditText(curr_f) # Restore text
-            
-            self.cb_replace.clear()
-            self.cb_replace.addItems(r_hist)
-            self.cb_replace.setEditText(curr_r) # Restore text
-
-            self.cb_find.blockSignals(False)
-            self.cb_replace.blockSignals(False)
-        
-    def init_tab_standard(self):
-        layout = QGridLayout(self.tab_standard)
-        
-        # Row 0: Find and Replace Inputs (Side by Side)
-        h_inputs = QHBoxLayout()
-        
-        # Find
-        self.lbl_find = QLabel("Find:")
-        self.cb_find = QComboBox()
-        self.cb_find.setEditable(True)
-        self.cb_find.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        
-        # Replace
-        self.lbl_replace = QLabel("Replace:")
-        self.cb_replace = QComboBox()
-        self.cb_replace.setEditable(True)
-        self.cb_replace.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        
-        h_inputs.addWidget(self.lbl_find)
-        h_inputs.addWidget(self.cb_find, 2) # weight 2
-        h_inputs.addWidget(self.lbl_replace)
-        h_inputs.addWidget(self.cb_replace, 2) 
-        
-        layout.addLayout(h_inputs, 0, 0, 1, 2)
-        
-        # Row 1: Source Chars (Hidden by default) - Translate Mode
-        self.lbl_src_chars = QLabel("Source Chars:")
-        self.cb_src_chars = QComboBox()
-        self.cb_src_chars.setEditable(True)
-        self.lbl_src_chars.setVisible(False)
-        self.cb_src_chars.setVisible(False)
-        
-        h_src = QHBoxLayout()
-        h_src.addWidget(self.lbl_src_chars)
-        h_src.addWidget(self.cb_src_chars)
-        layout.addLayout(h_src, 1, 0, 1, 2)
-
-        # Row 2: Options
-        opt_layout = QHBoxLayout()
-        self.chk_case = QCheckBox("Case Sensitive")
-        self.chk_word = QCheckBox("Whole Word")
-        self.chk_regex = QCheckBox("Regex")
-        self.chk_extended = QCheckBox("Extended (\\n, \\t)")
-        
-        opt_layout.addWidget(self.chk_case)
-        opt_layout.addWidget(self.chk_word)
-        opt_layout.addWidget(self.chk_regex)
-        opt_layout.addWidget(self.chk_extended)
-        layout.addLayout(opt_layout, 2, 0, 1, 2)
-        
-        # Row 3: Replace Mode
-        h = QHBoxLayout()
-        h.addWidget(QLabel("Replace Mode:"))
-        self.combo_repl_mode = QComboBox()
-        self.combo_repl_mode.addItems(["Normal", "Regex Group ($1)", "Python Lambda (match -> str)", "Translate (Char -> Char)"])
-        self.combo_repl_mode.currentTextChanged.connect(self.on_mode_changed)
-        h.addWidget(self.combo_repl_mode)
-        layout.addLayout(h, 3, 0, 1, 2)
-        
-        # Row 4: Actions
-        bg_act = QGroupBox("Actions")
-        v_act = QVBoxLayout(bg_act)
-        
-        # Row 1: Find Next | Replace (Current)
-        h_row1 = QHBoxLayout()
-        btn_find = QPushButton("Find Next")
-        btn_find.clicked.connect(self.on_find_next)
-        btn_repl = QPushButton("Replace")
-        btn_repl.clicked.connect(self.on_replace)
-        h_row1.addWidget(btn_find)
-        h_row1.addWidget(btn_repl)
-        
-        # Row 2: Find All (Page) | Find All (Global)
-        h_row2 = QHBoxLayout()
-        btn_find_all_page = QPushButton("Find All (Page)")
-        btn_find_all_page.clicked.connect(self.on_find_all_page)
-        btn_find_all_global = QPushButton("Find All (Global)")
-        btn_find_all_global.clicked.connect(self.on_find_all_global)
-        h_row2.addWidget(btn_find_all_page)
-        h_row2.addWidget(btn_find_all_global)
-        
-        # Row 3: Count (Page) | Count (Global)
-        h_row3 = QHBoxLayout()
-        btn_count_page = QPushButton("Count (Page)")
-        btn_count_page.clicked.connect(self.on_count_page)
-        btn_count_global = QPushButton("Count (Global)")
-        btn_count_global.clicked.connect(self.on_count_global)
-        h_row3.addWidget(btn_count_page)
-        h_row3.addWidget(btn_count_global)
-        
-        # Row 4: Replace All (Page) | Replace All (Global)
-        h_row4 = QHBoxLayout()
-        btn_repl_all = QPushButton("Replace All (Page)")
-        btn_repl_all.clicked.connect(self.on_replace_all_page)
-        btn_repl_global = QPushButton("Replace All (Global)")
-        btn_repl_global.clicked.connect(self.on_replace_all_global)
-        h_row4.addWidget(btn_repl_all)
-        h_row4.addWidget(btn_repl_global)
-        
-        # Row 5: Review (Page) | Review (Global)
-        h_row5 = QHBoxLayout()
-        btn_review = QPushButton("Review (Page)")
-        btn_review.clicked.connect(lambda: self.on_review(is_global=False))
-        btn_review_global = QPushButton("Review (Global)")
-        btn_review_global.clicked.connect(lambda: self.on_review(is_global=True))
-        h_row5.addWidget(btn_review)
-        h_row5.addWidget(btn_review_global)
-        
-        # Add to Layout
-        v_act.addLayout(h_row1)
-        v_act.addLayout(h_row2)
-        v_act.addLayout(h_row3)
-        v_act.addLayout(h_row4)
-        v_act.addLayout(h_row5)
-        
-        layout.addWidget(bg_act, 4, 0, 1, 2)
-        
-        layout.setRowStretch(5, 1)
-        
-    def on_mode_changed(self, text):
-        if "Translate" in text:
-            # Change Labels
-            self.tabs.setTabText(0, "Translate")
-            self.lbl_find.setText("Filter (Optional):")
-            self.lbl_replace.setText("Target Chars:")
-            self.cb_find.setPlaceholderText("Filter Pattern (or leave empty)")
-            self.cb_replace.setPlaceholderText("Target characters")
-
-            # Show Source Chars
-            self.lbl_src_chars.setVisible(True)
-            self.cb_src_chars.setVisible(True)
-        else:
-             self.tabs.setTabText(0, "Standard / Regex")
-             self.lbl_find.setText("Find:")
-             self.lbl_replace.setText("Replace:")
-             self.cb_find.setPlaceholderText("")
-             self.cb_replace.setPlaceholderText("")
-             
-             self.lbl_src_chars.setVisible(False)
-             self.cb_src_chars.setVisible(False)
-
-    def on_find_next(self):
-        self.save_search_history()
-        regex = self._compile_regex_from_ui()
-        if not regex: return
-        
-        editor = self.get_target_editor()
-        cursor = editor.textCursor()
-        
-        # Search from current position
-        text = editor.toPlainText()
-        pos = cursor.position()
-        
-        match = regex.search(text, pos)
-        
-        if not match:
-            # Wrap around?
-            match = regex.search(text, 0)
-            
-        if match:
-            start, end = match.span()
-            cursor.setPosition(start)
-            cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
-            editor.setTextCursor(cursor)
-            editor.ensureCursorVisible()
-            self.status_label.setText(f"Found match at {start}-{end}")
-        else:
-            self.status_label.setText("No match found.")
-
-    def on_replace(self):
-        self.save_search_history()
-        # Get current selection
-        editor = self.get_target_editor()
-        cursor = editor.textCursor()
-        
-        if not cursor.hasSelection():
-            self.on_find_next()
-            return
-
-        # Check if selection matches regex
-        text = editor.toPlainText()
-        sel_start = cursor.selectionStart()
-        sel_end = cursor.selectionEnd()
-        sel_text = cursor.selectedText()
-        
-        regex = self._compile_regex_from_ui()
-        if not regex: return
-        
-        # Verify if current selection is a match
-        # match = regex.fullmatch(sel_text) # Might fail if regex expects context
-        # Better: search at position
-        match = regex.search(text, sel_start)
-        
-        if match and match.start() == sel_start and match.end() == sel_end:
-            # It is a match, replace it
-            repl_text = self.cb_replace.currentText()
-            new_text = ""
-            
-            # Resolve replacement
-            repl_mode = self.combo_repl_mode.currentText()
-            try:
-                if "Python Lambda" in repl_mode:
-                    user_lambda = eval(f"lambda match: {repl_text}")
-                    new_text = str(user_lambda(match))
-                elif "Regex Group" in repl_mode:
-                    new_text = match.expand(repl_text)
-                elif "Translate" in repl_mode:
-                     src = self.cb_src_chars.currentText()
-                     tgt = self.cb_replace.currentText()
-                     table = str.maketrans(src, tgt)
-                     new_text = match.group().translate(table)
-                elif not self.chk_regex.isChecked() and self.chk_extended.isChecked():
-                     new_text = repl_text.replace('\\n', '\n').replace('\\t', '\t')
-                else:
-                     new_text = repl_text
-            except Exception as e:
-                QMessageBox.critical(self, "Replace Error", str(e))
-                return
-
-            cursor.insertText(new_text)
-            self.status_label.setText("Replaced.")
-            
-            # Find next?
-            self.on_find_next()
-        else:
-            # Selection is not a match, just find next
-            self.on_find_next()
-
-    def on_replace_all_page(self):
-        self.save_search_history()
-        self._batch_replace([self.mainwindow.spin_page.text()], is_global=False)
-
-    def on_replace_all_global(self):
-        self.save_search_history()
-        # Confirm
-        ret = QMessageBox.warning(self, "Global Replace", 
-            "This will replace ALL occurrences in the PROEJCT. \nEnsure you have reviewed or are confident.\nContinue?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if ret == QMessageBox.StandardButton.No: return
-        
-        pages = []
-        if self.rb_left.isChecked(): pages = list(self.mainwindow.pages_left.keys())
-        else: pages = list(self.mainwindow.pages_right_text.keys())
-        
-        self._batch_replace(pages, is_global=True)
-
-    def _batch_replace(self, page_nums, is_global=False):
-        regex = self._compile_regex_from_ui()
-        if not regex: return
-        
-        repl_mode = self.combo_repl_mode.currentText()
-        repl_text = self.cb_replace.currentText()
-        
-        # Prepare Repl Func
-        import html
-        repl_func = None
-
-        if "Python Lambda" in repl_mode:
-            try:
-                user_lambda = eval(f"lambda match: {repl_text}")
-                repl_func = lambda m: str(user_lambda(m))
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Lambda Error: {e}")
-                return
-        elif "Regex Group" in repl_mode:
-            repl_func = lambda m: m.expand(repl_text)
-        elif "Translate" in repl_mode:
-             src = self.cb_src_chars.currentText()
-             tgt = self.cb_replace.currentText()
-             try:
-                 table = str.maketrans(src, tgt)
-                 repl_func = lambda m: m.group().translate(table)
-             except Exception as e:
-                  QMessageBox.critical(self, "Error", f"Translate Error: {e}")
-                  return
-        elif not self.chk_regex.isChecked() and self.chk_extended.isChecked():
-             r_txt = repl_text.replace('\\n', '\n').replace('\\t', '\t')
-             repl_func = lambda m: r_txt
-        else:
-             repl_func = lambda m: repl_text
-             
-        # Undo Snapshot
-        if is_global:
-            self.mainwindow.push_global_undo("Replace All Global")
-        elif not is_global and len(page_nums) == 1:
-             # Page level undo handled by editor usually? 
-             # But we are modifying data dict directly or editor?
-             self.mainwindow.save_current_page_data()
-        
-        count = 0
-        target_dict = self.mainwindow.pages_left if self.rb_left.isChecked() else self.mainwindow.pages_right_text
-        
-        for p_key in page_nums:
-            try: p_num = int(p_key)
-            except: continue
-            
-            # Load text
-            if not is_global and str(p_num) == self.mainwindow.spin_page.text():
-                 # Use editor text for current page
-                 txt = self.get_target_editor().toPlainText()
-            else:
-                 txt = target_dict.get(p_num, "")
-            
-            # Apply Replace
-            try:
-                new_txt, n = regex.subn(repl_func, txt)
-                if n > 0:
-                    target_dict[p_num] = new_txt
-                    self.mainwindow.mark_page_dirty(p_num, self.rb_left.isChecked())
-                    count += n
-            except Exception as e:
-                print(f"Error replacing on page {p_num}: {e}")
-                
-        # Reload UI
-        if is_global or (len(page_nums) > 0 and str(page_nums[0]) == self.mainwindow.spin_page.text()):
-             self.mainwindow.force_ui_reload()
-
-        self.status_label.setText(f"Replaced {count} occurrences.")
-
-    def on_count_page(self):
-        self._count_matches(is_global=False)
-
-    def on_count_global(self):
-        self._count_matches(is_global=True)
-
-    def _count_matches(self, is_global):
-        regex = self._compile_regex_from_ui()
-        if not regex: return
-        
-        count = 0
-        scope_str = "Current Page" if not is_global else "Global Project"
-        
-        if is_global:
-            target_dict = self.mainwindow.pages_left if self.rb_left.isChecked() else self.mainwindow.pages_right_text
-            for txt in target_dict.values():
-                try: count += len(list(regex.finditer(txt)))
-                except: pass
-        else:
-            editor = self.get_target_editor()
-            text = editor.toPlainText()
-            try: count = len(list(regex.finditer(text)))
-            except: count = 0
-            
-        self.status_label.setText(f"Count ({scope_str}): {count} matches.")
-        
-    def init_tab_batch(self):
-        layout = QVBoxLayout(self.tab_batch)
-        
-        # Template Selection
-        h = QHBoxLayout()
-        h.addWidget(QLabel("Template:"))
-        self.combo_template = QComboBox()
-        
-        h.addWidget(self.combo_template, 1)
-        layout.addLayout(h)
-        
-        # Tools
-        bg_tools = QGroupBox("Template Management")
-        l_tools = QHBoxLayout(bg_tools)
-        
-        btn_new = QPushButton("New")
-        btn_new.clicked.connect(self.on_template_new)
-        btn_edit = QPushButton("Edit")
-        btn_edit.clicked.connect(self.on_template_edit)
-        btn_del = QPushButton("Delete")
-        btn_del.clicked.connect(self.on_template_delete)
-        
-        l_tools.addWidget(btn_new)
-        l_tools.addWidget(btn_edit)
-        l_tools.addWidget(btn_del)
-        layout.addWidget(bg_tools)
-        
-        # Actions
-        bg_run = QGroupBox("Execution")
-        l_run = QVBoxLayout(bg_run)
-        
-        btn_run_page = QPushButton("Run Batch (Current Page)")
-        btn_run_page.clicked.connect(self.on_batch_run_page)
-        btn_run_global = QPushButton("Run Batch (All Pages)")
-        btn_run_global.clicked.connect(self.on_batch_run_global)
-        
-        l_run.addWidget(btn_run_page)
-        l_run.addWidget(btn_run_global)
-        layout.addWidget(bg_run)
-        
-        layout.addStretch()
-
-    def init_tab_diff(self):
-        """Diff Filter UI"""
-        layout = QVBoxLayout(self.tab_diff)
-        
-        # 1. Opcode Selection
-        grp_op = QGroupBox("Select Changes to Apply (Opcodes)")
-        l_op = QHBoxLayout(grp_op)
-        self.chk_diff_insert = QCheckBox("Insert (Added text)")
-        self.chk_diff_delete = QCheckBox("Delete (Removed text)")
-        self.chk_diff_replace = QCheckBox("Replace (Modified text)")
-        self.chk_diff_insert.setChecked(True)
-        self.chk_diff_delete.setChecked(True)
-        self.chk_diff_replace.setChecked(True)
-        
-        l_op.addWidget(self.chk_diff_insert)
-        l_op.addWidget(self.chk_diff_delete)
-        l_op.addWidget(self.chk_diff_replace)
-        layout.addWidget(grp_op)
-        
-        # 2. Content Filters
-        grp_filter = QGroupBox("Content Filter (Regex)")
-        form = QFormLayout(grp_filter)
-        
-        # Original Text Filter (For Delete & Replace)
-        self.txt_diff_filter_old = QLineEdit()
-        self.txt_diff_filter_old.setPlaceholderText("Regex to match Original Text (Empty = All)")
-        form.addRow("Original Match:", self.txt_diff_filter_old)
-        
-        # New Text Filter (For Insert & Replace)
-        self.txt_diff_filter_new = QLineEdit()
-        self.txt_diff_filter_new.setPlaceholderText("Regex to match New Text (Empty = All)")
-        form.addRow("New Text Match:", self.txt_diff_filter_new)
-        
-        layout.addWidget(grp_filter)
-        
-        # 3. Actions
-        h_btn = QHBoxLayout()
-        btn_diff_page = QPushButton("Review Diff (Current Page)")
-        btn_diff_global = QPushButton("Review Diff (Global)")
-        
-        btn_diff_page.clicked.connect(lambda: self.on_review_diff(False))
-        btn_diff_global.clicked.connect(lambda: self.on_review_diff(True))
-        
-        h_btn.addWidget(btn_diff_page)
-        h_btn.addWidget(btn_diff_global)
-        layout.addLayout(h_btn)
-        
-        layout.addStretch()
-
-    def refresh_combo_templates(self):
-        curr = self.combo_template.currentText()
-        self.combo_template.clear()
-        names = self.template_manager.get_template_names()
-        self.combo_template.addItems(names)
-        if curr in names:
-            self.combo_template.setCurrentText(curr)
-        elif names:
-             self.combo_template.setCurrentIndex(0)
-
-    def on_template_new(self):
-        dlg = TemplateEditorDialog(self, self.template_manager, None)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            self.refresh_combo_templates()
-            # Select new
-            # If name is known? TemplateEditorDialog saves it.
-            # We can select it by name if we knew it, but refresh handles it.
-            
-    def on_template_edit(self):
-        curr = self.combo_template.currentText()
-        if not curr: return
-        dlg = TemplateEditorDialog(self, self.template_manager, curr)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            self.refresh_combo_templates()
-            self.combo_template.setCurrentText(curr) # Try maintain selection
-            
-    def on_template_delete(self):
-        curr = self.combo_template.currentText()
-        if not curr: return
-        
-        ret = QMessageBox.warning(self, "Delete Template", 
-            f"Are you sure you want to delete template '{curr}'?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            
-        if ret == QMessageBox.StandardButton.Yes:
-            self.template_manager.delete_template(curr)
-            self.refresh_combo_templates()
-            
-    def on_batch_run_page(self):
-        self._run_batch_logic(is_global=False)
-        
-    def on_batch_run_global(self):
-         # Confirm
-        ret = QMessageBox.warning(self, "Global Batch", 
-            "This will run multiple replacement rules on ALL pages. Ensure your template is correct.\nContinue?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if ret == QMessageBox.StandardButton.No: return
-        
-        self._run_batch_logic(is_global=True)
-        
-    def _run_batch_logic(self, is_global=False):
-        name = self.combo_template.currentText()
-        rules = self.template_manager.get_rules(name)
-        if not rules:
-             QMessageBox.warning(self, "Error", "No rules in template.")
-             return
-             
-        # Undo Snapshot
-        if is_global:
-            self.mainwindow.push_global_undo(f"Batch: {name}")
-            
-        target_dict = None
-        pages = []
-        
-        if is_global:
-            if self.rb_left.isChecked(): target_dict = self.mainwindow.pages_left
-            else: target_dict = self.mainwindow.pages_right_text
-            pages = list(target_dict.keys())
-        else:
-             # Current Page only
-             # Strategy: Modify current editor text directly?
-             # Or modify dict then reload? 
-             # If Modify Editor: we see updates live.
-             # But we have multiple rules.
-             pass
-             
-        editor = self.get_target_editor()
-        
-        # Pre-compile rules
-        compiled_rules = []
-        for r in rules:
-            try:
-                item = {}
-                r_mode = r.get('replace_mode', 'Normal')
-                pat = r['find']
-                r_text = r['replace']
-                
-                if "Translate" in r_mode:
-                    # Translate Mode: Source=Source Chars, Replace=Target, Find=Filter
-                    src = r.get('source', '')
-                    # If source missing (old rules), maybe fallback to 'find'?
-                    # But 'find' is now Filter.
-                    # Let's assume user updated rule. If src empty, maybe use find if it looks like char list?
-                    # No, strict mapping: Source->Src, Find->Filter.
-                    
-                    if not src and not r['find']: continue
-                    
-                    target_src = src if src else r['find'] # Fallback for migration/lazy usage if filter empty
-                    
-                    try:
-                        # Regex targets: Filter pattern OR Source Chars if filter empty
-                        filter_pat = r['find']
-                        
-                        if filter_pat:
-                             # Use user provided filter regex
-                             # Note: We need to translate matches of this filter.
-                             item['regex'] = re.compile(filter_pat)
-                        else:
-                             # No filter, find matches of source chars
-                             item['regex'] = re.compile(f"[{re.escape(target_src)}]")
-                             
-                        table = str.maketrans(target_src, r_text)
-                        
-                        # Apply func:
-                        # If we matched Filter, we translate the whole match using table?
-                        # Or partial? Usually whole match translate.
-                        # If we matched Source Chars directly, simple translate.
-                        item['func'] = lambda m: m.group().translate(table)
-                    except: continue
-                else:
-                    # Standard / Regex
-                    flags = 0
-                    if not r['case_sensitive']: flags |= re.IGNORECASE
-                    
-                    if r['search_mode'] == 'Regex':
-                        item['regex'] = re.compile(pat, flags)
-                    else:
-                        s_pat = pat
-                        if r['search_mode'] == 'Extended':
-                            s_pat = s_pat.replace('\\n', '\n').replace('\\t', '\t').replace('\\r', '\r')
-                        
-                        if not r['case_sensitive']:
-                             item['regex'] = re.compile(re.escape(s_pat), flags)
-                        else:
-                             item['regex'] = re.compile(re.escape(s_pat))
-                    
-                    if "Python Lambda" in r_mode:
-                         user_l = eval(f"lambda match: {r_text}")
-                         item['func'] = lambda m, ul=user_l: str(ul(m))
-                    elif "Regex Group" in r_mode:
-                         item['func'] = lambda m, rt=r_text: m.expand(rt)
-                    else:
-                         # Normal
-                         final_r = r_text
-                         item['func'] = lambda m, rt=final_r: rt
-                     
-                compiled_rules.append(item)
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Error compiling rule '{r['find']}': {e}")
-                return
-
-        count_total = 0
-        
-        if not is_global:
-            # Local Page: Apply sequentially to editor text
-            text = editor.toPlainText()
-            
-            # For each rule, apply to text
-            # Note: sequential application meant rule 2 sees result of rule 1.
-            
-            cursor = editor.textCursor()
-            cursor.beginEditBlock()
-            
-            # Optimize: apply to python string, then set ONCE?
-            # Or apply step by step to keep granular Undo? 
-            # If we setOnce, we lose granular undo of steps, but we have 1 Undo for "Batch Run". This is better.
-            
-            current_text = text
-            for cr in compiled_rules:
-                current_text, n = cr['regex'].subn(cr['func'], current_text)
-                count_total += n
-                
-            if current_text != text:
-                cursor.select(QTextCursor.SelectionType.Document)
-                cursor.insertText(current_text)
-            
-            cursor.endEditBlock()
-            
-        else:
-            # Global
-            for p in pages:
-                if p not in target_dict: continue
-                txt = target_dict[p]
-                
-                original = txt
-                for cr in compiled_rules:
-                    txt, n = cr['regex'].subn(cr['func'], txt)
-                    count_total += n
-                
-                if txt != original:
-                    target_dict[p] = txt
-                    self.mainwindow.mark_page_dirty(p, self.rb_left.isChecked())
-            
-            self.mainwindow.reload_displayed_texts()
-            
-        self.status_label.setText(f"Batch completed. {count_total} replacements.")
-
-    def on_replace_all_page(self):
-        self.save_search_history()
-        self._batch_replace([self.mainwindow.spin_page.text()], is_global=False)
-
-    def on_replace_all_global(self):
-        self.save_search_history()
-        # Confirm
-        ret = QMessageBox.warning(self, "Global Replace", 
-            "This will replace text in ALL pages. You can undo this action later, but manual edits might be lost if you undo.\nContinue?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if ret == QMessageBox.StandardButton.No: return
-        
-        # Save current page first!
-        self.mainwindow.save_current_page_data()
-        
-        # Get all page keys
-        if self.rb_left.isChecked():
-            pages = list(self.mainwindow.pages_left.keys())
-        else:
-            pages = list(self.mainwindow.pages_right_text.keys())
-        
-        self._batch_replace(pages, is_global=True)
-
-    def _batch_replace(self, page_nums, is_global=False):
-        """Generic batch replace logic"""
-        # 1. Prepare Logic
-        regex = self._compile_regex_from_ui()
-        if not regex:
-             # Check if it was because of empty pattern/src?
-             # For standard modes, empty pattern is invalid.
-             # For translate, empty src is invalid.
-             return
-
-        target_is_left = self.rb_left.isChecked()
-        repl_text = self.cb_replace.currentText()
-        repl_mode = self.combo_repl_mode.currentText()
-        
-        # Snapshot for Undo (if global)
-        if is_global:
-            self.mainwindow.push_global_undo("Replace All")
-
-        repl_func = None
-        # Determine replacement string/func
-        repl_mode = self.combo_repl_mode.currentText()
-        
-        if "Python Lambda" in repl_mode:
-            try:
-                # Security risk accepted by user
-                user_lambda = eval(f"lambda match: {repl_text}")
-                repl_func = lambda m: str(user_lambda(m))
-            except Exception as e:
-                 QMessageBox.critical(self, "Error", f"Invalid Python Code: {e}")
-                 return
-        elif "Regex Group" in repl_mode:
-            repl_func = lambda m: m.expand(repl_text)
-        elif "Translate" in repl_mode:
-             src = self.cb_src_chars.currentText()
-             tgt = self.cb_replace.currentText()
-             try:
-                 table = str.maketrans(src, tgt)
-                 repl_func = lambda m: m.group().translate(table)
-             except: return
-        else:
-            # Normal / Extended
-            r_txt = repl_text
-            if not self.chk_regex.isChecked() and self.chk_extended.isChecked():
-                 r_txt = r_txt.replace('\\n', '\n').replace('\\t', '\t')
-            repl_func = lambda m: r_txt
-
-        # Statistics
-        count = 0
-        
-        # Execution
-        # If current page == editor, use editor API for Undo support (if not global or consistent)
-        # Actually mixed approach: Editor for active, Dict for others?
-        # To keep it simple: Update Dict, then Reload Editor. 
-        # BUT losing editor undo stack for current page is annoying.
-        # Strategy: 
-        #   If is_global: Update Dicts. Reload. (Undo via Global Undo).
-        #   If single page (current): Use Editor API (Undo via Ctrl+Z).
-        
-        editor = self.get_target_editor()
-        
-        if not is_global:
-            # Local Page - Editor API
-            text = editor.toPlainText()
-            matches = list(regex.finditer(text))
-            if not matches:
-                self.status_label.setText("No matches found.")
-                return
-            
-            cursor = editor.textCursor()
-            cursor.beginEditBlock()
-            # Reverse apply
-            for m in reversed(matches):
-                start, end = m.span()
-                try:
-                    new_s = repl_func(m)
-                    cursor.setPosition(start)
-                    cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
-                    cursor.insertText(new_s)
-                    count += 1
-                except: pass
-            cursor.endEditBlock()
-            
-        else:
-            # Global - Dict API
-            target_dict = self.mainwindow.pages_left if target_is_left else self.mainwindow.pages_right_text
-            
-            for p in page_nums:
-                p_key = int(p) if isinstance(p, str) and p.isdigit() else p
-                if p_key not in target_dict: continue
-                
-                txt = target_dict[p_key]
-                # re.sub with function
-                new_txt, n = regex.subn(repl_func, txt)
-                
-                if n > 0:
-                    target_dict[p_key] = new_txt
-                    self.mainwindow.mark_page_dirty(p_key, target_is_left)
-                    count += n
-            
-            # Reload if current page affected
-            if hasattr(self.mainwindow, 'force_ui_reload'):
-                self.mainwindow.force_ui_reload()
-
-        self.status_label.setText(f"Replaced {count} occurrences.")
-
-
-    def on_count(self):
-        regex = self._compile_regex_from_ui()
-        if not regex: return
-        
-        # Current Page Count
-        editor = self.get_target_editor()
-        text_page = editor.toPlainText()
-        try:
-            count_page = len(list(regex.finditer(text_page)))
-        except: count_page = 0
-            
-        # Global Count
-        count_global = 0
-        target_dict = self.mainwindow.pages_left if self.rb_left.isChecked() else self.mainwindow.pages_right_text
-        for txt in target_dict.values():
-            try:
-                count_global += len(list(regex.finditer(txt)))
-            except: pass
-            
-        self.status_label.setText(f"Matches: {count_page} (Current Page) / {count_global} (Global Project)")
-
-    def on_find_all_page(self):
-        self.on_review(is_global=False, find_only=True)
-        
-    def on_find_all_global(self):
-        self.on_review(is_global=True, find_only=True)
-
-    def select_all_review(self):
-        if not self.review_table.model(): return
-        for i in range(self.review_table.model().rowCount()):
-            self.review_table.model()._data[i]['checked'] = True
-        self.review_table.model().layoutChanged.emit() # Refresh all
-        
-    def deselect_all_review(self):
-        if not self.review_table.model(): return
-        for i in range(self.review_table.model().rowCount()):
-            self.review_table.model()._data[i]['checked'] = False
-        self.review_table.model().layoutChanged.emit()
-
-    def toggle_review_selection(self):
-        rows = sorted(set(index.row() for index in self.review_table.selectedIndexes()))
-        if not rows or not self.review_table.model(): return
-        
-        # Toggle based on first selected item? Or flip each?
-        # User said "Select items then check/uncheck".
-        # If mixed, maybe set all to Checked? Or Unchecked?
-        # Standard: Flip each.
-        
-        m = self.review_table.model()
-        for r in rows:
-            m._data[r]['checked'] = not m._data[r]['checked']
-            
-        # Optimize emit?
-        # model.dataChanged for specific rows?
-        # LayoutChanged is easiest for now.
-        m.layoutChanged.emit()
-
-    def on_review(self, is_global=False, find_only=False):
-        # 1. Clear previous
-        self.current_review_items = []
-        self.review_is_global = is_global
-        
-        regex = self._compile_regex_from_ui()
-        if not regex: return
-        
-        pages = []
-        if is_global:
-            if self.rb_left.isChecked(): pages = list(self.mainwindow.pages_left.keys())
-            else: pages = list(self.mainwindow.pages_right_text.keys())
-        else:
-            pages = [self.mainwindow.spin_page.text()]
-            
-        self.status_label.setText("Generating review...")
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        
-        try:
-            target_dict = self.mainwindow.pages_left if self.rb_left.isChecked() else self.mainwindow.pages_right_text
-            
-            for p_key in pages:
-                try: p_num = int(p_key)
-                except: continue
-                
-                text = ""
-                if not is_global:
-                     text = self.get_target_editor().toPlainText()
-                else:
-                     text = target_dict.get(p_num, "")
-                
-                self._generate_review_items_for_page(p_num, text, regex, is_find_only=find_only)
-                
-            # Set Model
-            self.model = ReviewTableModel(self.current_review_items)
-            self.review_table.setModel(self.model)
-            # Resize
-            self.review_table.resizeColumnsToContents()
-            self.review_table.resizeRowsToContents()
-            self.review_table.horizontalHeader().setStretchLastSection(True)
-            # Set Col 0 width fix
-            self.review_table.setColumnWidth(0, 30)
-            self.review_table.setColumnWidth(4, 400) # Give more space to context
-                
-        finally:
-            QApplication.restoreOverrideCursor()
-            
-        if not self.current_review_items:
-            self.status_label.setText("No matches found.")
-            return
-
-        # 3. Show Review UI
-        self.tabs.setVisible(False)
-        self.scope_group.setVisible(False)
-        self.review_group.setVisible(True)
-        self.status_label.setText(f"Found {len(self.current_review_items)} {'matches' if find_only else 'replacements'}.")
-        
-        # Adjust UI for Find vs Replace
-        if find_only:
-            self.review_table.setColumnHidden(0, True) # Hide Checkboxes
-            self.review_top_widget.setVisible(False)   # Hide Top Selection Buttons
-            self.btn_rev_apply.setVisible(False)       # Hide Apply Button
-            self.btn_rev_cancel.setText("Back")        # Change Cancel to Back
-        else:
-            self.review_table.setColumnHidden(0, False)
-            self.review_top_widget.setVisible(True)
-            self.btn_rev_apply.setVisible(True)
-            self.btn_rev_cancel.setText("Cancel Review")
-
-    def _generate_review_items_for_page(self, page_num, text, regex, is_find_only=False):
-        import html
-        
-        repl_func = None
-        if not is_find_only:
-            repl_mode = self.combo_repl_mode.currentText()
-            repl_text = self.cb_replace.currentText()
-
-            if "Python Lambda" in repl_mode:
-                try:
-                    user_lambda = eval(f"lambda match: {repl_text}")
-                    repl_func = lambda m: str(user_lambda(m))
-                except: return
-            elif "Regex Group" in repl_mode:
-                repl_func = lambda m: m.expand(repl_text)
-            elif "Translate" in repl_mode:
-                 src = self.cb_src_chars.currentText()
-                 tgt = self.cb_replace.currentText()
-                 try:
-                     table = str.maketrans(src, tgt)
-                     repl_func = lambda m: m.group().translate(table)
-                 except: return
-            elif not self.chk_regex.isChecked() and self.chk_extended.isChecked():
-                 r_txt = repl_text.replace('\\n', '\n').replace('\\t', '\t')
-                 repl_func = lambda m: r_txt
-            else:
-                 repl_func = lambda m: repl_text
-        
-        matches = list(regex.finditer(text))
-        
-        for m in matches:
-            original = m.group()
-            start, end = m.span()
-            
-            # Line/Col Calculation
-            line = text.count('\n', 0, start) + 1
-            last_nl = text.rfind('\n', 0, start)
-            if last_nl == -1: col = start + 1
-            else: col = start - last_nl
-            
-            new_t = original
-            item_checked = True
-            
-            if not is_find_only and repl_func:
-                try:
-                    new_t = repl_func(m)
-                except: new_t = "ERROR"
-                
-                # If no change, skip in replace mode
-                if original == new_t: continue
-            else:
-                # Find Only mode: uncheck by default if we want? 
-                # Or check to allow "Select and Delete"? No, Find All shouldn't delete.
-                # Just check so user sees them highlighted.
-                item_checked = False
-            
-            # Context HTML
-            c_start = max(0, start - 20)
-            c_end = min(len(text), end + 20)
-            
-            prefix = html.escape(text[c_start:start])
-            suffix = html.escape(text[end:c_end])
-            orig_esc = html.escape(original)
-            
-            diff_html = ""
-            if is_find_only:
-                # Highlight only
-                diff_html = f"{prefix}<span style='background-color:#ffff00; color:black;'><b>{orig_esc}</b></span>{suffix}"
-            else:
-                # Diff style
-                new_esc = html.escape(new_t)
-                diff_html = f"{prefix}<span style='background-color:#ffcccc; text-decoration:line-through;'>{orig_esc}</span> <span style='background-color:#ccffcc;'><b>{new_esc}</b></span>{suffix}"
-            
-            item_data = {
-                'page_num': page_num,
-                'line': line,
-                'col': col,
-                'span': (start, end), 
-                'original': original,
-                'new': new_t,
-                'context_html': diff_html,
-                'checked': item_checked
-            }
-            self.current_review_items.append(item_data)
-        
-    def close_review(self):
-        self.review_group.setVisible(False)
-        self.tabs.setVisible(True)
-        self.scope_group.setVisible(True)
-        self.status_label.setText("Review cancelled.")
-        self.review_table.setModel(None) # Clear memory
-        
-    def apply_review_selection(self):
-        # Use data from model (it might have been updated by checkboxes)
-        to_apply = [x for x in self.current_review_items if x['checked']]
-        if not to_apply: return
-        
-        to_apply.sort(key=lambda x: (int(x['page_num']), x['span'][0]), reverse=True)
-        
-        # Save current page first!
-        self.mainwindow.save_current_page_data()
-        
-        if self.review_is_global:
-            self.mainwindow.push_global_undo("Review Apply")
-            
-        from collections import defaultdict
-        by_page = defaultdict(list)
-        for item in to_apply:
-            by_page[item['page_num']].append(item)
-            
-        count = 0
-        target_dict = self.mainwindow.pages_left if self.rb_left.isChecked() else self.mainwindow.pages_right_text
-        
-        try: curr_p = int(self.mainwindow.spin_page.text())
-        except: curr_p = -999
-            
-        for p_num, items in by_page.items():
-            # Always load from memory since we just saved current page
-            txt = target_dict.get(p_num, "")
-            
-            # Create new text by applying patches
-            # Since items are sorted reverse, index shifting is handled?
-            # Items are sorted by page THEN span start desc.
-            # But here `items` is list for ONE page.
-            # Need to ensure `items` for this page are sorted reverse by start index.
-            items.sort(key=lambda x: x['span'][0], reverse=True)
-            
-            new_txt = txt
-            for item in items:
-                start, end = item['span']
-                repl_t = item['new']
-                # Verify context match
-                if new_txt[start:end] == item['original']:
-                     new_txt = new_txt[:start] + repl_t + new_txt[end:]
-                     count += 1
-            
-            # Update memory
-            target_dict[p_num] = new_txt
-            self.mainwindow.mark_page_dirty(p_num, self.rb_left.isChecked())
-            
-        if self.review_is_global:
-            if hasattr(self.mainwindow, 'force_ui_reload'): self.mainwindow.force_ui_reload()
-        else:
-            # If local review, we might not be in global mode, but still affecting current page
-            # Just reload to be safe and consistent
-            if hasattr(self.mainwindow, 'force_ui_reload'): self.mainwindow.force_ui_reload()
-            
-        self.close_review()
-        self.status_label.setText(f"Applied {count} changes.")
-        
-    def _compile_regex_from_ui(self):
-        pattern = self.cb_find.currentText()
-        repl_mode = self.combo_repl_mode.currentText()
-        
-        # Translate Mode Special Case
-        if "Translate" in repl_mode:
-             if not pattern:
-                 # If no filter pattern, match ANY of the source chars
-                 src = self.cb_src_chars.currentText()
-                 if not src: return None
-                 try:
-                     return re.compile(f"[{re.escape(src)}]")
-                 except: return None
-        
-        if not pattern: return None
-        try:
-            flags = 0
-            if not self.chk_case.isChecked(): flags |= re.IGNORECASE
-            if self.chk_regex.isChecked():
-                return re.compile(pattern, flags)
-            else:
-                s_pat = pattern
-                if self.chk_extended.isChecked():
-                     s_pat = s_pat.replace('\\n', '\n').replace('\\t', '\t').replace('\\r', '\r')
-                return re.compile(re.escape(s_pat), flags)
-        except: return None
-
-
-
-    def on_review_diff(self, is_global):
-        """Handler for Diff Filter Review"""
-        self.review_group.setVisible(False)
-        self.current_review_items = []
-        self.review_is_global = is_global
-        
-        # 1. Compile filters
-        regex_old = None
-        regex_new = None
-        pat_old = self.txt_diff_filter_old.text()
-        pat_new = self.txt_diff_filter_new.text()
-        
-        try:
-             if pat_old: regex_old = re.compile(pat_old)
-             if pat_new: regex_new = re.compile(pat_new)
-        except Exception as e:
-             QMessageBox.critical(self, "Regex Error", str(e))
-             return
-
-        # 2. Determine target side
-        # Use selection from "Target Text" groupbox which dictates "Target" side.
-        # But for Diff, we usually compare Left vs Right.
-        # If Target=Right, we modify Right to match Left? Or vice versa?
-        # Standard: applying changes TO Target.
-        # Implies Source is the OTHER side.
-        
-        target_is_left = self.rb_left.isChecked()
-        target_side = "Left" if target_is_left else "Right"
-        
-        # 3. Pages
-        start_page = self.mainwindow.project_config.get('start_page', 1)
-        end_page = self.mainwindow.project_config.get('end_page', 1) # Default 1? No usually max.
-        
-        # For current page:
-        if not is_global:
-            try:
-                p = int(self.mainwindow.spin_page.text())
-                pages = [p]
-            except: pages = []
-        else:
-             # Need to know max pages?
-             # From project config or scan?
-             # Let's use start/end from config if available, or scan memory.
-             # Memory pages keys.
-             keys_l = set(self.mainwindow.pages_left.keys())
-             keys_r = set(self.mainwindow.pages_right_text.keys())
-             all_pages = sorted(list(keys_l | keys_r))
-             pages = all_pages
-             
-        # 4. Process
-        # 4. Start Worker
-        self.progress_dialog = QProgressDialog("Analyzing differences...", "Cancel", 0, len(pages), self)
-        self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
-        self.progress_dialog.setMinimumDuration(200)
-        self.progress_dialog.setValue(0)
-        
-        self.diff_worker_thread = ReviewDiffWorker(
-            pages, 
-            self.mainwindow.pages_left, 
-            self.mainwindow.pages_right_text,
-            target_is_left,
-            regex_old, regex_new,
-            self.chk_diff_insert.isChecked(),
-            self.chk_diff_delete.isChecked(),
-            self.chk_diff_replace.isChecked()
-        )
-        
-        self.diff_worker_thread.progress.connect(self.progress_dialog.setValue)
-        self.diff_worker_thread.finished.connect(self.on_diff_worker_finished)
-        self.progress_dialog.canceled.connect(self.diff_worker_thread.requestInterruption)
-        
-        self.diff_worker_thread.start()
-
-    def on_diff_worker_finished(self, items, msg):
-        self.diff_worker_thread = None
-        self.progress_dialog.close()
-        
-        if msg != "Done" and msg != "Cancelled": 
-             if msg: QMessageBox.warning(self, "Diff Info", msg)
-        
-        self.current_review_items = items
-        
-        if not items:
-            self.status_label.setText("No diff items found.")
-            return
-
-        self.model = ReviewTableModel(self.current_review_items)
-        self.review_table.setModel(self.model)
-        
-        self.tabs.setVisible(False)
-        self.scope_group.setVisible(False)
-        self.review_group.setVisible(True)
-        self.review_table.resizeRowsToContents()
-        self.status_label.setText(f"Found {len(self.current_review_items)} diff items.")
-        
-
-
-    def on_review_table_dbl_click(self, index):
-        """Double click to jump to page and exact location"""
-        if not index.isValid(): return
-        
-        row = index.row()
-        if 0 <= row < len(self.current_review_items):
-            item = self.current_review_items[row]
-            page_num = item.get('page_num')
-            span = item.get('span')
-            
-            if page_num:
-                # 1. Switch Page
-                if str(page_num) != self.mainwindow.spin_page.text():
-                    self.mainwindow.spin_page.setText(str(page_num))
-                    # Force load NOW to ensure editor has text
-                    self.mainwindow.jump_page()
-                    # Process events to allow UI update? 
-                    QApplication.processEvents()
-            
-            # 2. Scroll to Span
-            if span:
-                editor = self.get_target_editor()
-                if not editor: return
-                
-                # Verify length matching (safety)
-                # Text should be loaded by jump_page
-                
-                cursor = editor.textCursor()
-                start, end = span
-                
-                try:
-                    cursor.setPosition(start)
-                    cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
-                    editor.setTextCursor(cursor)
-                    editor.ensureCursorVisible()
-                    editor.setFocus()
-                except: pass # In case text changed or index OOB
-
-    def reset_review_ui(self):
-        """Reset the review UI to initial search state"""
-        self.review_group.setVisible(False)
-        self.tabs.setVisible(True)
-        self.scope_group.setVisible(True)
-        self.current_review_items = []
-        self.review_table.setModel(None)
-        self.status_label.setText("Review reset due to project switch.")
-
-    def get_target_editor(self):
-        if self.rb_left.isChecked():
-            return self.mainwindow.edit_left
-        return self.mainwindow.edit_right
-
-    def get_search_flags(self):
-        flags = QTextDocument.FindFlag(0)
-        if self.chk_case.isChecked():
-            flags |= QTextDocument.FindFlag.FindCaseSensitively
-        if self.chk_word.isChecked():
-            flags |= QTextDocument.FindFlag.FindWholeWords
-        # Note: FindUseRegularExpression is handled separately via QRegularExpression if needed,
-        # or we use Python re for robustness (especially for complex replaces).
-        # QPlainTextEdit.find uses QTextDocument.FindFlags.
-        return flags
-
-    def on_find_next(self):
-        editor = self.get_target_editor()
-        
-        # Use centralized regex compilation to handle Translate/Empty logic
-        regex = self._compile_regex_from_ui()
-        if not regex: return
-        
-        pattern = regex.pattern
-            
-        # Search
-        found = False
-        
-        # Try finding using Python Regex manually (since Qt regex is different, and we need full compat)
-        # Especially for Translate mode which uses [chars] pattern
-        
-        text = editor.toPlainText()
-        cursor = editor.textCursor()
-        start_pos = cursor.position()
-             
-        try:
-             # Search from current position
-             match = regex.search(text, start_pos)
-             
-             # If exact match at current position (length > 0) and we want 'Next', we might need to advance?
-             # But regex.search searches *forward*. If it matches at start_pos, it means current cursor is start of match.
-             # If we want *next* occurrence, we should start from start_pos + 1?
-             # Standard "Find Next" behavior: if we have selection, move past it?
-             if cursor.hasSelection():
-                  # If the selection *is* the match, we advance
-                  sel_txt = cursor.selectedText()
-                  # This is tricky. Let's just search from cursor.position() (end of selection usually).
-                  # If cursor is at start of selection (reverse selection), position() is start.
-                  # Logic: start search from max(cursor.position(), cursor.anchor())?
-                  # QPlainTextEdit cursor position is usually the "moving" end.
-                  # Let's search from max(cursor.selectionStart(), cursor.selectionEnd()) if selection exists?
-                  # Actually let's just search from cursor.position().
-                  pass
-                  
-             # However, if we just found a match, the cursor is at end of match (usually).
-             # If we search from there, we find the next one.
-             
-             # Problem: If user clicks inside text, cursor is there.
-             match = regex.search(text, start_pos)
-             
-             if not match:
-                 # Wrap around
-                 match = regex.search(text, 0)
-             
-             if match:
-                 # Select it
-                 new_cursor = editor.textCursor()
-                 new_cursor.setPosition(match.start())
-                 # Keep anchor? No, set selection.
-                 new_cursor.setPosition(match.end(), QTextCursor.MoveMode.KeepAnchor)
-                 editor.setTextCursor(new_cursor)
-                 found = True
-                 editor.centerCursor()
-        except Exception as e:
-             self.status_label.setText(f"Regex Error: {e}")
-             return
-                 
-        if found:
-            self.status_label.setText("Found.")
-        else:
-            self.status_label.setText("Not found.")
-
-    def on_replace(self):
-        editor = self.get_target_editor()
-        cursor = editor.textCursor()
-        if not cursor.hasSelection():
-            self.on_find_next()
-            return
-            
-        # Verify selection matches find?
-        # Actually standard Replace just replaces selection if it matches, or finds next.
-        # Simplification: Just replace selection if user clicks replace
-        # But we need to calculate replacement string.
-        
-        repl_text = self.cb_replace.currentText()
-        if self.cb_replace.findText(repl_text) == -1: self.cb_replace.addItem(repl_text)
-        
-        selected_text = cursor.selectedText()
-        new_text = repl_text
-        
-        # If Regex Mode or Python Mode, we need to re-evaluate based on the selection
-        if self.chk_regex.isChecked():
-            # If Regex Group mode ($1)
-            # We need to match the selection again to get groups
-            try:
-                pattern = self.cb_find.currentText()
-                flags = 0
-                if not self.chk_case.isChecked(): flags |= re.IGNORECASE
-                match = re.fullmatch(pattern, selected_text, flags)
-                
-                if match:
-                    repl_mode = self.combo_repl_mode.currentText()
-                    if "Python Lambda" in repl_mode:
-                        # Dangerous!
-                        try:
-                            # Context: match
-                            func = eval(f"lambda match: {repl_text}")
-                            new_text = str(func(match))
-                        except Exception as e:
-                            self.status_label.setText(f"Python Error: {str(e)}")
-                            return
-                    elif "Regex Group" in repl_mode:
-                        # Use re.sub logic
-                        new_text = match.expand(repl_text)
-            except Exception as e:
-                self.status_label.setText(f"Replace Error: {e}")
-                return
-
-        # Normal/Extended Replace
-        if not self.chk_regex.isChecked() and self.chk_extended.isChecked():
-             new_text = new_text.replace('\\n', '\n').replace('\\t', '\t')
-
-        cursor.insertText(new_text)
-        self.status_label.setText("Replaced.")
-        
-        # Find next
-        self.on_find_next()
-
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -4048,6 +1569,20 @@ class MainWindow(QMainWindow):
         self.find_replace_dialog = None
         self.last_manual_edit_time = 0
         self.current_loaded_page = None # Track actual loaded page index
+        
+        # Preview Mode
+        self.is_preview_mode = False
+        self.preview_map_left = None
+        self.preview_map_right = None
+        # Regex for Markdown and HTML tags. 
+        # <[^>]+> : HTML tags
+        # \[.*?\]\(.*?\) : Markdown Links
+        # [*_`#]+ : Markdown formatting chars
+        # !\[.*?\]\(.*?\) : Images
+        # Active Strippers (Initialized to Plain, updated by UI)
+        self.stripper_l_active = TextStripper("plain")
+        self.stripper_r_active = TextStripper("plain")
+        self.text_stripper = self.stripper_l_active # Compatibility fallback for legacy calls
         
         # 初始化界面
         self.init_ui()
@@ -4128,6 +1663,19 @@ class MainWindow(QMainWindow):
         self.cb_word_wrap.toggled.connect(self.toggle_word_wrap)
         toolbar.addWidget(self.cb_word_wrap)
         
+        # Preview Mode Toggle
+        # Preview Mode Toggle (Button)
+        self.btn_preview = QPushButton("Preview (Stripped)")
+        self.btn_preview.setCheckable(True)
+        self.btn_preview.toggled.connect(self.toggle_preview_mode)
+        toolbar.addWidget(self.btn_preview)
+        
+        # Ignore Tags Toggle (Removed)
+        # self.cb_ignore_tags = QCheckBox("Ignore Tags")
+        # self.cb_ignore_tags.setChecked(False)
+        # self.cb_ignore_tags.toggled.connect(self.run_diff)
+        # toolbar.addWidget(self.cb_ignore_tags)
+        
         toolbar.addSeparator()
         toolbar.addWidget(QLabel(" OCR Engine: "))
         self.combo_ocr_engine = QComboBox()
@@ -4203,8 +1751,21 @@ class MainWindow(QMainWindow):
         right_layout = QVBoxLayout(right_container)
         right_layout.setContentsMargins(0,0,0,0)
         
-        # 2.1 正则配置区
+        # 2.1 正则配置区 & Type Selectors (Combined)
         regex_layout = QHBoxLayout()
+        
+        # --- Left Controls ---
+        # Type Selector Left
+        regex_layout.addWidget(QLabel("L Type:"))
+        self.combo_type_left = QComboBox()
+        self.combo_type_left.addItems(["Plain Text", "Markdown", "HTML"])
+        self.combo_type_left.setItemData(0, "plain")
+        self.combo_type_left.setItemData(1, "markdown")
+        self.combo_type_left.setItemData(2, "html")
+        self.combo_type_left.currentIndexChanged.connect(self.on_type_changed)
+        regex_layout.addWidget(self.combo_type_left)
+        
+        # Regex Left
         
         self.regex_input_left = QLineEdit()
         self.regex_input_left.setPlaceholderText("左侧词头正则")
@@ -4224,6 +1785,20 @@ class MainWindow(QMainWindow):
         self.spin_reg_grp_l.setValue(self.project_config.get("regex_group_left", 0))
         self.spin_reg_grp_l.valueChanged.connect(self.on_regex_changed)
         regex_layout.addWidget(self.spin_reg_grp_l)
+        
+        # Spacer
+        regex_layout.addSpacing(20)
+        
+        # --- Right Controls ---
+        # Type Selector Right
+        regex_layout.addWidget(QLabel("R Type:"))
+        self.combo_type_right = QComboBox()
+        self.combo_type_right.addItems(["Plain Text", "Markdown", "HTML"])
+        self.combo_type_right.setItemData(0, "plain")
+        self.combo_type_right.setItemData(1, "markdown")
+        self.combo_type_right.setItemData(2, "html")
+        self.combo_type_right.currentIndexChanged.connect(self.on_type_changed)
+        regex_layout.addWidget(self.combo_type_right)
         
         regex_layout.addWidget(QLabel("R正则:"))
         regex_layout.addWidget(self.regex_input_right)
@@ -4246,10 +1821,25 @@ class MainWindow(QMainWindow):
         left_box.setSpacing(0)
         
         self.header_left = FileHeaderWidget(self, "left")
-        self.edit_left = DiffTextEdit("left")
         
+        # Type Selector Left (Moved to Top)
+        # hl_l = QHBoxLayout() ... (Removed)
+        # left_box.addLayout(hl_l)
+
+        # Stack for Preview
+        self.stack_left = QStackedWidget()
+        
+        self.edit_left = DiffTextEdit("left")
+        self.stack_left.addWidget(self.edit_left)
+        
+        self.edit_left_preview = PreviewTextEdit("left") # Custom Rich Text Editor
+        self.edit_left_preview.setReadOnly(False)
+        self.edit_left_preview.setReadOnly(False) # Editable per user request
+        self.edit_left_preview.setPlaceholderText("Preview Mode...")
+        self.stack_left.addWidget(self.edit_left_preview)
+
         left_box.addWidget(self.header_left)
-        left_box.addWidget(self.edit_left)
+        left_box.addWidget(self.stack_left)
         
         # --- Right Side Container ---
         right_container_widget = QWidget() # Rename to avoid conflict with right_container (outer)
@@ -4258,18 +1848,38 @@ class MainWindow(QMainWindow):
         right_box.setSpacing(0)
         
         self.header_right = FileHeaderWidget(self, "right")
+        
+        # Type Selector Right (Moved to Top)
+        # hl_r = QHBoxLayout() ... (Removed)
+        # right_box.addLayout(hl_r)
+        
+        # Stack for Preview
+        self.stack_right = QStackedWidget()
+        
         self.edit_right = DiffTextEdit("right")
+        self.stack_right.addWidget(self.edit_right)
+        
+        self.edit_right_preview = PreviewTextEdit("right") # Custom Rich Text Editor
+        self.edit_right_preview.setReadOnly(False)
+        self.edit_right_preview.setReadOnly(False) # Editable per user request
+        self.edit_right_preview.setPlaceholderText("Preview Mode...")
+        self.stack_right.addWidget(self.edit_right_preview)
         
         right_box.addWidget(self.header_right)
-        right_box.addWidget(self.edit_right)
+        right_box.addWidget(self.stack_right)
         
-        # 初始化 Highlighters
+        # 初始化 Highlighters (Only for Code Editors)
         self.highlighter_left = DiffSyntaxHighlighter(self.edit_left.document())
         self.highlighter_right = DiffSyntaxHighlighter(self.edit_right.document())
+        # Preview uses separate highlighting logic (Rich Text Background)
         
         # 绑定信号
         self.edit_left.textChanged.connect(self.on_text_changed_left)
         self.edit_right.textChanged.connect(self.on_text_changed_right)
+        
+        # Preview Sync Signals
+        self.edit_left_preview.textChanged.connect(self.on_preview_left_changed)
+        self.edit_right_preview.textChanged.connect(self.on_preview_right_changed)
         
         # 绑定 Patch 信号
         self.edit_left.apply_patch_signal.connect(lambda r, t: self.apply_patch(self.edit_left, r, t))
@@ -4284,8 +1894,20 @@ class MainWindow(QMainWindow):
         self.edit_right.verticalScrollBar().valueChanged.connect(lambda v: self.on_scroll(self.edit_right, self.edit_left))
         
         # 绑定光标移动 (高亮对齐 & 自动滚动)
+        # 绑定光标移动 (高亮对齐 & 自动滚动)
         self.edit_left.cursorPositionChanged.connect(self.on_cursor_left)
         self.edit_right.cursorPositionChanged.connect(self.on_cursor_right)
+
+        # Preview Signals Connection
+        self.edit_left_preview.verticalScrollBar().valueChanged.connect(lambda v: self.on_scroll(self.edit_left_preview, self.edit_right_preview))
+        self.edit_right_preview.verticalScrollBar().valueChanged.connect(lambda v: self.on_scroll(self.edit_right_preview, self.edit_left_preview))
+        
+        # Preview Cursor (for BBox sync) - Simplified mapping for now
+        # self.edit_left_preview.cursorPositionChanged.connect(self.on_preview_cursor_left) 
+        
+        # Preview Apply Patch
+        self.edit_left_preview.apply_patch_signal.connect(lambda r, t: self.apply_patch(self.edit_left, r, t))
+        self.edit_right_preview.apply_patch_signal.connect(lambda r, t: self.apply_patch(self.edit_right, r, t))
         
         # 绑定缩放 (Ctrl+Wheel)
         self.edit_left.zoom_signal.connect(self.on_zoom_request)
@@ -4436,6 +2058,34 @@ class MainWindow(QMainWindow):
             self.edit_left.setPlainText(left_text)
             self.edit_right.setPlainText(right_text)
             
+            if self.is_preview_mode:
+                 # Update strippers just in case (though usually fixed by mode toggle)
+                 # But we need stripping for diff mapping? 
+                 # Yes, DiffWorker uses active mode.
+                 pass
+                 
+                 # Render Left
+                 self.edit_left_preview.blockSignals(True)
+                 mode_l = self.combo_type_left.currentText().lower()
+                 if "markdown" in mode_l:
+                     self.edit_left_preview.setMarkdown(left_text)
+                 elif "html" in mode_l:
+                     self.edit_left_preview.setHtml(left_text)
+                 else:
+                     self.edit_left_preview.setPlainText(left_text)
+                 self.edit_left_preview.blockSignals(False)
+
+                 # Render Right
+                 self.edit_right_preview.blockSignals(True)
+                 mode_r = self.combo_type_right.currentText().lower()
+                 if "markdown" in mode_r:
+                     self.edit_right_preview.setMarkdown(right_text)
+                 elif "html" in mode_r:
+                     self.edit_right_preview.setHtml(right_text)
+                 else:
+                     self.edit_right_preview.setPlainText(right_text)
+                 self.edit_right_preview.blockSignals(False)
+            
             self.edit_left.blockSignals(False)
             self.edit_right.blockSignals(False)
             
@@ -4476,6 +2126,29 @@ class MainWindow(QMainWindow):
             if self.combo_source.currentText() == "Text File B":
                 text_r = self.pages_right_text.get(p, "")
                 self.edit_right.setPlainText(text_r)
+                
+            if self.is_preview_mode:
+                 text_l_curr = self.edit_left.toPlainText()
+                 self.edit_left_preview.blockSignals(True)
+                 mode_l = self.combo_type_left.currentText().lower()
+                 if "markdown" in mode_l:
+                      self.edit_left_preview.setMarkdown(text_l_curr)
+                 elif "html" in mode_l:
+                      self.edit_left_preview.setHtml(text_l_curr)
+                 else:
+                      self.edit_left_preview.setPlainText(text_l_curr)
+                 self.edit_left_preview.blockSignals(False)
+                 
+                 text_r_curr = self.edit_right.toPlainText()
+                 self.edit_right_preview.blockSignals(True)
+                 mode_r = self.combo_type_right.currentText().lower()
+                 if "markdown" in mode_r:
+                      self.edit_right_preview.setMarkdown(text_r_curr)
+                 elif "html" in mode_r:
+                      self.edit_right_preview.setHtml(text_r_curr)
+                 else:
+                      self.edit_right_preview.setPlainText(text_r_curr)
+                 self.edit_right_preview.blockSignals(False)
                 
             # Trigger diff update
             self.deferred_run_diff()
@@ -4598,7 +2271,21 @@ class MainWindow(QMainWindow):
         
         need_ocr_map = (self.combo_source.currentText() != "OCR Results" and bool(self.ocr_text_full))
         
-        self.diff_worker = DiffWorker(text_l, text_r, self.ocr_text_full, need_ocr_map)
+        # ignore_tags = self.cb_ignore_tags.isChecked() (Removed)
+        
+        # Get Modes from Combos
+        # Get Modes from Combos
+        # Map UI Text to internal mode string
+        mode_map = {"Plain Text": "plain", "Markdown": "markdown", "HTML": "html"}
+        mode_l = mode_map.get(self.combo_type_left.currentText(), "plain")
+        mode_r = mode_map.get(self.combo_type_right.currentText(), "plain")
+        
+        # Default Ignore Tags Logic:
+        # If either side is NOT plain text, we assume user wants to diff stripped content (Ignore Tags).
+        # Unless user explicitly demanded plain diff? User said "ignore_tags should be default option... no need for separate option".
+        ignore_tags = (mode_l != "plain" or mode_r != "plain")
+        
+        self.diff_worker = DiffWorker(text_l, text_r, self.ocr_text_full, need_ocr_map, ignore_tags=ignore_tags, mode_l=mode_l, mode_r=mode_r)
         self.diff_worker.result_ready.connect(self.on_diff_finished)
         self.diff_worker.finished.connect(self.on_diff_thread_finished)
         self.diff_worker.start()
@@ -4607,32 +2294,33 @@ class MainWindow(QMainWindow):
         self._is_updating_diff = False
         self.diff_worker = None
 
-    def on_diff_finished(self, opcodes, ocr_opcodes):
+    @pyqtSlot(list, list, list)
+    def on_diff_finished(self, opcodes, ocr_opcodes, raw_opcodes):
         text_l = self.edit_left.toPlainText()
         text_r = self.edit_right.toPlainText()
         
-        # Set Data
-        self.edit_left.set_diff_data(opcodes, text_r)
-        self.edit_right.set_diff_data(opcodes, text_l)
-        
-        # Highlight
+        # 2. Preview Highlighting (If Active)
+        if self.is_preview_mode:
+            # Highlight Preview using helper (since QTextEdit doesn't have set_diff_data)
+            self.edit_left_preview.blockSignals(True)
+            self.edit_right_preview.blockSignals(True)
+            
+            self.highlight_preview(self.edit_left_preview, raw_opcodes, True)
+            self.highlight_preview(self.edit_right_preview, raw_opcodes, False)
+            
+            self.edit_left_preview.blockSignals(False)
+            self.edit_right_preview.blockSignals(False)
+            
+        # Highlight (Triggers repaint)
         self.edit_left.blockSignals(True)
         self.edit_right.blockSignals(True)
         self.highlighter_left.set_diff_data(opcodes, is_left=True)
         self.highlighter_right.set_diff_data(opcodes, is_left=False)
-        self.edit_left.blockSignals(False)
-        self.edit_right.blockSignals(False)
-        
-        # Regex
-        # Regex
-        self.highlighter_left.set_regex(self.project_config.get("regex_left"), self.project_config.get("regex_group_left", 0))
-        self.highlighter_right.set_regex(self.project_config.get("regex_right"), self.project_config.get("regex_group_right", 0))
         
         # OCR Mapping
         if ocr_opcodes:
             self.ocr_diff_opcodes = ocr_opcodes
         else:
-            # If not calculated, maybe we use main diff if right is OCR
             if self.combo_source.currentText() == "OCR Results":
                  self.ocr_diff_opcodes = opcodes
 
@@ -4729,6 +2417,54 @@ class MainWindow(QMainWindow):
             self.update_memory_cache()
         self.deferred_run_diff()
 
+    def on_preview_left_changed(self):
+             self.edit_left.blockSignals(False)
+             # Update Map (Optimistic)
+             _, self.preview_map_left, st_l = self.stripper_l_active.strip(new_orig)
+             # Re-apply styles effectively? 
+             # If user typed "a", it has no style.
+             # Ideally we should re-highlight.
+             # But modifying text in preview clears styles usually.
+             # We should re-apply styles for the whole doc?
+             # Yes, simplest way to keep it correct.
+             self.edit_left_preview.blockSignals(True) # Prevent recursive loop
+             # We need to save cursor pos
+             cursor = self.edit_left_preview.textCursor()
+             pos = cursor.position()
+             # self.edit_left_preview.setPlainText( ... ) # Wait, we are editing IT. 
+             # If we setPlainText, we interrupt editing.
+             # Just apply styles?
+             self.apply_styles_to_editor(self.edit_left_preview, st_l)
+             cursor.setPosition(pos)
+             self.edit_left_preview.setTextCursor(cursor)
+             self.edit_left_preview.blockSignals(False)
+             
+             # Mark Dirty
+             self.on_text_changed_left() 
+
+    def on_preview_right_changed(self):
+        if self._is_loading or not self.is_preview_mode: return
+        # Sync Preview -> Source
+        new_strip = self.edit_right_preview.toPlainText()
+        orig = self.edit_right.toPlainText()
+        new_orig = self.stripper_r_active.apply_stripped_diff(orig, new_strip, self.preview_map_right)
+        
+        if new_orig != orig:
+             self.edit_right.blockSignals(True)
+             self.edit_right.setPlainText(new_orig)
+             self.edit_right.blockSignals(False)
+             _, self.preview_map_right, st_r = self.stripper_r_active.strip(new_orig)
+             
+             self.edit_right_preview.blockSignals(True)
+             cursor = self.edit_right_preview.textCursor()
+             pos = cursor.position()
+             self.apply_styles_to_editor(self.edit_right_preview, st_r)
+             cursor.setPosition(pos)
+             self.edit_right_preview.setTextCursor(cursor)
+             self.edit_right_preview.blockSignals(False)
+             
+             self.on_text_changed_right()
+
     def on_regex_changed(self):
         self.project_config["regex_left"] = self.regex_input_left.text()
         self.project_config["regex_right"] = self.regex_input_right.text()
@@ -4741,6 +2477,13 @@ class MainWindow(QMainWindow):
         self.highlighter_right.set_regex(self.project_config["regex_right"], self.project_config["regex_group_right"])
         
         self.run_diff()
+
+    def on_type_changed(self, index):
+        # Trigger re-diff or re-preview
+        if self.is_preview_mode:
+            self.toggle_preview_mode(True) # Re-apply stripping with new mode
+        else:
+            self.run_diff()
 
     def on_zoom_request(self, delta):
         """Synchronized Font Zoom (Ctrl+Wheel)"""
@@ -4809,6 +2552,26 @@ class MainWindow(QMainWindow):
     def save_current_page_data(self):
         """Explicitly save editor content to memory dicts if changed"""
         if self.current_loaded_page is None: return
+        
+        # If Preview Mode, sync first
+        if self.is_preview_mode:
+            # Sync Left
+            new_strip_l = self.edit_left_preview.toPlainText()
+            orig_l = self.edit_left.toPlainText()
+            # Use active stripper
+            new_orig_l = self.stripper_l_active.apply_stripped_diff(orig_l, new_strip_l, self.preview_map_left)
+            if new_orig_l != orig_l:
+                 self.edit_left.setPlainText(new_orig_l)
+                 _, self.preview_map_left = self.stripper_l_active.strip(new_orig_l)
+                 
+            # Sync Right
+            new_strip_r = self.edit_right_preview.toPlainText()
+            orig_r = self.edit_right.toPlainText()
+            new_orig_r = self.stripper_r_active.apply_stripped_diff(orig_r, new_strip_r, self.preview_map_right)
+            if new_orig_r != orig_r:
+                 self.edit_right.setPlainText(new_orig_r)
+                 _, self.preview_map_right = self.stripper_r_active.strip(new_orig_r)
+
         p = self.current_loaded_page
         
         # Left
@@ -5559,6 +3322,221 @@ class MainWindow(QMainWindow):
         # MainWindow usually has self.statusBar().
         self.statusBar().showMessage(f"Undone: {snapshot['desc']}", 5000)
         QMessageBox.information(self, "Undo", f"Reverted: {snapshot['desc']}")
+
+    def toggle_preview_mode(self, checked):
+        self.is_preview_mode = checked
+        if checked:
+            self.btn_preview.setText("Exit Preview")
+        else:
+            self.btn_preview.setText("Preview (Stripped)")
+        
+        if checked:
+            # 1. Update Active Strippers from Combos
+            mode_l = self.combo_type_left.currentData()
+            # If "Plain Text" -> "plain". If "Markdown" -> "markdown"
+            # Mapping logic might be needed if combo data is not set correctly or text used.
+            # In init_ui: setItemData(0, "plain")...
+            # So currentData() should be correct.
+            self.stripper_l_active = TextStripper(mode=mode_l)
+            
+            mode_r = self.combo_type_right.currentData()
+            self.stripper_r_active = TextStripper(mode=mode_r)
+            
+            # 2. Source -> Preview (Left)
+            # Use ORIGINAL text for rendering to get formatting.
+            text_l = self.edit_left.toPlainText()
+            
+            # We still need stripper to map diffs later? 
+            # Yes, DiffWorker uses Stripper. 
+            # Preview needs to display Formatted Text.
+            # And we need to map Stripped Indices (from Diff) to Formatted Text indices.
+            # Assumption: stripped text content == formatted text content.
+            
+            # Calculate strips for internal state (sync)
+            s_l, m_l, st_l = self.stripper_l_active.strip(text_l)
+            self.preview_map_left = m_l
+            
+            self.edit_left_preview.blockSignals(True)
+            self.edit_left_preview.clear()
+            if mode_l == "markdown":
+                 self.edit_left_preview.setMarkdown(text_l)
+            elif mode_l == "html":
+                 self.edit_left_preview.setHtml(text_l)
+            else:
+                 self.edit_left_preview.setPlainText(s_l) # Plain: show stripped (or original?)
+                 # Usually plain == stripped.
+            self.edit_left_preview.blockSignals(False)
+            
+            self.stack_left.setCurrentIndex(1)
+            
+            # 3. Source -> Preview (Right)
+            text_r = self.edit_right.toPlainText()
+            s_r, m_r, st_r = self.stripper_r_active.strip(text_r)
+            self.preview_map_right = m_r
+            
+            self.edit_right_preview.blockSignals(True)
+            self.edit_right_preview.clear()
+            if mode_r == "markdown":
+                 self.edit_right_preview.setMarkdown(text_r)
+            elif mode_r == "html":
+                 self.edit_right_preview.setHtml(text_r)
+            else:
+                 self.edit_right_preview.setPlainText(s_r)
+            self.edit_right_preview.blockSignals(False)
+                 
+            self.stack_right.setCurrentIndex(1)
+            
+            # Trigger Diff Refresh to Highlight Preview
+            self.run_diff()
+            
+        else:
+            # Preview -> Source
+            # Sync Logic REMOVED per user request/issue.
+            # Preview is ReadOnly, so no changes can propagate.
+            # Programmatic updates to Preview cause Format Changes which break Original Data if synced back.
+            
+            self.stack_left.setCurrentIndex(0)
+            self.stack_right.setCurrentIndex(0)
+
+    def highlight_preview(self, editor, opcodes, is_left):
+        """Highlight QTextEdit (Rich Text) based on opcodes"""
+        doc = editor.document()
+        cursor = QTextCursor(doc)
+        
+        # Clear existing background (Optimistic)
+        # We assume re-rendering clears it? 
+        # Yes, setHtml clears document.
+        
+        green_bg = QColor("#E6FFEC")
+        red_bg = QColor("#FFEBE9")
+        
+        text = editor.toPlainText() # Plain text representation of HTML
+        
+        for tag, i1, i2, j1, j2 in opcodes:
+            if tag == 'equal': continue
+            
+            s, e = (i1, i2) if is_left else (j1, j2)
+            
+            # Map valid range
+            if s >= len(text): continue
+            
+            # Convert python index to qt index (if needed for utf-16, depends on python build)
+            # Usually strict index mapping works if text matches.
+            
+            cursor.setPosition(s)
+            cursor.setPosition(min(e, len(text)), QTextCursor.MoveMode.KeepAnchor)
+            
+            fmt = QTextCharFormat()
+            if tag == 'replace':
+                fmt.setBackground(red_bg if is_left else green_bg)
+            elif tag == 'delete':
+                fmt.setBackground(red_bg)
+            elif tag == 'insert':
+                fmt.setBackground(green_bg)
+                
+            cursor.mergeCharFormat(fmt)
+
+    def apply_styles_to_editor(self, editor, styles):
+        """Apply formatting to QPlainTextEdit based on styles list"""
+        if not styles: return
+        
+        doc = editor.document()
+        cursor = QTextCursor(doc)
+        
+        # Reset format? Actually easier to assume plain if we just setPlainText
+        
+        for start, length, style_type in styles:
+            cursor.setPosition(start)
+            cursor.setPosition(start + length, QTextCursor.MoveMode.KeepAnchor)
+            
+            fmt = QTextCharFormat()
+            if style_type == 'bold':
+                fmt.setFontWeight(QFont.Weight.Bold)
+            elif style_type == 'italic':
+                fmt.setFontItalic(True)
+            elif style_type.startswith('header'):
+                fmt.setFontWeight(QFont.Weight.Bold)
+                # fmt.setForeground(QColor("blue")) # Optional
+                
+            cursor.mergeCharFormat(fmt)
+
+    # ================= Preview Sync =================
+    def on_preview_left_changed(self):
+        """Sync Preview Edits -> Source (Left)"""
+        # Only if NOT blocking signals (User Edit)
+        mode = self.combo_type_left.currentText().lower()
+        new_text = ""
+        
+        if "markdown" in mode:
+            new_text = self.edit_left_preview.toMarkdown()
+        elif "html" in mode:
+            new_text = self.edit_left_preview.toHtml()
+        else:
+            new_text = self.edit_left_preview.toPlainText()
+            
+        # Update Source
+        self.edit_left.blockSignals(True) # Prevent cycle
+        self.edit_left.setPlainText(new_text)
+        self.edit_left.blockSignals(False)
+        
+        self.deferred_run_diff()
+
+    def on_preview_right_changed(self):
+        """Sync Preview Edits -> Source (Right)"""
+        mode = self.combo_type_right.currentText().lower()
+        new_text = ""
+        
+        if "markdown" in mode:
+            new_text = self.edit_right_preview.toMarkdown()
+        elif "html" in mode:
+            new_text = self.edit_right_preview.toHtml()
+        else:
+            new_text = self.edit_right_preview.toPlainText()
+            
+        # Update Source
+        self.edit_right.blockSignals(True)
+        self.edit_right.setPlainText(new_text)
+        self.edit_right.blockSignals(False)
+        
+        self.deferred_run_diff()
+
+    def on_preview_cursor_left(self):
+        """Sync Preview Cursor -> Image & Other Side"""
+        if self._is_program_scrolling: return
+        
+        # 1. Image Highlight using Source Editor Helper
+        # We need mapping from Preview Index -> Source Index
+        # For plain text mapping, it's 1:1. Rich text: approximate.
+        # We will map Preview Cursor -> Source Cursor -> Trigger logic
+        
+        cursor = self.edit_left_preview.textCursor()
+        idx_preview = cursor.position()
+        
+        # Simplified: Assume idx matches Source
+        # Trigger Image Highlight by calling logic from on_cursor_left but with overridden index?
+        # on_cursor_left reads self.edit_left.textCursor().
+        
+        # Strategy:
+        # 1. Find BBox for idx_preview
+        # 2. Highlight Image
+        
+        if self.current_ocr_data:
+             # Logic from on_cursor_left duplicated/adapted
+             bboxes = []
+             # Find bbox containing idx_preview
+             # This depends on OCR data structure (list of dicts with 'text', 'bbox'?)
+             # self.current_ocr_data is list of {text, box} usually?
+             # Actually on_cursor_left logic is complex (uses TextToBBoxMapper).
+             pass
+             
+        # For now, just implement rudimentary sync to Other Preview
+        # Map idx_preview to Other Side using Diff Opcodes?
+        
+        # Sync Scroll (handled by scroll bar signal)
+        pass
+
+    def on_preview_cursor_right(self):
+        pass
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
