@@ -28,6 +28,8 @@ from ocr_lib.app_logic.find_replace import FindReplaceDialog
 from ocr_lib.core.image_utils import get_page_image
 from ocr_lib.core.text_utils import TextStripper
 from ocr_lib.app_logic.workers import DiffWorker, OCRWorker
+from ocr_lib.ui.diff_interaction import DiffInteractionMixin
+
 from ocr_lib.app_logic.image_export import TextToBBoxMapper, BBoxMerger, ImageStitcher
 
 
@@ -432,41 +434,23 @@ class LineNumberArea(QWidget):
         self.codeEditor.lineNumberAreaPaintEvent(event)
 
 
-class DiffTextEdit(QPlainTextEdit):
+class DiffTextEdit(DiffInteractionMixin, QPlainTextEdit):
     """
-    支持 Ctrl+Hover 高亮和 Ctrl+Click 应用补丁的文本框
+    QPlainTextEdit with diff interaction support.
+    Uses DiffInteractionMixin for shared interaction logic.
     """
+    # Define signals (required by mixin)
     focus_in_signal = pyqtSignal()
-    # 信号：点击了某个 Diff 块，请求应用到另一侧 (self_index_range, target_text)
     apply_patch_signal = pyqtSignal(tuple, str)
-    # 信号：Alt+Click 将本侧内容推送到另一侧 (target_range, my_content)
     push_patch_signal = pyqtSignal(tuple, str)
-    # 信号：Ctrl+Wheel 缩放请求 (delta)
     zoom_signal = pyqtSignal(int)
 
-    def focusInEvent(self, event):
-        self.focus_in_signal.emit()
-        super().focusInEvent(event)
-    
-    def wheelEvent(self, event):
-        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            # Emit zoom signal, consume event
-            self.zoom_signal.emit(event.angleDelta().y())
-            event.accept()
-        else:
-            super().wheelEvent(event)
-    
     def __init__(self, side="left"):
         super().__init__()
-        self.side = side # 'left' or 'right'
-        self.diff_opcodes = [] # 存储 difflib 的 opcodes
-        self.other_text_content = "" # 另一侧的完整文本，用于提取
+        self.init_diff_interaction(side)  # Initialize mixin
         self.setFont(QFont("Consolas", 11))
         
-        # 启用鼠标追踪以支持 Hover
-        self.setMouseTracking(True)
-        self._hovering_diff = False
-        
+        # Line number area (QPlainTextEdit specific)
         self.line_number_area = LineNumberArea(self)
         self.blockCountChanged.connect(self.update_line_number_area_width)
         self.updateRequest.connect(self.update_line_number_area)
@@ -542,232 +526,62 @@ class DiffTextEdit(QPlainTextEdit):
         
         self.blockSignals(False)
 
-    def set_diff_data(self, opcodes, other_text):
-        self.diff_opcodes = opcodes
-        self.other_text_content = other_text
-
-    def get_opcode_at_position(self, pos):
-        """根据鼠标坐标获取对应的 opcode"""
-        cursor = self.cursorForPosition(pos)
-        qt_idx = cursor.position()
-        
-        # Convert to Python index for opcode lookup
-        text = self.toPlainText()
-        idx = to_py_pos(text, qt_idx)
-        
-        # 遍历 opcodes 查找当前索引是否在差异区间内
-        for tag, i1, i2, j1, j2 in self.diff_opcodes:
-            if tag == 'equal': continue
-            
-            # 判断是在左侧还是右侧
-            if self.side == 'left':
-                if i1 <= idx <= i2:
-                    return (tag, i1, i2, j1, j2)
-            else:
-                if j1 <= idx <= j2:
-                    return (tag, i1, i2, j1, j2)
-        return None
-
-    def mouseMoveEvent(self, event):
-        # 检查是否按住 Ctrl
-        modifiers = QApplication.keyboardModifiers()
-        if modifiers & Qt.KeyboardModifier.ControlModifier:
-            opcode = self.get_opcode_at_position(event.pos())
-            if opcode:
-                self.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
-                self._hovering_diff = True
-            else:
-                self.viewport().setCursor(Qt.CursorShape.IBeamCursor)
-                self._hovering_diff = False
-        elif modifiers & Qt.KeyboardModifier.AltModifier:
-            opcode = self.get_opcode_at_position(event.pos())
-            if opcode:
-                self.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
-                self._hovering_diff = True
-            else:
-                self.viewport().setCursor(Qt.CursorShape.IBeamCursor)
-                self._hovering_diff = False
-        else:
-            self.viewport().setCursor(Qt.CursorShape.IBeamCursor)
-            self._hovering_diff = False
-        super().mouseMoveEvent(event)
+    # Implement abstract methods from mixin
+    def get_text_content(self):
+        """Get plain text content."""
+        return self.toPlainText()
 
     def clear_highlight(self):
-        """清除高亮（ExtraSelections）"""
+        """Clear ExtraSelections highlighting."""
         self.setExtraSelections([])
 
-    def mousePressEvent(self, event):
-        # 处理 Ctrl + Click
-        modifiers = QApplication.keyboardModifiers()
-        if modifiers & Qt.KeyboardModifier.ControlModifier:
-            opcode = self.get_opcode_at_position(event.pos())
-            if opcode:
-                tag, i1, i2, j1, j2 = opcode
-                # Apply Patch Logic
-                # Left Click: Apply Change?
-                # Right now, emit signal
-                
-                # Extract text from OTHER side
-                # For Left Editor, other side is Right.
-                # If Replace/Insert, we need text from Right(j1:j2)
-                # But self.other_text_content needs to be set!
-                
-                start_idx, end_idx = (i1, i2) if self.side == 'left' else (j1, j2)
-                
-                target_text = ""
-                if tag == 'replace':
-                    # Need corresponding text from OTHER side
-                    o_start, o_end = (j1, j2) if self.side == 'left' else (i1, i2)
-                    if self.other_text_content:
-                        target_text = self.other_text_content[o_start:o_end]
-                elif tag == 'delete':
-                    target_text = "" # Delete means replace with empty
-                elif tag == 'insert':
-                     # Insert means we are missing something present in other side
-                     o_start, o_end = (j1, j2) if self.side == 'left' else (i1, i2)
-                     if self.other_text_content:
-                        target_text = self.other_text_content[o_start:o_end]
-                        
-                self.apply_patch_signal.emit((start_idx, end_idx), target_text)
-                return
 
-        super().mousePressEvent(event)
-
-
-class PreviewTextEdit(QTextEdit):
+class PreviewTextEdit(DiffInteractionMixin, QTextEdit):
     """
-    Rich Text Preview with Diff Interaction Support
-    Inherits QTextEdit instead of QPlainTextEdit
+    QTextEdit with diff interaction support for rendered/preview text.
+    Uses DiffInteractionMixin for shared interaction logic.
     """
-    # Signals mirroring DiffTextEdit for compatibility
+    # Define signals (required by mixin)
+    focus_in_signal = pyqtSignal()
     apply_patch_signal = pyqtSignal(tuple, str)
-    # Scroll Sync Signal
-    scroll_sync_signal = pyqtSignal(int)
+    push_patch_signal = pyqtSignal(tuple, str)
+    zoom_signal = pyqtSignal(int)
     
     def __init__(self, side="left"):
         super().__init__()
-        self.side = side
-        self.diff_opcodes = []
-        self.other_text_content = "" # Raw text of other side
+        self.init_diff_interaction(side)  # Initialize mixin
         self.setFont(QFont("Consolas", 11))
-        self.setMouseTracking(True)
-        
-    def set_diff_data(self, opcodes, other_text):
-        self.diff_opcodes = opcodes
-        self.other_text_content = other_text
-        
-    def get_opcode_at_position(self, pos):
-        # QTextEdit cursor lookup
-        cursor = self.cursorForPosition(pos)
-        qt_idx = cursor.position()
-        
-        # Approximate mapping: using PlainText index
-        # This might be slightly off for Rich Text / HTML if hidden tags exist?
-        # extra logic needed for exact mapping?
-        # For now, assume toPlainText() index aligns with OpCode index (which is based on stripped/plain text)
-        
-        # But wait, opcodes are based on STRIPPED text if ignore_tags is On.
-        # Preview displays STRIPPED text? No, Preview displays RENDERED text.
-        # If we used setMarkdown, the text content IS the stripped text (mostly).
-        # So we can try mapping directly.
-        
-        idx = qt_idx # Simplify for now
-        
-        for tag, i1, i2, j1, j2 in self.diff_opcodes:
-            if tag == 'equal': continue
-            
-            if self.side == 'left':
-                if i1 <= idx <= i2:
-                    return (tag, i1, i2, j1, j2)
-            else:
-                if j1 <= idx <= j2:
-                    return (tag, i1, i2, j1, j2)
-        return None
-
-    def mouseMoveEvent(self, event):
-        modifiers = QApplication.keyboardModifiers()
-        if modifiers & Qt.KeyboardModifier.ControlModifier:
-            if self.get_opcode_at_position(event.pos()):
-                self.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
-            else:
-                self.viewport().setCursor(Qt.CursorShape.IBeamCursor)
-        else:
-            self.viewport().setCursor(Qt.CursorShape.IBeamCursor)
-        super().mouseMoveEvent(event)
-
-    def mousePressEvent(self, event):
-        modifiers = QApplication.keyboardModifiers()
-        if modifiers & Qt.KeyboardModifier.ControlModifier:
-            opcode = self.get_opcode_at_position(event.pos())
-            if opcode:
-                # Same Logic as DiffTextEdit
-                tag, i1, i2, j1, j2 = opcode
-                start_idx, end_idx = (i1, i2) if self.side == 'left' else (j1, j2)
-                
-                target_text = ""
-                if tag == 'replace' or tag == 'insert':
-                    o_start, o_end = (j1, j2) if self.side == 'left' else (i1, i2)
-                    if self.other_text_content:
-                        target_text = self.other_text_content[o_start:o_end]
-                        
-                self.apply_patch_signal.emit((start_idx, end_idx), target_text)
-                return
-                
-        super().mousePressEvent(event)
-        
-        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-             event.ignore() # Let parent handle zoom? or impl zoom
-        else:
-             super().wheelEvent(event)
-
-    def handle_patch_click(self, opcode):
-        tag, i1, i2, j1, j2 = opcode
-        
-        # 逻辑：点击某侧的差异块，意为“将这一块的内容变成另一侧的样子”
-        # 或者“将这一块的内容推送到另一侧”。
-        # 通常 Beyond Compare 的逻辑是：点击箭头将当前侧内容覆盖到另一侧。
-        # 这里的实现：点击红色区域 -> 将该区域内容替换为另一侧对应区域的内容 (Accept Change)
-        
-        target_text = ""
-        my_range = (0, 0)
-        
-        if self.side == 'left':
-            my_range = (i1, i2)
-            # 获取右侧对应文本 (j1:j2)
-            target_text = self.other_text_content[j1:j2]
-        else:
-            my_range = (j1, j2)
-            # 获取左侧对应文本 (i1:i2)
-            target_text = self.other_text_content[i1:i2]
-            
-        # 发射信号，由主窗口执行替换操作
-        self.apply_patch_signal.emit(my_range, target_text)
-
-    def handle_push_click(self, opcode):
-        tag, i1, i2, j1, j2 = opcode
-        
-        # Logic: Alt+Click = 将“我”的内容推送到“另一侧”
-        # 我是 left: 我的内容在 i1:i2, 目标在 j1:j2
-        # 我是 right: 我的内容在 j1:j2, 目标在 i1:i2
-        
-        my_range = (0, 0)
-        target_range = (0, 0)
-        text_to_push = ""
-        current_text = self.toPlainText()
-        
-        if self.side == 'left':
-            my_range = (i1, i2)
-            target_range = (j1, j2)
-            text_to_push = current_text[i1:i2]
-        else:
-            my_range = (j1, j2) # Index in right text
-            target_range = (i1, i2) # Index in left text
-            text_to_push = current_text[j1:j2]
-            
-        # 发射信号: (目标区间, 要替换成的内容)
-        self.push_patch_signal.emit(target_range, text_to_push)
 
 
+    # Implement abstract methods from mixin
+    def get_text_content(self):
+        """Get plain text content."""
+        return self.toPlainText()
+
+    def highlight_line_at_index(self, idx):
+        """Highlight line at given character index."""
+        self.blockSignals(True)
+        
+        cursor = self.textCursor()
+        cursor.setPosition(idx)
+        
+        selection = QTextEdit.ExtraSelection()
+        selection.format.setBackground(QColor("#FFFFAA"))
+        fmt = selection.format
+        fmt.setProperty(QTextFormat.Property.FullWidthSelection, True)
+        selection.format = fmt
+        selection.cursor = cursor
+        selection.cursor.clearSelection()
+        
+        self.setExtraSelections([selection])
+        
+        self.blockSignals(False)
+
+    def clear_highlight(self):
+        """Clear ExtraSelections highlighting."""
+        self.setExtraSelections([])
+
+        
 # ==========================================
 # 2. 图像画布 (支持缩放、BBox)
 # ==========================================
@@ -1149,7 +963,10 @@ class ExportParser:
         else:
             # Check previous text ending
             prev_text = entry["text"]
-            if prev_text.endswith('-'):
+            cur_char = text_chunk[0]
+            cur_is_cjk = ('\u4e00' <= cur_char <= '\u9fff')
+            cur_is_latin = ('a' <= cur_char <= 'z' or 'A' <= cur_char <= 'Z' or '\u00c0' <= cur_char <= '\u0250')
+            if prev_text.endswith('-') and cur_is_latin:
                 # Hyphen: Remove hyphen, join directly
                 entry["text"] = prev_text[:-1] + text_chunk
             else:
@@ -1157,10 +974,12 @@ class ExportParser:
                 # CJK Check (Simple range)
                 is_cjk = ('\u4e00' <= last_char <= '\u9fff')
                 
-                if is_cjk:
+                if is_cjk and cur_is_cjk:
                     entry["text"] = prev_text + text_chunk
-                else:
+                elif cur_is_latin or cur_is_cjk:
                     entry["text"] = prev_text + " " + text_chunk
+                else:
+                    entry["text"] = prev_text + "\n" + text_chunk
                     
 
 # ==========================================
@@ -1909,9 +1728,19 @@ class MainWindow(QMainWindow):
         self.edit_left_preview.apply_patch_signal.connect(lambda r, t: self.apply_patch(self.edit_left, r, t))
         self.edit_right_preview.apply_patch_signal.connect(lambda r, t: self.apply_patch(self.edit_right, r, t))
         
+        # Preview Push Patch
+        self.edit_left_preview.push_patch_signal.connect(lambda r, t: self.apply_patch(self.edit_right, r, t))
+        self.edit_right_preview.push_patch_signal.connect(lambda r, t: self.apply_patch(self.edit_left, r, t))
+        
+        # Preview Focus
+        self.edit_left_preview.focus_in_signal.connect(self.on_editor_focus)
+        self.edit_right_preview.focus_in_signal.connect(self.on_editor_focus)
+        
         # 绑定缩放 (Ctrl+Wheel)
         self.edit_left.zoom_signal.connect(self.on_zoom_request)
         self.edit_right.zoom_signal.connect(self.on_zoom_request)
+        self.edit_left_preview.zoom_signal.connect(self.on_zoom_request)
+        self.edit_right_preview.zoom_signal.connect(self.on_zoom_request)
         
         # 标记是否正在编程滚动，防止死循环
         self._is_program_scrolling = False
@@ -2305,17 +2134,33 @@ class MainWindow(QMainWindow):
             self.edit_left_preview.blockSignals(True)
             self.edit_right_preview.blockSignals(True)
             
-            self.highlight_preview(self.edit_left_preview, raw_opcodes, True)
-            self.highlight_preview(self.edit_right_preview, raw_opcodes, False)
+            # Use opcodes (mapped to original text) instead of raw_opcodes (stripped)
+            # This ensures markdown markers are NOT highlighted as differences
+            self.highlight_preview(self.edit_left_preview, opcodes, True)
+            self.highlight_preview(self.edit_right_preview, opcodes, False)
             
             self.edit_left_preview.blockSignals(False)
             self.edit_right_preview.blockSignals(False)
             
         # Highlight (Triggers repaint)
-        self.edit_left.blockSignals(True)
-        self.edit_right.blockSignals(True)
+        #self.edit_left.blockSignals(True)
+        #self.edit_right.blockSignals(True)
         self.highlighter_left.set_diff_data(opcodes, is_left=True)
         self.highlighter_right.set_diff_data(opcodes, is_left=False)
+        
+        # Set diff data for editors (CRITICAL for interaction features)
+        left_text = self.edit_left.toPlainText()
+        right_text = self.edit_right.toPlainText()
+        self.edit_left.set_diff_data(opcodes, right_text)
+        self.edit_right.set_diff_data(opcodes, left_text)
+        
+        # Set diff data for preview editors if in preview mode
+        if self.is_preview_mode:
+            left_preview_text = self.edit_left_preview.toPlainText()
+            right_preview_text = self.edit_right_preview.toPlainText()
+            # Use opcodes (not raw_opcodes) for correct position mapping
+            self.edit_left_preview.set_diff_data(opcodes, right_preview_text)
+            self.edit_right_preview.set_diff_data(opcodes, left_preview_text)
         
         # OCR Mapping
         if ocr_opcodes:
@@ -2323,6 +2168,7 @@ class MainWindow(QMainWindow):
         else:
             if self.combo_source.currentText() == "OCR Results":
                  self.ocr_diff_opcodes = opcodes
+
 
 
 
@@ -3426,13 +3272,11 @@ class MainWindow(QMainWindow):
             cursor.setPosition(s)
             cursor.setPosition(min(e, len(text)), QTextCursor.MoveMode.KeepAnchor)
             
+            
             fmt = QTextCharFormat()
-            if tag == 'replace':
-                fmt.setBackground(red_bg if is_left else green_bg)
-            elif tag == 'delete':
-                fmt.setBackground(red_bg)
-            elif tag == 'insert':
-                fmt.setBackground(green_bg)
+            # Match normal mode: Red text + Light red background for ALL changes
+            fmt.setForeground(QColor("#CC0000"))  # Red text
+            fmt.setBackground(QColor("#FFEBE9"))  # Light red background
                 
             cursor.mergeCharFormat(fmt)
 
