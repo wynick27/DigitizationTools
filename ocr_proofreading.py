@@ -973,7 +973,7 @@ class ExportParser:
                 last_char = prev_text[-1]
                 # CJK Check (Simple range)
                 is_cjk = ('\u4e00' <= last_char <= '\u9fff')
-                
+
                 if is_cjk and cur_is_cjk:
                     entry["text"] = prev_text + text_chunk
                 elif cur_is_latin or cur_is_cjk:
@@ -1136,7 +1136,7 @@ class ProjectManagerDialog(QDialog):
         # 3. Numeric Fields
         self.spin_start = QSpinBox(); self.spin_start.setRange(1, 9999)
         self.spin_end = QSpinBox(); self.spin_end.setRange(1, 9999)
-        self.spin_offset = QSpinBox(); self.spin_offset.setRange(-999, 999)
+        self.spin_offset = QSpinBox(); self.spin_offset.setRange(-9999, 9999)
         
         self.spin_start.valueChanged.connect(self.save_current_project)
         self.spin_end.valueChanged.connect(self.save_current_project)
