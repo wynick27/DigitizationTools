@@ -7,6 +7,8 @@ import difflib
 import requests
 import base64
 import time
+from PIL import Image, ImageOps
+from io import BytesIO
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QTextEdit, QPlainTextEdit, QLabel, QPushButton, QSplitter, QFileDialog, QInputDialog,
@@ -157,17 +159,27 @@ def get_page_image(doc, img_dir, real_page_num):
                     xref = images[0][0]
                     base_image = doc.extract_image(xref)
                     img_bytes = base_image["image"]
+                    img = Image.open(BytesIO(img_bytes))
+
+                    # 单通道灰度图
+                    #if img.mode == "L":
+                    #    img = ImageOps.invert(img)
+                    # 转回 bytes（PNG）
+                    #output = BytesIO()
+                    #img.save(output, format="PNG")
+                    #img_bytes = output.getvalue()
                 else:
                     # Fallback High DPI Render
                     pix = page.get_pixmap(matrix=fitz.Matrix(3.0, 3.0))
                     img_bytes = pix.tobytes("png")
+            
         except Exception as e:
             # print(f"PDF extract error: {e}")
             pass
             
     # 2. Try Local File
     if not img_bytes and img_dir:
-        candidates = [f"page_{real_page_num}", f"{real_page_num}"]
+        candidates = [f"page_{real_page_num:04}", f"page_{real_page_num}", f"{real_page_num}"]
         exts = [".jpg", ".jpeg", ".png", ".bmp"]
         found_path = None
         for c in candidates:
@@ -1954,18 +1966,24 @@ class ExportParser:
         else:
             # Check previous text ending
             prev_text = entry["text"]
-            if prev_text.endswith('-'):
+            cur_char = text_chunk[0]
+            cur_is_cjk = ('\u4e00' <= cur_char <= '\u9fff') or ('\u3040' <= cur_char <= '\u30ff')  or cur_char in ['／','「']
+            cur_is_latin = ('a' <= cur_char <= 'z' or 'A' <= cur_char <= 'Z' or '\u00c0' <= cur_char <= '\u0250')
+            if prev_text.endswith('-') and cur_is_latin:
                 # Hyphen: Remove hyphen, join directly
                 entry["text"] = prev_text[:-1] + text_chunk
             else:
                 last_char = prev_text[-1]
                 # CJK Check (Simple range)
-                is_cjk = ('\u4e00' <= last_char <= '\u9fff')
-                
-                if is_cjk:
+                prev_is_cjk = ('\u4e00' <= last_char <= '\u9fff') or ('\u3040' <= last_char <= '\u30ff') or last_char in ['、','，','」']
+                prev_is_latin = ('a' <= last_char <= 'z' or 'A' <= last_char <= 'Z' or '\u00c0' <= last_char <= '\u0250')
+
+                if prev_is_cjk and cur_is_cjk:
                     entry["text"] = prev_text + text_chunk
-                else:
+                elif (cur_is_latin or cur_is_cjk) and (prev_is_latin or prev_is_cjk):
                     entry["text"] = prev_text + " " + text_chunk
+                else:
+                    entry["text"] = prev_text + "\n" + text_chunk
                     
 
 # ==========================================
@@ -2122,7 +2140,7 @@ class ProjectManagerDialog(QDialog):
         # 3. Numeric Fields
         self.spin_start = QSpinBox(); self.spin_start.setRange(1, 9999)
         self.spin_end = QSpinBox(); self.spin_end.setRange(1, 9999)
-        self.spin_offset = QSpinBox(); self.spin_offset.setRange(-999, 999)
+        self.spin_offset = QSpinBox(); self.spin_offset.setRange(-9999, 9999)
         
         self.spin_start.valueChanged.connect(self.save_current_project)
         self.spin_end.valueChanged.connect(self.save_current_project)
@@ -4398,22 +4416,13 @@ class MainWindow(QMainWindow):
 
     def get_page_pixmap(self, page_num):
         """Helper for image cropping etc (still needed?) -> Refactor to use get_best..."""
-        if self.doc:
-            b = self.get_best_page_image_bytes(self.doc, page_num)
-            if b:
-                img = QImage.fromData(b)
-                return QPixmap.fromImage(img)
+        real_page_num = page_num + self.project_config.get('page_offset', 0)
         img_dir = self.project_config['image_dir']
-        if img_dir and os.path.exists(img_dir):
-            real_page_num = page_num + self.project_config.get('page_offset', 0)
-            # 尝试 page_1.jpg 或 1.jpg
-            names = [f"page_{real_page_num}", f"{real_page_num}"]
-            exts = [".jpg", ".png", ".jpeg"]
-            for n in names:
-                for e in exts:
-                    p = os.path.join(img_dir, n + e)
-                    if os.path.exists(p):
-                        return QPixmap(p)
+        img_bytes = get_page_image(self.doc, img_dir, real_page_num)
+        if img_bytes:
+            img = QImage.fromData(img_bytes)
+            return QPixmap.fromImage(img)
+        
         return None
 
     def load_ocr_json(self, page_num):
@@ -4444,7 +4453,7 @@ class MainWindow(QMainWindow):
                             data = data["layoutParsingResults"][0]
                         blocks = data.get("prunedResult", {}).get("parsing_res_list", [])
                         for b in blocks:
-                            if b.get('block_label') in ['text','paragraph_title','vertical_text']:
+                            if b.get('block_label') in ['text','abstract','algorithm','paragraph_title','vertical_text','reference_content']:
                                 res.append({
                                     'block_label': b.get('block_label'),
                                     'text': b.get('block_content'),
