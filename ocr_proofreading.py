@@ -209,13 +209,24 @@ try:
 except ImportError:
     print("PaddleOCR not found. Local OCR disabled.")
 
+HAS_KAKASI = False
+try:
+    import pykakasi
+    kks = pykakasi.kakasi()
+    HAS_KAKASI = True
+    print("pykakasi loaded for Furigana.")
+except ImportError:
+    print("pykakasi not found. Furigana disabled.")
+
 
 DEFAULT_GLOBAL_CONFIG = {
     "ocr_api_url": "",
     "ocr_api_token": "",
     "ocr_engine": "remote", # remote or local
     "find_history": [],
-    "replace_history": []
+    "replace_history": [],
+    "shortcuts_alt": [""] * 10,
+    "shortcut_furigana": "Ctrl+Shift+F"
 }
 
 DEFAULT_PROJECT_CONFIG = {
@@ -276,6 +287,10 @@ class ConfigManager:
                 # Ensure structure integrity
                 if "global" not in self.data: 
                     self.data["global"] = DEFAULT_GLOBAL_CONFIG.copy()
+                else:
+                    for k, v in DEFAULT_GLOBAL_CONFIG.items():
+                        if k not in self.data["global"]:
+                            self.data["global"][k] = v
                 if "projects" not in self.data: 
                     self.data["projects"] = [DEFAULT_PROJECT_CONFIG.copy()]
                 if "active_project" not in self.data:
@@ -1803,6 +1818,9 @@ class ProjectManagerDialog(QDialog):
         
         self.input_api_url = QLineEdit()
         self.input_api_token = QLineEdit()
+        from PyQt6.QtWidgets import QKeySequenceEdit
+        self.input_furigana = QKeySequenceEdit()
+        self.inputs_alt = []
         
         # Load values
         g = self.config_manager.get_global()
@@ -1816,10 +1834,30 @@ class ProjectManagerDialog(QDialog):
         layout.addRow("OCR API URL:", self.input_api_url)
         layout.addRow("OCR API Token:", self.input_api_token)
         
+        # Shortcuts logic
+        from PyQt6.QtGui import QKeySequence
+        self.input_furigana.setKeySequence(QKeySequence(g.get("shortcut_furigana", "Ctrl+Shift+F")))
+        self.input_furigana.keySequenceChanged.connect(self.save_global)
+        layout.addRow("Furigana Shortcut:", self.input_furigana)
+        
+        alt_texts = g.get("shortcuts_alt", [""] * 10)
+        for i in range(10):
+            le = QLineEdit()
+            le.setText(alt_texts[i] if i < len(alt_texts) else "")
+            le.textChanged.connect(self.save_global)
+            self.inputs_alt.append(le)
+            layout.addRow(f"Alt+{i} Text:", le)
+        
     def save_global(self):
         g = self.config_manager.get_global()
         g["ocr_api_url"] = self.input_api_url.text()
         g["ocr_api_token"] = self.input_api_token.text()
+        
+        if hasattr(self, 'input_furigana'):
+            g["shortcut_furigana"] = self.input_furigana.keySequence().toString()
+        if hasattr(self, 'inputs_alt'):
+            g["shortcuts_alt"] = [le.text() for le in self.inputs_alt]
+            
         self.config_manager.save()
 
     def init_projects_tab(self):
@@ -2078,7 +2116,7 @@ class ReviewDiffWorker(QThread):
     finished = pyqtSignal(list, str) # items, msg
     
     def __init__(self, pages, pages_left, pages_right, target_is_left, 
-                 regex_old, regex_new, 
+                 regex_old, regex_new, regex_scope,
                  check_insert, check_delete, check_replace):
         super().__init__()
         self.pages = pages
@@ -2087,6 +2125,7 @@ class ReviewDiffWorker(QThread):
         self.target_is_left = target_is_left
         self.regex_old = regex_old
         self.regex_new = regex_new
+        self.regex_scope = regex_scope
         self.chk_insert = check_insert
         self.chk_delete = check_delete
         self.chk_replace = check_replace
@@ -2128,6 +2167,11 @@ class ReviewDiffWorker(QThread):
         matcher = difflib.SequenceMatcher(None, text_a, text_b, autojunk=False)
         opcodes = matcher.get_opcodes()
         
+        # Pre-compute valid scope spans if regex_scope is defined
+        scope_spans = []
+        if self.regex_scope:
+            scope_spans = [m.span() for m in self.regex_scope.finditer(text_a)]
+        
         import html
         
         for tag, i1, i2, j1, j2 in opcodes:
@@ -2151,6 +2195,17 @@ class ReviewDiffWorker(QThread):
                  if not self.regex_new.search(new_segment): continue
              if self.regex_new and not new_segment: continue
             
+             # Check Scope
+             if self.regex_scope:
+                 # Check if the diff overlap with any scope match
+                 in_scope = False
+                 for (start, end) in scope_spans:
+                     if not (i2 < start or i1 > end): # Overlaps
+                         in_scope = True
+                         break
+                 if not in_scope:
+                     continue
+            
              # Context
              c_start = max(0, i1 - 10)
              c_end = min(len(text_a), i2 + 10)
@@ -2170,8 +2225,16 @@ class ReviewDiffWorker(QThread):
              elif tag == 'insert':
                   diff_html = f"{prefix}<span style='{style_ins}'>{seg_new_esc}</span>{suffix}"
             
+             # Line/Col Calculation
+             line = text_a.count('\n', 0, i1) + 1
+             last_nl = text_a.rfind('\n', 0, i1)
+             if last_nl == -1: col = i1 + 1
+             else: col = i1 - last_nl
+
              item_data = {
                 'page_num': page_num,
+                'line': line,
+                'col': col,
                 'span': (i1, i2), 
                 'original': old_segment,
                 'new': new_segment,
@@ -2935,13 +2998,16 @@ class FindReplaceDialog(QDialog):
         else:
              repl_func = lambda m: repl_text
              
+        # Ensure current page in active editor is saved before bulk replace
+        self.mainwindow.save_current_page_data()
+
         # Undo Snapshot
         if is_global:
             self.mainwindow.push_global_undo("Replace All Global")
         elif not is_global and len(page_nums) == 1:
              # Page level undo handled by editor usually? 
              # But we are modifying data dict directly or editor?
-             self.mainwindow.save_current_page_data()
+             pass # Save already called above
         
         count = 0
         target_dict = self.mainwindow.pages_left if self.rb_left.isChecked() else self.mainwindow.pages_right_text
@@ -3074,7 +3140,22 @@ class FindReplaceDialog(QDialog):
         self.txt_diff_filter_new.setPlaceholderText("Regex to match New Text (Empty = All)")
         form.addRow("New Text Match:", self.txt_diff_filter_new)
         
+        # Scope Text Filter
+        self.txt_diff_scope_regex = QLineEdit()
+        self.txt_diff_scope_regex.setPlaceholderText(r"Regex scope (e.g. \*\*.*?\*\*)")
+        form.addRow("Scope Match:", self.txt_diff_scope_regex)
+        
         layout.addWidget(grp_filter)
+        
+        # 2.5 Custom Replace Format
+        grp_fmt = QGroupBox("Custom Replace Format")
+        l_fmt = QFormLayout(grp_fmt)
+        self.chk_custom_replace = QCheckBox("Enable Custom Format")
+        self.txt_custom_replace = QLineEdit()
+        self.txt_custom_replace.setPlaceholderText(r"e.g. \1[\2] (\1=src, \2=tgt)")
+        l_fmt.addRow(self.chk_custom_replace)
+        l_fmt.addRow("Format:", self.txt_custom_replace)
+        layout.addWidget(grp_fmt)
         
         # 3. Actions
         h_btn = QHBoxLayout()
@@ -3673,8 +3754,15 @@ class FindReplaceDialog(QDialog):
             for item in items:
                 start, end = item['span']
                 repl_t = item['new']
+                orig_t = item['original']
+                
                 # Verify context match
-                if new_txt[start:end] == item['original']:
+                if new_txt[start:end] == orig_t:
+                     if self.chk_custom_replace.isChecked():
+                         fmt = self.txt_custom_replace.text()
+                         if fmt:
+                             repl_t = fmt.replace(r'\1', orig_t).replace(r'\2', repl_t)
+                             
                      new_txt = new_txt[:start] + repl_t + new_txt[end:]
                      count += 1
             
@@ -3730,12 +3818,15 @@ class FindReplaceDialog(QDialog):
         # 1. Compile filters
         regex_old = None
         regex_new = None
+        regex_scope = None
         pat_old = self.txt_diff_filter_old.text()
         pat_new = self.txt_diff_filter_new.text()
+        pat_scope = self.txt_diff_scope_regex.text()
         
         try:
              if pat_old: regex_old = re.compile(pat_old)
              if pat_new: regex_new = re.compile(pat_new)
+             if pat_scope: regex_scope = re.compile(pat_scope)
         except Exception as e:
              QMessageBox.critical(self, "Regex Error", str(e))
              return
@@ -3782,7 +3873,7 @@ class FindReplaceDialog(QDialog):
             self.mainwindow.pages_left, 
             self.mainwindow.pages_right_text,
             target_is_left,
-            regex_old, regex_new,
+            regex_old, regex_new, regex_scope,
             self.chk_diff_insert.isChecked(),
             self.chk_diff_delete.isChecked(),
             self.chk_diff_replace.isChecked()
@@ -4048,6 +4139,7 @@ class MainWindow(QMainWindow):
         self.find_replace_dialog = None
         self.last_manual_edit_time = 0
         self.current_loaded_page = None # Track actual loaded page index
+        self.last_active_editor = None # Track last focused editor for shortcuts
         
         # 初始化界面
         self.init_ui()
@@ -4062,7 +4154,83 @@ class MainWindow(QMainWindow):
         else:
             event.ignore()
         
+    def setup_shortcuts(self):
+        from PyQt6.QtGui import QShortcut, QKeySequence
+        
+        # Furigana
+        furi_seq = self.global_config.get("shortcut_furigana", "Ctrl+Shift+F")
+        if furi_seq:
+            self.shortcut_furi = QShortcut(QKeySequence(furi_seq), self)
+            self.shortcut_furi.activated.connect(self.apply_furigana_to_selection)
+            
+        # Alt+0-9 Shortcuts
+        alt_texts = self.global_config.get("shortcuts_alt", [""] * 10)
+        self.alt_shortcuts = []
+        for i, text in enumerate(alt_texts):
+            if text:
+                sc = QShortcut(QKeySequence(f"Alt+{i}"), self)
+                sc.activated.connect(lambda txt=text: self.insert_shortcut_text(txt))
+                self.alt_shortcuts.append(sc)
+                
+    def _get_focused_editor(self):
+        """Return the last active text editor (edit_left or edit_right)."""
+        editor = getattr(self, 'last_active_editor', None)
+        if editor and isinstance(editor, QPlainTextEdit):
+            return editor
+        # Fallback: try either editor
+        if hasattr(self, 'edit_left'):
+            return self.edit_left
+        return None
+                
+    def insert_shortcut_text(self, text):
+        editor = self._get_focused_editor()
+        if editor:
+            editor.setFocus()
+            cursor = editor.textCursor()
+            cursor.insertText(text)
+            editor.setTextCursor(cursor)
+            
+    def apply_furigana_to_selection(self):
+        if not HAS_KAKASI: return
+        
+        editor = self._get_focused_editor()
+        if not editor: return
+        
+        editor.setFocus()
+        cursor = editor.textCursor()
+        if not cursor.hasSelection(): return
+        
+        sel_text = cursor.selectedText()
+        if not sel_text.strip(): return
+        
+        # Process Furigana
+        result = []
+        for item in kks.convert(sel_text):
+            orig = item['orig']
+            kana = item['hira']
+            if orig == kana or orig == item['kana']:
+                result.append(orig)
+            else:
+                result.append(f"{orig}[{kana}]")
+                
+        cursor.insertText("".join(result))
+        editor.setTextCursor(cursor)
+
+    def show_split_pdf_dialog(self):
+        d = SplitPdfDialog(self)
+        d.exec()
+        
+    def show_export_pdf_img_dialog(self):
+        d = ExportPdfImageDialog(self)
+        d.exec()
+        
+    def show_merge_text_dialog(self):
+        d = MergeTextDialog(self)
+        d.exec()
+
     def init_ui(self):
+        self.setup_shortcuts()
+        
         # --- 工具栏 ---
         toolbar = QToolBar()
         self.addToolBar(toolbar)
@@ -4087,6 +4255,19 @@ class MainWindow(QMainWindow):
         act_undo_global = QAction("Undo Global Replace", self)
         act_undo_global.triggered.connect(self.undo_global)
         edit_menu.addAction(act_undo_global)
+        
+        tools_menu = menubar.addMenu("Tools (实用工具)")
+        act_split = QAction("拆分PDF (Split PDF)", self)
+        act_split.triggered.connect(self.show_split_pdf_dialog)
+        tools_menu.addAction(act_split)
+        
+        act_exp_img = QAction("导出PDF图片 (Export PDF Images)", self)
+        act_exp_img.triggered.connect(self.show_export_pdf_img_dialog)
+        tools_menu.addAction(act_exp_img)
+        
+        act_merge = QAction("合并文本文件 (Merge Texts)", self)
+        act_merge.triggered.connect(self.show_merge_text_dialog)
+        tools_menu.addAction(act_merge)
         
         btn_manage = QPushButton("Settings / Manage")
         btn_manage.clicked.connect(self.open_project_manager)
@@ -5559,6 +5740,270 @@ class MainWindow(QMainWindow):
         # MainWindow usually has self.statusBar().
         self.statusBar().showMessage(f"Undone: {snapshot['desc']}", 5000)
         QMessageBox.information(self, "Undo", f"Reverted: {snapshot['desc']}")
+
+# ==========================================
+# 6. Utility Functions Dialogs
+# ==========================================
+
+class SplitPdfDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("拆分PDF")
+        self.resize(500, 200)
+        self.init_ui()
+        
+    def init_ui(self):
+        layout = QFormLayout(self)
+        
+        self.txt_pdf = QLineEdit()
+        btn_browse = QPushButton("...")
+        btn_browse.setFixedWidth(30)
+        btn_browse.clicked.connect(self.browse_pdf)
+        h_pdf = QHBoxLayout()
+        h_pdf.addWidget(self.txt_pdf)
+        h_pdf.addWidget(btn_browse)
+        layout.addRow("输入PDF:", h_pdf)
+        
+        self.txt_ranges = QLineEdit()
+        self.txt_ranges.setPlaceholderText("例如: 1-10, 15, 20-30")
+        layout.addRow("页码范围:", self.txt_ranges)
+        
+        self.spin_split = QSpinBox()
+        self.spin_split.setMinimum(1)
+        self.spin_split.setMaximum(9999)
+        self.spin_split.setValue(10)
+        layout.addRow("每次拆分包含页数:", self.spin_split)
+        
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.run_split)
+        btns.rejected.connect(self.reject)
+        layout.addRow(btns)
+        
+    def browse_pdf(self):
+        path, _ = QFileDialog.getOpenFileName(self, "选择PDF", "", "PDF (*.pdf)")
+        if path: self.txt_pdf.setText(path)
+        
+    def run_split(self):
+        pdf_path = self.txt_pdf.text()
+        if not os.path.exists(pdf_path): return QMessageBox.warning(self, "Error", "PDF 文件不存在")
+        
+        ranges_text = self.txt_ranges.text()
+        chunk_size = self.spin_split.value()
+        
+        # Parse ranges
+        pages_to_extract = set()
+        for part in ranges_text.split(','):
+            part = part.strip()
+            if not part: continue
+            if '-' in part:
+                try:
+                    s, e = map(int, part.split('-'))
+                    pages_to_extract.update(range(s, e+1))
+                except: pass
+            else:
+                try: pages_to_extract.add(int(part))
+                except: pass
+        if not pages_to_extract:
+            QMessageBox.warning(self, "Error", "页码范围无效或为空")
+            return
+            
+        pages = sorted(list(pages_to_extract))
+        try:
+            doc = fitz.open(pdf_path)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"无法打开PDF: {e}")
+            return
+            
+        base_name = os.path.splitext(pdf_path)[0]
+        
+        chunks = [pages[i:i + chunk_size] for i in range(0, len(pages), chunk_size)]
+        for i, chunk in enumerate(chunks):
+            new_doc = fitz.open()
+            for p_num in chunk:
+                # 1-indexed to 0-indexed
+                if 1 <= p_num <= len(doc):
+                    new_doc.insert_pdf(doc, from_page=p_num-1, to_page=p_num-1)
+            if len(new_doc) > 0:
+                out_path = f"{base_name}_part{i+1}_{chunk[0]}-{chunk[-1]}.pdf"
+                new_doc.save(out_path)
+            new_doc.close()
+            
+        doc.close()
+        QMessageBox.information(self, "Success", f"拆分完成，生成了 {len(chunks)} 个文件。")
+        self.accept()
+        
+class ExportPdfImageDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("导出PDF图片")
+        self.resize(500, 200)
+        self.init_ui()
+        
+    def init_ui(self):
+        layout = QFormLayout(self)
+        
+        self.txt_pdf = QLineEdit()
+        btn_browse_pdf = QPushButton("...")
+        btn_browse_pdf.setFixedWidth(30)
+        btn_browse_pdf.clicked.connect(self.browse_pdf)
+        h_pdf = QHBoxLayout()
+        h_pdf.addWidget(self.txt_pdf)
+        h_pdf.addWidget(btn_browse_pdf)
+        layout.addRow("输入PDF:", h_pdf)
+        
+        self.txt_ranges = QLineEdit()
+        self.txt_ranges.setPlaceholderText("例如: 1-10, 15, 20-30")
+        layout.addRow("页码范围:", self.txt_ranges)
+        
+        self.txt_out = QLineEdit()
+        btn_browse_out = QPushButton("...")
+        btn_browse_out.setFixedWidth(30)
+        btn_browse_out.clicked.connect(self.browse_out)
+        h_out = QHBoxLayout()
+        h_out.addWidget(self.txt_out)
+        h_out.addWidget(btn_browse_out)
+        layout.addRow("输出目录:", h_out)
+        
+        self.combo_ext = QComboBox()
+        self.combo_ext.addItems([".jpg", ".png"])
+        layout.addRow("图片格式:", self.combo_ext)
+        
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.run_export)
+        btns.rejected.connect(self.reject)
+        layout.addRow(btns)
+        
+    def browse_pdf(self):
+        path, _ = QFileDialog.getOpenFileName(self, "选择PDF", "", "PDF (*.pdf)")
+        if path: self.txt_pdf.setText(path)
+        
+    def browse_out(self):
+        d = QFileDialog.getExistingDirectory(self, "选择输出目录")
+        if d: self.txt_out.setText(d)
+        
+    def run_export(self):
+        pdf_path = self.txt_pdf.text()
+        out_dir = self.txt_out.text()
+        if not os.path.exists(pdf_path) or not os.path.exists(out_dir):
+            return QMessageBox.warning(self, "Error", "路径无效")
+            
+        ranges_text = self.txt_ranges.text()
+        ext = self.combo_ext.currentText()
+        
+        pages_to_extract = set()
+        for part in ranges_text.split(','):
+            part = part.strip()
+            if not part: continue
+            if '-' in part:
+                try:
+                    s, e = map(int, part.split('-'))
+                    pages_to_extract.update(range(s, e+1))
+                except: pass
+            else:
+                try: pages_to_extract.add(int(part))
+                except: pass
+                
+        if not pages_to_extract:
+            return QMessageBox.warning(self, "Error", "页码范围无效")
+            
+        pages = sorted(list(pages_to_extract))
+        try:
+            doc = fitz.open(pdf_path)
+        except Exception as e:
+            return QMessageBox.critical(self, "Error", str(e))
+            
+        count = 0
+        for p_num in pages:
+            if 1 <= p_num <= len(doc):
+                page = doc[p_num-1]
+                pix = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5))
+                out_path = os.path.join(out_dir, f"page_{p_num}{ext}")
+                pix.save(out_path)
+                count += 1
+                
+        doc.close()
+        QMessageBox.information(self, "Success", f"导出完成，共 {count} 张图片。")
+        self.accept()
+
+class MergeTextDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("合并文本文件")
+        self.resize(600, 300)
+        self.files = []
+        self.init_ui()
+        
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        
+        h_list = QHBoxLayout()
+        self.list_files = QListWidget()
+        h_list.addWidget(self.list_files)
+        
+        v_btns = QVBoxLayout()
+        btn_add = QPushButton("添加文件")
+        btn_add.clicked.connect(self.add_files)
+        btn_remove = QPushButton("移除选中")
+        btn_remove.clicked.connect(self.remove_files)
+        btn_clear = QPushButton("清空")
+        btn_clear.clicked.connect(self.clear_files)
+        v_btns.addWidget(btn_add)
+        v_btns.addWidget(btn_remove)
+        v_btns.addWidget(btn_clear)
+        v_btns.addStretch()
+        h_list.addLayout(v_btns)
+        layout.addLayout(h_list)
+        
+        form = QFormLayout()
+        self.combo_conflict = QComboBox()
+        self.combo_conflict.addItems(["保留第一份 (Keep First)", "保留最后一份 (Keep Last)", "合并内容 (Merge All)"])
+        form.addRow("重复页码策略:", self.combo_conflict)
+        layout.addLayout(form)
+        
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.run_merge)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+        
+    def add_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "选择文本文件", "", "Text Files (*.txt)")
+        for p in paths:
+            if p not in self.files:
+                self.files.append(p)
+                self.list_files.addItem(os.path.basename(p))
+                
+    def remove_files(self):
+        for item in self.list_files.selectedItems():
+            idx = self.list_files.row(item)
+            self.list_files.takeItem(idx)
+            del self.files[idx]
+            
+    def clear_files(self):
+        self.list_files.clear()
+        self.files.clear()
+        
+    def run_merge(self):
+        if not self.files: return
+        
+        out_path, _ = QFileDialog.getSaveFileName(self, "保存合并文件", "", "Text Files (*.txt)")
+        if not out_path: return
+        
+        strategy = self.combo_conflict.currentIndex()
+        
+        merged_pages = {}
+        for fpath in self.files:
+            pages = read_text_to_pages(fpath)
+            for p_num, content in pages.items():
+                if p_num in merged_pages:
+                    if strategy == 0: continue
+                    elif strategy == 1: merged_pages[p_num] = content
+                    elif strategy == 2: merged_pages[p_num] += "\n\n" + content
+                else:
+                    merged_pages[p_num] = content
+                    
+        write_pages_to_file(merged_pages, out_path)
+        QMessageBox.information(self, "Success", f"合并完成，共 {len(merged_pages)} 页。")
+        self.accept()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
