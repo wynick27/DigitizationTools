@@ -1861,7 +1861,7 @@ class ProjectManagerDialog(QDialog):
         # 3. Numeric Fields
         self.spin_start = QSpinBox(); self.spin_start.setRange(1, 9999)
         self.spin_end = QSpinBox(); self.spin_end.setRange(1, 9999)
-        self.spin_offset = QSpinBox(); self.spin_offset.setRange(-999, 999)
+        self.spin_offset = QSpinBox(); self.spin_offset.setRange(-9999, 9999)
         
         self.spin_start.valueChanged.connect(self.save_current_project)
         self.spin_end.valueChanged.connect(self.save_current_project)
@@ -4553,7 +4553,7 @@ class MainWindow(QMainWindow):
                             data = data["layoutParsingResults"][0]
                         blocks = data.get("prunedResult", {}).get("parsing_res_list", [])
                         for b in blocks:
-                            if b.get('block_label') in ['text','paragraph_title','vertical_text']:
+                            if b.get('block_label') in ['text','paragraph_title',"reference_content",'vertical_text']:
                                 res.append({
                                     'block_label': b.get('block_label'),
                                     'text': b.get('block_content'),
