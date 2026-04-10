@@ -243,3 +243,39 @@ class ImageExportWorker(QThread):
 
     def stop(self):
         self.is_running = False
+
+class MarkdownImageDownloader(QThread):
+    progress_val = pyqtSignal(int)
+    finished = pyqtSignal(bool, int)
+
+    def __init__(self, tasks):
+        super().__init__()
+        self.tasks = tasks
+        self.is_running = True
+
+    def run(self):
+        count = 0
+        success = True
+        for i, (url, save_path) in enumerate(self.tasks):
+            if not self.is_running:
+                success = False
+                break
+                
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            if not os.path.exists(save_path):
+                try:
+                    r = requests.get(url, timeout=10)
+                    if r.status_code == 200:
+                        with open(save_path, 'wb') as f:
+                            f.write(r.content)
+                        count += 1
+                except Exception as e:
+                    print(f"Failed to download image: {url} -> {e}")
+            else:
+                count += 1
+            self.progress_val.emit(i + 1)
+            
+        self.finished.emit(success, count)
+        
+    def stop(self):
+        self.is_running = False

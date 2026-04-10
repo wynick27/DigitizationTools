@@ -175,7 +175,8 @@ DEFAULT_GLOBAL_CONFIG = {
     "find_history": [],
     "replace_history": [],
     "shortcuts_alt": [""] * 10,
-    "shortcut_furigana": "Ctrl+Shift+F"
+    "shortcut_furigana": "Ctrl+Shift+F",
+    "ui_lang": "zh"
 }
 
 DEFAULT_PROJECT_CONFIG = {
@@ -303,7 +304,78 @@ class ConfigManager:
         self.save()
         return True
 
-# (Text functions moved to tools/text_tools.py)
+# ==========================================
+# 0.6 Language Dictionary (i18n)
+# ==========================================
+UI_TEXTS = {
+    "zh": {
+        "menu_edit": "编辑 (Edit)",
+        "menu_tools": "工具 (Tools)",
+        "menu_export": "导出 (Export)",
+        "menu_lang": "语言 (Language)",
+        "act_find": "查找和替换 (Find/Replace)",
+        "act_undo_global": "撤销全局替换 (Undo Global Replace)",
+        "act_split": "拆分PDF (Split PDF)",
+        "act_exp_img": "导出PDF图片 (Export PDF Images)",
+        "act_merge": "合并文本文件 (Merge Texts)",
+        "act_exp_slice": "导出当前页面切图",
+        "act_exp_ocr_curr": "导出当前页面OCR文本",
+        "act_exp_ocr_all": "导出所有页面OCR文本",
+        "act_exp_md_all": "导出所有为Markdown",
+        "act_exp_md_img_all": "导出所有为Markdown+图片",
+        "act_exp_l_json": "导出左侧文本(.json)",
+        "act_exp_r_json": "导出右侧文本(.json)",
+        "act_exp_l_mdx": "导出左侧文本(.mdx.txt)",
+        "act_exp_r_mdx": "导出右侧文本(.mdx.txt)",
+        "act_exp_l_json_img": "导出左侧文本(.json)+图片",
+        "act_exp_r_json_img": "导出右侧文本(.json)+图片",
+        "act_exp_l_mdx_img": "导出左侧文本(.mdx.txt)+图片",
+        "act_exp_r_mdx_img": "导出右侧文本(.mdx.txt)+图片",
+        "act_force_recreate": "强制重新生成图片",
+        "lbl_project": "项目: ",
+        "btn_manage": "设置 / 管理",
+        "lbl_page": "页码: ",
+        "lbl_source": " 右侧数据源: ",
+        "cb_wrap": "自动换行",
+        "lbl_engine": " OCR引擎: ",
+        "btn_ocr_cur": "OCR当前页面",
+        "btn_ocr_batch": "OCR所有缺失页面",
+    },
+    "en": {
+        "menu_edit": "Edit",
+        "menu_tools": "Tools",
+        "menu_export": "Export",
+        "menu_lang": "Language",
+        "act_find": "Find and Replace",
+        "act_undo_global": "Undo Global Replace",
+        "act_split": "Split PDF",
+        "act_exp_img": "Export PDF Images",
+        "act_merge": "Merge Texts",
+        "act_exp_slice": "Export Current Slices",
+        "act_exp_ocr_curr": "Export Current OCR Text",
+        "act_exp_ocr_all": "Export All OCR Text",
+        "act_exp_md_all": "Export All to Markdown",
+        "act_exp_md_img_all": "Export All to Markdown + Images",
+        "act_exp_l_json": "Export Left (.json)",
+        "act_exp_r_json": "Export Right (.json)",
+        "act_exp_l_mdx": "Export Left (.mdx.txt)",
+        "act_exp_r_mdx": "Export Right (.mdx.txt)",
+        "act_exp_l_json_img": "Export Left (.json) + Images",
+        "act_exp_r_json_img": "Export Right (.json) + Images",
+        "act_exp_l_mdx_img": "Export Left (.mdx.txt) + Images",
+        "act_exp_r_mdx_img": "Export Right (.mdx.txt) + Images",
+        "act_force_recreate": "Force Recreate Images",
+        "lbl_project": "Project: ",
+        "btn_manage": "Settings / Manage",
+        "lbl_page": "Page: ",
+        "lbl_source": " Right Data Source: ",
+        "cb_wrap": "Word Wrap",
+        "lbl_engine": " OCR Engine: ",
+        "btn_ocr_cur": "OCR Current",
+        "btn_ocr_batch": "OCR Missing Pages",
+    }
+}
+
 
 # ==========================================
 # 1. 自定义编辑器 (支持 Diff 交互) & Highlighter
@@ -3391,6 +3463,10 @@ class MainWindow(QMainWindow):
         from PyQt6.QtGui import QShortcut, QKeySequence
         
         # Furigana
+        if hasattr(self, 'shortcut_furi') and self.shortcut_furi:
+            self.shortcut_furi.deleteLater()
+            self.shortcut_furi = None
+            
         furi_seq = self.global_config.get("shortcut_furigana", "Ctrl+Shift+F")
         if furi_seq:
             self.shortcut_furi = QShortcut(QKeySequence(furi_seq), self)
@@ -3398,12 +3474,68 @@ class MainWindow(QMainWindow):
             
         # Alt+0-9 Shortcuts
         alt_texts = self.global_config.get("shortcuts_alt", [""] * 10)
+        
+        if hasattr(self, 'alt_shortcuts'):
+            for sc in self.alt_shortcuts:
+                sc.deleteLater()
+                
         self.alt_shortcuts = []
         for i, text in enumerate(alt_texts):
             if text:
                 sc = QShortcut(QKeySequence(f"Alt+{i}"), self)
                 sc.activated.connect(lambda txt=text: self.insert_shortcut_text(txt))
                 self.alt_shortcuts.append(sc)
+                
+    def get_text(self, key):
+        lang = self.global_config.get("ui_lang", "zh")
+        return UI_TEXTS.get(lang, UI_TEXTS["zh"]).get(key, key)
+        
+    def switch_language(self, lang_code):
+        self.global_config["ui_lang"] = lang_code
+        self.config_manager.save()
+        self.retranslate_ui()
+        
+    def retranslate_ui(self):
+        # Update Menu titles
+        self.edit_menu.setTitle(self.get_text("menu_edit"))
+        self.tools_menu.setTitle(self.get_text("menu_tools"))
+        self.menu_export.setTitle(self.get_text("menu_export"))
+        self.lang_menu.setTitle(self.get_text("menu_lang"))
+        
+        # Update Actions
+        self.act_find.setText(self.get_text("act_find"))
+        self.act_undo_global.setText(self.get_text("act_undo_global"))
+        self.act_split.setText(self.get_text("act_split"))
+        self.act_exp_img.setText(self.get_text("act_exp_img"))
+        self.act_merge.setText(self.get_text("act_merge"))
+        
+        self.act_exp_slice.setText(self.get_text("act_exp_slice"))
+        self.act_exp_ocr_curr.setText(self.get_text("act_exp_ocr_curr"))
+        self.act_exp_ocr_all.setText(self.get_text("act_exp_ocr_all"))
+        self.act_exp_md_all.setText(self.get_text("act_exp_md_all"))
+        self.act_exp_md_img_all.setText(self.get_text("act_exp_md_img_all"))
+        
+        self.act_exp_l_json.setText(self.get_text("act_exp_l_json"))
+        self.act_exp_r_json.setText(self.get_text("act_exp_r_json"))
+        self.act_exp_l_mdx.setText(self.get_text("act_exp_l_mdx"))
+        self.act_exp_r_mdx.setText(self.get_text("act_exp_r_mdx"))
+        
+        self.act_exp_l_json_img.setText(self.get_text("act_exp_l_json_img"))
+        self.act_exp_r_json_img.setText(self.get_text("act_exp_r_json_img"))
+        self.act_exp_l_mdx_img.setText(self.get_text("act_exp_l_mdx_img"))
+        self.act_exp_r_mdx_img.setText(self.get_text("act_exp_r_mdx_img"))
+        
+        self.action_force_recreate.setText(self.get_text("act_force_recreate"))
+        
+        # Update Toolbar
+        self.lbl_project.setText(self.get_text("lbl_project"))
+        self.btn_manage.setText(self.get_text("btn_manage"))
+        self.lbl_page.setText(self.get_text("lbl_page"))
+        self.lbl_source.setText(self.get_text("lbl_source"))
+        self.cb_word_wrap.setText(self.get_text("cb_wrap"))
+        self.lbl_engine.setText(self.get_text("lbl_engine"))
+        self.btn_ocr_cur.setText(self.get_text("btn_ocr_cur"))
+        self.btn_batch.setText(self.get_text("btn_ocr_batch"))
                 
     def _get_focused_editor(self):
         """Return the last active text editor (edit_left or edit_right)."""
@@ -3422,6 +3554,7 @@ class MainWindow(QMainWindow):
             cursor = editor.textCursor()
             cursor.insertText(text)
             editor.setTextCursor(cursor)
+            self.statusBar().showMessage(f"Shortcut Inserted: {text}", 3000)
             
     def apply_furigana_to_selection(self):
         if not HAS_KAKASI: return
@@ -3441,6 +3574,7 @@ class MainWindow(QMainWindow):
                 
         cursor.insertText(result_text)
         editor.setTextCursor(cursor)
+        self.statusBar().showMessage("Shortcut applied: Furigana added", 3000)
 
     def show_split_pdf_dialog(self):
         d = SplitPdfDialog(self)
@@ -3462,7 +3596,8 @@ class MainWindow(QMainWindow):
         self.addToolBar(toolbar)
         
         # Project Controls
-        toolbar.addWidget(QLabel("Project: "))
+        self.lbl_project = QLabel("Project: ")
+        toolbar.addWidget(self.lbl_project)
         self.combo_project = QComboBox()
         self.combo_project.setMinimumWidth(150)
         self.update_project_combo()
@@ -3470,34 +3605,42 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.combo_project)
 
         # Menu Bar
-        menubar = self.menuBar()
-        edit_menu = menubar.addMenu("Edit")
+        self.menubar = self.menuBar()
+        self.edit_menu = self.menubar.addMenu("Edit")
         
-        act_find = QAction("Find and Replace", self)
-        act_find.setShortcut("Ctrl+F")
-        act_find.triggered.connect(self.show_find_replace)
-        edit_menu.addAction(act_find)
+        self.act_find = QAction("Find and Replace", self)
+        self.act_find.setShortcut("Ctrl+F")
+        self.act_find.triggered.connect(self.show_find_replace)
+        self.edit_menu.addAction(self.act_find)
         
-        act_undo_global = QAction("Undo Global Replace", self)
-        act_undo_global.triggered.connect(self.undo_global)
-        edit_menu.addAction(act_undo_global)
+        self.act_undo_global = QAction("Undo Global Replace", self)
+        self.act_undo_global.triggered.connect(self.undo_global)
+        self.edit_menu.addAction(self.act_undo_global)
         
-        tools_menu = menubar.addMenu("Tools (实用工具)")
-        act_split = QAction("拆分PDF (Split PDF)", self)
-        act_split.triggered.connect(self.show_split_pdf_dialog)
-        tools_menu.addAction(act_split)
+        self.tools_menu = self.menubar.addMenu("Tools (实用工具)")
+        self.act_split = QAction("拆分PDF (Split PDF)", self)
+        self.act_split.triggered.connect(self.show_split_pdf_dialog)
+        self.tools_menu.addAction(self.act_split)
         
-        act_exp_img = QAction("导出PDF图片 (Export PDF Images)", self)
-        act_exp_img.triggered.connect(self.show_export_pdf_img_dialog)
-        tools_menu.addAction(act_exp_img)
+        self.act_exp_img = QAction("导出PDF图片 (Export PDF Images)", self)
+        self.act_exp_img.triggered.connect(self.show_export_pdf_img_dialog)
+        self.tools_menu.addAction(self.act_exp_img)
         
-        act_merge = QAction("合并文本文件 (Merge Texts)", self)
-        act_merge.triggered.connect(self.show_merge_text_dialog)
-        tools_menu.addAction(act_merge)
+        self.act_merge = QAction("合并文本文件 (Merge Texts)", self)
+        self.act_merge.triggered.connect(self.show_merge_text_dialog)
+        self.tools_menu.addAction(self.act_merge)
         
-        btn_manage = QPushButton("Settings / Manage")
-        btn_manage.clicked.connect(self.open_project_manager)
-        toolbar.addWidget(btn_manage)
+        self.lang_menu = self.menubar.addMenu("Language")
+        act_lang_zh = QAction("中文", self)
+        act_lang_zh.triggered.connect(lambda: self.switch_language("zh"))
+        self.lang_menu.addAction(act_lang_zh)
+        act_lang_en = QAction("English", self)
+        act_lang_en.triggered.connect(lambda: self.switch_language("en"))
+        self.lang_menu.addAction(act_lang_en)
+        
+        self.btn_manage = QPushButton("Settings / Manage")
+        self.btn_manage.clicked.connect(self.open_project_manager)
+        toolbar.addWidget(self.btn_manage)
         
         toolbar.addSeparator()
         
@@ -3509,14 +3652,16 @@ class MainWindow(QMainWindow):
         btn_prev = QPushButton("<"); btn_prev.setFixedWidth(30); btn_prev.clicked.connect(self.prev_page)
         btn_next = QPushButton(">"); btn_next.setFixedWidth(30); btn_next.clicked.connect(self.next_page)
         
-        toolbar.addWidget(QLabel("页码: "))
+        self.lbl_page = QLabel("页码: ")
+        toolbar.addWidget(self.lbl_page)
         toolbar.addWidget(btn_prev)
         toolbar.addWidget(self.spin_page)
         toolbar.addWidget(btn_next)
         toolbar.addSeparator()
         
         # 数据源选择
-        toolbar.addWidget(QLabel(" 右侧数据源: "))
+        self.lbl_source = QLabel(" 右侧数据源: ")
+        toolbar.addWidget(self.lbl_source)
         self.combo_source = QComboBox()
         self.combo_source.addItems(["Text File B", "OCR Results"])
         self.combo_source.currentIndexChanged.connect(lambda: self.load_current_page())
@@ -3536,7 +3681,8 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.cb_word_wrap)
         
         toolbar.addSeparator()
-        toolbar.addWidget(QLabel(" OCR Engine: "))
+        self.lbl_engine = QLabel(" OCR Engine: ")
+        toolbar.addWidget(self.lbl_engine)
         self.combo_ocr_engine = QComboBox()
         self.combo_ocr_engine.addItem("Remote API", "remote")
         if HAS_LOCAL_OCR:
@@ -3550,48 +3696,82 @@ class MainWindow(QMainWindow):
         self.combo_ocr_engine.currentIndexChanged.connect(self.on_ocr_engine_changed)
         toolbar.addWidget(self.combo_ocr_engine)
         
-        btn_ocr_cur = QPushButton("OCR当前页面")
-        btn_ocr_cur.clicked.connect(self.run_current_ocr_unified)
-        toolbar.addWidget(btn_ocr_cur)
+        self.btn_ocr_cur = QPushButton("OCR当前页面")
+        self.btn_ocr_cur.clicked.connect(self.run_current_ocr_unified)
+        toolbar.addWidget(self.btn_ocr_cur)
         
         self.btn_batch = QPushButton("OCR所有缺失页面")
         self.btn_batch.clicked.connect(self.run_batch_ocr)
         toolbar.addWidget(self.btn_batch)
 
+        # Export Menu (Moved to Menu Bar)
+        self.menu_export = self.menubar.addMenu("Export (导出)")
         
+        self.act_exp_slice = QAction("导出当前页面切图", self)
+        self.act_exp_slice.triggered.connect(self.export_slices)
+        self.menu_export.addAction(self.act_exp_slice)
         
-        # Export Menu Button
-        self.btn_export_menu = QPushButton("导出...")
-        self.menu_export = QMenu(self)
+        self.act_exp_ocr_curr = QAction("导出当前页面OCR文本", self)
+        self.act_exp_ocr_curr.triggered.connect(self.export_ocr_dict_current)
+        self.menu_export.addAction(self.act_exp_ocr_curr)
         
-        # Actions
-        def add_action(text, func):
-            a = QAction(text, self)
-            a.triggered.connect(func)
-            self.menu_export.addAction(a)
-            
-        add_action("导出当前页面切图", self.export_slices)
-        add_action("导出当前页面OCR文本", self.export_ocr_dict_current)
         self.menu_export.addSeparator()
-        add_action("导出所有页面OCR文本", self.export_all_ocr_txt)
+        
+        self.act_exp_ocr_all = QAction("导出所有页面OCR文本", self)
+        self.act_exp_ocr_all.triggered.connect(self.export_all_ocr_txt)
+        self.menu_export.addAction(self.act_exp_ocr_all)
+        
+        # New Markdown Exports
+        self.act_exp_md_all = QAction("导出所有为Markdown", self)
+        self.act_exp_md_all.triggered.connect(lambda: self.export_all_markdown(with_images=False))
+        self.menu_export.addAction(self.act_exp_md_all)
+        
+        self.act_exp_md_img_all = QAction("导出所有为Markdown+图片", self)
+        self.act_exp_md_img_all.triggered.connect(lambda: self.export_all_markdown(with_images=True))
+        self.menu_export.addAction(self.act_exp_md_img_all)
+        
         self.menu_export.addSeparator()
-        add_action("导出左侧文本(.json)", lambda: self.export_parsed("left", "json"))
-        add_action("导出右侧文本(.json)", lambda: self.export_parsed("right", "json"))
-        add_action("导出左侧文本(.mdx.txt)", lambda: self.export_parsed("left", "mdx"))
-        add_action("导出右侧文本(.mdx.txt)", lambda: self.export_parsed("right", "mdx"))
+        
+        self.act_exp_l_json = QAction("导出左侧文本(.json)", self)
+        self.act_exp_l_json.triggered.connect(lambda: self.export_parsed("left", "json"))
+        self.menu_export.addAction(self.act_exp_l_json)
+        
+        self.act_exp_r_json = QAction("导出右侧文本(.json)", self)
+        self.act_exp_r_json.triggered.connect(lambda: self.export_parsed("right", "json"))
+        self.menu_export.addAction(self.act_exp_r_json)
+        
+        self.act_exp_l_mdx = QAction("导出左侧文本(.mdx.txt)", self)
+        self.act_exp_l_mdx.triggered.connect(lambda: self.export_parsed("left", "mdx"))
+        self.menu_export.addAction(self.act_exp_l_mdx)
+        
+        self.act_exp_r_mdx = QAction("导出右侧文本(.mdx.txt)", self)
+        self.act_exp_r_mdx.triggered.connect(lambda: self.export_parsed("right", "mdx"))
+        self.menu_export.addAction(self.act_exp_r_mdx)
+        
         self.menu_export.addSeparator()
-        add_action("导出左侧文本(.json)+图片", lambda: self.export_parsed_with_images("left", "json"))
-        add_action("导出右侧文本(.json)+图片", lambda: self.export_parsed_with_images("right", "json"))
-        add_action("导出左侧文本(.mdx.txt)+图片", lambda: self.export_parsed_with_images("left", "mdx"))
-        add_action("导出右侧文本(.mdx.txt)+图片", lambda: self.export_parsed_with_images("right", "mdx"))
+        
+        self.act_exp_l_json_img = QAction("导出左侧文本(.json)+图片", self)
+        self.act_exp_l_json_img.triggered.connect(lambda: self.export_parsed_with_images("left", "json"))
+        self.menu_export.addAction(self.act_exp_l_json_img)
+        
+        self.act_exp_r_json_img = QAction("导出右侧文本(.json)+图片", self)
+        self.act_exp_r_json_img.triggered.connect(lambda: self.export_parsed_with_images("right", "json"))
+        self.menu_export.addAction(self.act_exp_r_json_img)
+        
+        self.act_exp_l_mdx_img = QAction("导出左侧文本(.mdx.txt)+图片", self)
+        self.act_exp_l_mdx_img.triggered.connect(lambda: self.export_parsed_with_images("left", "mdx"))
+        self.menu_export.addAction(self.act_exp_l_mdx_img)
+        
+        self.act_exp_r_mdx_img = QAction("导出右侧文本(.mdx.txt)+图片", self)
+        self.act_exp_r_mdx_img.triggered.connect(lambda: self.export_parsed_with_images("right", "mdx"))
+        self.menu_export.addAction(self.act_exp_r_mdx_img)
         
         self.menu_export.addSeparator()
         self.action_force_recreate = QAction("强制重新生成图片", self, checkable=True)
         self.action_force_recreate.setChecked(False)
         self.menu_export.addAction(self.action_force_recreate)
         
-        self.btn_export_menu.setMenu(self.menu_export)
-        toolbar.addWidget(self.btn_export_menu)
+        self.retranslate_ui()
 
         # --- 主布局 ---
         main_widget = QWidget()
@@ -4631,6 +4811,95 @@ class MainWindow(QMainWindow):
              if isinstance(item, dict): txt.append(item.get('text', ''))
              elif isinstance(item, list): txt.append(item[1][0])
         return "\n".join(txt)
+
+    def export_all_markdown(self, with_images=False):
+        export_dir = self.project_config.get("export_dir")
+        if not export_dir or not os.path.exists(export_dir):
+            export_dir = QFileDialog.getExistingDirectory(self, self.get_text("menu_export"))
+            if not export_dir: return
+            self.project_config["export_dir"] = export_dir
+            self.config_manager.save()
+            
+        ocr_dir = self.project_config.get("ocr_json_path")
+        if not ocr_dir or not os.path.exists(ocr_dir):
+            QMessageBox.warning(self, "Error", "OCR JSON path is invalid.")
+            return
+            
+        start_p = self.project_config.get("start_page", 1)
+        end_p = self.project_config.get("end_page", 1)
+        
+        md_texts = []
+        image_tasks = []
+        
+        for p in range(start_p, end_p + 1):
+            json_file = os.path.join(ocr_dir, f"page_{p}.json")
+            if os.path.exists(json_file):
+                try:
+                    with open(json_file, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    res = data.get("layoutParsingResults", [])
+                    if res:
+                        md_data = res[0].get("markdown", {})
+                        md_text = md_data.get("text", "")
+                        images_dict = md_data.get("images", {})
+                        
+                        if with_images and images_dict:
+                            for img_key, img_url in images_dict.items():
+                                if not img_url.startswith("http"): continue
+                                img_filename = f"page_{p}_{os.path.basename(img_key)}"
+                                local_rel_path = f"imgs/{img_filename}"
+                                md_text = md_text.replace(f"src=\"{img_key}\"", f"src=\"{local_rel_path}\"")
+                                md_text = md_text.replace(f"]({img_key})", f"]({local_rel_path})")
+                                img_save_path = os.path.join(export_dir, "imgs", img_filename)
+                                image_tasks.append((img_url, img_save_path))
+                        
+                        if md_text:
+                            md_texts.append(md_text)
+                except Exception as e:
+                    print(f"Markdown parse error page {p}: {e}")
+
+        if not md_texts:
+            QMessageBox.warning(self, "Warning", "No markdown content found in OCR results.")
+            return
+
+        out_md_path = os.path.join(export_dir, f"{self.project_config.get('name', 'project')}.md")
+        try:
+            with open(out_md_path, "w", encoding='utf-8') as f:
+                f.write("\n\n---\n\n".join(md_texts))
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save Markdown: {e}")
+            return
+            
+        if not with_images or not image_tasks:
+            QMessageBox.information(self, "Success", f"Exported Markdown to {out_md_path}")
+            return
+            
+        from ocr.ocr_worker import MarkdownImageDownloader
+        self.md_img_worker = MarkdownImageDownloader(image_tasks)
+        
+        from PyQt6.QtWidgets import QProgressDialog
+        self.progress_dlg = QProgressDialog("Downloading Images...", "Cancel", 0, len(image_tasks), self)
+        self.progress_dlg.setWindowTitle("Exporting Images")
+        self.progress_dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        self.progress_dlg.setMinimumDuration(0)
+        self.progress_dlg.show()
+        
+        self.md_img_worker.progress_val.connect(self.progress_dlg.setValue)
+        self.md_img_worker.finished.connect(lambda s, c: self.on_md_img_finished(s, c, out_md_path))
+        self.progress_dlg.canceled.connect(self.md_img_worker.stop)
+        
+        self.md_img_worker.start()
+
+    def on_md_img_finished(self, success, count, out_md_path):
+        self.progress_dlg.close()
+        if count > 0:
+            msg = f"Exported Markdown and {count} images to {os.path.dirname(out_md_path)}"
+            if success:
+                QMessageBox.information(self, "Success", msg)
+            else:
+                QMessageBox.warning(self, "Incomplete", msg + "\n(Some images may have failed/cancelled)")
+        self.md_img_worker = None
+
         
     def export_parsed(self, side, fmt):
         """Export parsed JSON/MDX"""
@@ -4827,6 +5096,7 @@ class MainWindow(QMainWindow):
         self.project_config = self.config_manager.get_active_project()
         
         self.update_project_combo()
+        self.setup_shortcuts()
         self.reload_all_data()
 
     def on_editor_focus(self):

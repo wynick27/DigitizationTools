@@ -120,4 +120,3 @@ class MergeTextDialog(QDialog):
                     
         write_pages_to_file(merged_pages, out_path)
         QMessageBox.information(self, "Success", f"合并完成，共 {len(merged_pages)} 页。")
-        self.accept()
