@@ -26,6 +26,8 @@ import bisect
 from tools.pdf_tools import SplitPdfDialog, ExportPdfImageDialog
 from tools.text_tools import MergeTextDialog, read_text_to_pages, write_pages_to_file, PAGE_PATTERN
 from tools.furigana import generate_furigana_string, HAS_KAKASI
+from tools.project_manager_ui import ProjectManagerDialog
+from tools.export_manager import ExportManager
 
 
 
@@ -309,15 +311,15 @@ class ConfigManager:
 # ==========================================
 UI_TEXTS = {
     "zh": {
-        "menu_edit": "编辑 (Edit)",
-        "menu_tools": "工具 (Tools)",
-        "menu_export": "导出 (Export)",
-        "menu_lang": "语言 (Language)",
-        "act_find": "查找和替换 (Find/Replace)",
-        "act_undo_global": "撤销全局替换 (Undo Global Replace)",
-        "act_split": "拆分PDF (Split PDF)",
-        "act_exp_img": "导出PDF图片 (Export PDF Images)",
-        "act_merge": "合并文本文件 (Merge Texts)",
+        "menu_edit": "编辑",
+        "menu_tools": "工具",
+        "menu_export": "导出",
+        "menu_lang": "语言",
+        "act_find": "查找和替换",
+        "act_undo_global": "撤销全局替换",
+        "act_split": "拆分PDF",
+        "act_exp_img": "导出PDF图片",
+        "act_merge": "合并文本文件",
         "act_exp_slice": "导出当前页面切图",
         "act_exp_ocr_curr": "导出当前页面OCR文本",
         "act_exp_ocr_all": "导出所有页面OCR文本",
@@ -1091,321 +1093,7 @@ class FileHeaderWidget(QWidget):
 # 2.6 项目管理对话框
 # ==========================================
 
-class ProjectManagerDialog(QDialog):
-    def __init__(self, parent, config_manager):
-        super().__init__(parent)
-        self.setWindowTitle("Settings & Project Manager")
-        self.resize(800, 600)
-        self.config_manager = config_manager
-        
-        # UI Layout
-        layout = QVBoxLayout(self)
-        self.tabs = QTabWidget()
-        layout.addWidget(self.tabs)
-        
-        # Tab 1: Global Settings
-        self.tab_global = QWidget()
-        self.init_global_tab()
-        self.tabs.addTab(self.tab_global, "Global Settings")
-        
-        # Tab 2: Projects
-        self.tab_projects = QWidget()
-        self.init_projects_tab()
-        self.tabs.addTab(self.tab_projects, "Projects")
-        
-        # Buttons
-        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        btns.rejected.connect(self.accept) # Close acts as confirm/exit
-        layout.addWidget(btns)
-        
-    def init_global_tab(self):
-        layout = QFormLayout(self.tab_global)
-        
-        self.input_api_url = QLineEdit()
-        self.input_api_token = QLineEdit()
-        from PyQt6.QtWidgets import QKeySequenceEdit
-        self.input_furigana = QKeySequenceEdit()
-        self.inputs_alt = []
-        
-        # Load values
-        g = self.config_manager.get_global()
-        self.input_api_url.setText(g.get("ocr_api_url", ""))
-        self.input_api_token.setText(g.get("ocr_api_token", ""))
-        
-        # Connect save
-        self.input_api_url.textChanged.connect(self.save_global)
-        self.input_api_token.textChanged.connect(self.save_global)
-        
-        layout.addRow("OCR API URL:", self.input_api_url)
-        layout.addRow("OCR API Token:", self.input_api_token)
-        
-        # Shortcuts logic
-        from PyQt6.QtGui import QKeySequence
-        self.input_furigana.setKeySequence(QKeySequence(g.get("shortcut_furigana", "Ctrl+Shift+F")))
-        self.input_furigana.keySequenceChanged.connect(self.save_global)
-        layout.addRow("Furigana Shortcut:", self.input_furigana)
-        
-        alt_texts = g.get("shortcuts_alt", [""] * 10)
-        for i in range(10):
-            le = QLineEdit()
-            le.setText(alt_texts[i] if i < len(alt_texts) else "")
-            le.textChanged.connect(self.save_global)
-            self.inputs_alt.append(le)
-            layout.addRow(f"Alt+{i} Text:", le)
-        
-    def save_global(self):
-        g = self.config_manager.get_global()
-        g["ocr_api_url"] = self.input_api_url.text()
-        g["ocr_api_token"] = self.input_api_token.text()
-        
-        if hasattr(self, 'input_furigana'):
-            g["shortcut_furigana"] = self.input_furigana.keySequence().toString()
-        if hasattr(self, 'inputs_alt'):
-            g["shortcuts_alt"] = [le.text() for le in self.inputs_alt]
-            
-        self.config_manager.save()
-
-    def init_projects_tab(self):
-        layout = QHBoxLayout(self.tab_projects)
-        
-        # Left: List
-        left_layout = QVBoxLayout()
-        self.list_projects = QListWidget()
-        self.list_projects.currentRowChanged.connect(self.load_selected_project)
-        left_layout.addWidget(self.list_projects)
-        
-        btn_add = QPushButton("New Project")
-        btn_add.clicked.connect(self.add_project)
-        btn_del = QPushButton("Delete Project")
-        btn_del.clicked.connect(self.delete_project)
-        
-        left_layout.addWidget(btn_add)
-        left_layout.addWidget(btn_del)
-        
-        layout.addLayout(left_layout, 1)
-        
-        # Right: Details Form
-        self.form_widget = QWidget()
-        self.form_layout = QFormLayout(self.form_widget)
-        
-        # 1. Project Name (Editable)
-        self.inp_name = QLineEdit()
-        self.inp_name.editingFinished.connect(self.save_current_project)
-        self.form_layout.addRow("Name:", self.inp_name)
-        
-        # 2. Paths with Browse Buttons
-        self.inp_pdf = self.add_browse_row("PDF Path:", "file", "PDF Files (*.pdf)")
-        self.inp_left_txt = self.add_browse_row("Left Text:", "file", "Text (*.txt)")
-        self.inp_right_txt = self.add_browse_row("Right Text:", "file", "Text (*.txt)")
-        self.inp_img_dir = self.add_browse_row("Image Dir:", "dir")
-        self.inp_ocr_json = self.add_browse_row("OCR JSON Dir:", "dir")
-        self.inp_export_dir = self.add_browse_row("Export Dir:", "dir")
-        
-        # 3. Numeric Fields
-        self.spin_start = QSpinBox(); self.spin_start.setRange(1, 9999)
-        self.spin_end = QSpinBox(); self.spin_end.setRange(1, 9999)
-        self.spin_offset = QSpinBox(); self.spin_offset.setRange(-999, 999)
-        
-        self.spin_start.valueChanged.connect(self.save_current_project)
-        self.spin_end.valueChanged.connect(self.save_current_project)
-        self.spin_offset.valueChanged.connect(self.save_current_project)
-        
-        self.form_layout.addRow("Start Page:", self.spin_start)
-        self.form_layout.addRow("End Page:", self.spin_end)
-        self.form_layout.addRow("Page Offset:", self.spin_offset)
-        
-        # 4. Regex
-        self.inp_reg_l = QLineEdit()
-        self.inp_reg_r = QLineEdit()
-        self.inp_reg_l.editingFinished.connect(self.save_current_project)
-        self.inp_reg_r.editingFinished.connect(self.save_current_project)
-        
-        # Group IDs
-        self.spin_reg_grp_l = QSpinBox(); self.spin_reg_grp_l.setRange(0, 99);
-        self.spin_reg_grp_r = QSpinBox(); self.spin_reg_grp_r.setRange(0, 99);
-        self.spin_reg_grp_l.valueChanged.connect(self.save_current_project)
-        self.spin_reg_grp_r.valueChanged.connect(self.save_current_project)
-
-        h_l = QHBoxLayout(); h_l.addWidget(self.inp_reg_l); h_l.addWidget(QLabel("Grp:")); h_l.addWidget(self.spin_reg_grp_l)
-        h_r = QHBoxLayout(); h_r.addWidget(self.inp_reg_r); h_r.addWidget(QLabel("Grp:")); h_r.addWidget(self.spin_reg_grp_r)
-        
-        self.form_layout.addRow("Regex Left:", h_l)
-        self.form_layout.addRow("Regex Right:", h_r)
-        
-        layout.addWidget(self.form_widget, 2)
-        
-        self.current_project_original_name = None
-        self.refresh_project_list()
-        
-    def add_browse_row(self, label, mode, filter_str=""):
-        widget = QWidget()
-        h = QHBoxLayout(widget)
-        h.setContentsMargins(0,0,0,0)
-        
-        line_edit = QLineEdit()
-        line_edit.editingFinished.connect(self.save_current_project)
-        
-        btn = QPushButton("...")
-        btn.setFixedWidth(30)
-        btn.clicked.connect(lambda: self.browse_path(line_edit, mode, filter_str))
-        
-        h.addWidget(line_edit)
-        h.addWidget(btn)
-        
-        self.form_layout.addRow(label, widget)
-        return line_edit
-        
-    def browse_path(self, line_edit, mode, filter_str):
-        current = line_edit.text()
-        path = ""
-        if mode == "file":
-             path, _ = QFileDialog.getOpenFileName(self, "Select File", current, filter_str)
-        else:
-             path = QFileDialog.getExistingDirectory(self, "Select Directory", current)
-             
-        if path:
-            line_edit.setText(path)
-            self.save_current_project()
-
-    def refresh_project_list(self):
-        self.list_projects.blockSignals(True)
-        self.list_projects.clear()
-        projects = self.config_manager.get_projects()
-        current = self.config_manager.get_active_project()
-        
-        sel_row = 0
-        for i, p in enumerate(projects):
-            self.list_projects.addItem(p["name"])
-            if p["name"] == current["name"]:
-                sel_row = i
-                
-        # If we just renamed, try to keep selection on renamed item
-        if self.current_project_original_name:
-             # Find item with new name? Or just use index?
-             # Let's rely on index for stability if possible, but projects list might reorder?
-             # List order is usually stable.
-             pass
-             
-        self.list_projects.setCurrentRow(sel_row)
-        self.list_projects.blockSignals(False)
-        self.load_selected_project() # Force reload fields
-        
-    def load_selected_project(self):
-        row = self.list_projects.currentRow()
-        if row < 0: 
-            self.form_widget.setEnabled(False)
-            return
-        
-        self.form_widget.setEnabled(True)
-        name = self.list_projects.item(row).text()
-        p = self.config_manager.get_project(name)
-        if not p: return
-        
-        self.current_project_original_name = name
-        
-        self.block_signals_inputs(True)
-        self.inp_name.setText(p.get("name"))
-        self.inp_pdf.setText(p.get("pdf_path", ""))
-        self.inp_img_dir.setText(p.get("image_dir", ""))
-        self.inp_left_txt.setText(p.get("text_path_left", ""))
-        self.inp_right_txt.setText(p.get("text_path_right", ""))
-        self.inp_right_txt.setText(p.get("text_path_right", ""))
-        self.inp_ocr_json.setText(p.get("ocr_json_path", ""))
-        self.inp_export_dir.setText(p.get("export_dir", ""))
-        
-        self.spin_start.setValue(int(p.get("start_page", 1)))
-        self.spin_end.setValue(int(p.get("end_page", 1)))
-        self.spin_offset.setValue(int(p.get("page_offset", 0)))
-        
-        self.inp_reg_l.setText(p.get("regex_left", ""))
-        self.inp_reg_r.setText(p.get("regex_right", ""))
-        self.spin_reg_grp_l.setValue(int(p.get("regex_group_left", 0)))
-        self.spin_reg_grp_r.setValue(int(p.get("regex_group_right", 0)))
-        self.block_signals_inputs(False)
-
-    def save_current_project(self):
-        # We need to know which project we are editing.
-        # Use self.current_project_original_name as key
-        if not self.current_project_original_name: return
-        
-        p = self.config_manager.get_project(self.current_project_original_name)
-        if not p: return
-        
-        # 1. Handle Rename
-        new_name = self.inp_name.text().strip()
-        if new_name and new_name != self.current_project_original_name:
-            if self.config_manager.get_project(new_name):
-                QMessageBox.warning(self, "Error", "Project name already exists!")
-                self.inp_name.setText(self.current_project_original_name) # Revert
-                return
-            else:
-                p["name"] = new_name
-                # If this was active project, update active ref key (handled in manager? No, key string in ConfigManager needs update)
-                # ConfigManager uses list of dicts. "Active Project" is a separate string key.
-                # If we rename, we must update active_project string if it matches.
-                if self.config_manager.data["active_project"] == self.current_project_original_name:
-                    self.config_manager.data["active_project"] = new_name
-                
-                self.current_project_original_name = new_name
-                # Refresh list to show new name (and keep selection)
-                # Trigger refresh at end
-                
-        # 2. Save Fields
-        p["pdf_path"] = self.inp_pdf.text()
-        p["image_dir"] = self.inp_img_dir.text()
-        p["text_path_left"] = self.inp_left_txt.text()
-        p["text_path_right"] = self.inp_right_txt.text()
-        p["text_path_right"] = self.inp_right_txt.text()
-        p["ocr_json_path"] = self.inp_ocr_json.text()
-        p["export_dir"] = self.inp_export_dir.text()
-        
-        p["start_page"] = self.spin_start.value()
-        p["end_page"] = self.spin_end.value()
-        p["page_offset"] = self.spin_offset.value()
-        
-        p["regex_left"] = self.inp_reg_l.text()
-        p["regex_right"] = self.inp_reg_r.text()
-        p["regex_group_left"] = self.spin_reg_grp_l.value()
-        p["regex_group_right"] = self.spin_reg_grp_r.value()
-        
-        self.config_manager.save()
-        
-        # If renamed, refresh list items
-        current_list_item = self.list_projects.currentItem()
-        if current_list_item and current_list_item.text() != self.current_project_original_name:
-             current_list_item.setText(self.current_project_original_name)
-
-    def block_signals_inputs(self, block):
-        inputs = [self.inp_pdf, self.inp_img_dir, self.inp_left_txt, self.inp_right_txt, 
-                  self.inp_ocr_json, self.inp_export_dir, self.inp_reg_l, self.inp_reg_r, self.inp_name,
-                  self.spin_start, self.spin_end, self.spin_offset,
-                  self.spin_reg_grp_l, self.spin_reg_grp_r]
-        for inp in inputs:
-            inp.blockSignals(block)
-
-    def add_project(self):
-        name, ok = QInputDialog.getText(self, "New Project", "Project Name:")
-        if ok and name:
-            if self.config_manager.create_project(name):
-                self.refresh_project_list()
-                # Select new
-                items = self.list_projects.findItems(name, Qt.MatchFlag.MatchExactly)
-                if items:
-                    self.list_projects.setCurrentItem(items[0])
-            else:
-                QMessageBox.warning(self, "Error", "Project name exists or invalid")
-
-    def delete_project(self):
-        row = self.list_projects.currentRow()
-        if row < 0: return
-        name = self.list_projects.item(row).text()
-        
-        ret = QMessageBox.question(self, "Delete", f"Delete project '{name}'?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if ret == QMessageBox.StandardButton.Yes:
-            if self.config_manager.delete_project(name):
-                self.refresh_project_list()
-            else:
-                QMessageBox.warning(self, "Error", "Cannot delete the last project")
+# Removed ProjectManagerDialog -> tools/project_manager_ui.py
 
 
 # ==========================================
@@ -3413,6 +3101,7 @@ class MainWindow(QMainWindow):
         self.config_manager = ConfigManager()
         self.global_config = self.config_manager.get_global()
         self.project_config = self.config_manager.get_active_project()
+        self.exporter = ExportManager(self)
         
         self.last_active_editor = None
         self._is_navigating_from_image = False
@@ -3479,12 +3168,34 @@ class MainWindow(QMainWindow):
             for sc in self.alt_shortcuts:
                 sc.deleteLater()
                 
+        if hasattr(self, 'shortcut_toolbar'):
+            self.shortcut_toolbar.clear()
+                
         self.alt_shortcuts = []
         for i, text in enumerate(alt_texts):
             if text:
                 sc = QShortcut(QKeySequence(f"Alt+{i}"), self)
                 sc.activated.connect(lambda txt=text: self.insert_shortcut_text(txt))
                 self.alt_shortcuts.append(sc)
+                
+                # Add to toolbar
+                if hasattr(self, 'shortcut_toolbar'):
+                    btn_widget = QWidget()
+                    vbox = QVBoxLayout(btn_widget)
+                    vbox.setContentsMargins(5, 0, 5, 0)
+                    vbox.setSpacing(0)
+                    
+                    lbl_key = QLabel(f"Alt+{i}")
+                    lbl_key.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    lbl_key.setStyleSheet("color: gray; font-size: 10px;")
+                    
+                    btn_insert = QPushButton(text)
+                    btn_insert.clicked.connect(lambda checked, txt=text: self.insert_shortcut_text(txt))
+                    
+                    vbox.addWidget(lbl_key)
+                    vbox.addWidget(btn_insert)
+                    self.shortcut_toolbar.addWidget(btn_widget)
+                
                 
     def get_text(self, key):
         lang = self.global_config.get("ui_lang", "zh")
@@ -3554,7 +3265,6 @@ class MainWindow(QMainWindow):
             cursor = editor.textCursor()
             cursor.insertText(text)
             editor.setTextCursor(cursor)
-            self.statusBar().showMessage(f"Shortcut Inserted: {text}", 3000)
             
     def apply_furigana_to_selection(self):
         if not HAS_KAKASI: return
@@ -3574,7 +3284,6 @@ class MainWindow(QMainWindow):
                 
         cursor.insertText(result_text)
         editor.setTextCursor(cursor)
-        self.statusBar().showMessage("Shortcut applied: Furigana added", 3000)
 
     def show_split_pdf_dialog(self):
         d = SplitPdfDialog(self)
@@ -3589,8 +3298,6 @@ class MainWindow(QMainWindow):
         d.exec()
 
     def init_ui(self):
-        self.setup_shortcuts()
-        
         # --- 工具栏 ---
         toolbar = QToolBar()
         self.addToolBar(toolbar)
@@ -3708,62 +3415,62 @@ class MainWindow(QMainWindow):
         self.menu_export = self.menubar.addMenu("Export (导出)")
         
         self.act_exp_slice = QAction("导出当前页面切图", self)
-        self.act_exp_slice.triggered.connect(self.export_slices)
+        self.act_exp_slice.triggered.connect(self.exporter.export_slices)
         self.menu_export.addAction(self.act_exp_slice)
         
         self.act_exp_ocr_curr = QAction("导出当前页面OCR文本", self)
-        self.act_exp_ocr_curr.triggered.connect(self.export_ocr_dict_current)
+        self.act_exp_ocr_curr.triggered.connect(self.exporter.export_ocr_dict_current)
         self.menu_export.addAction(self.act_exp_ocr_curr)
         
         self.menu_export.addSeparator()
         
         self.act_exp_ocr_all = QAction("导出所有页面OCR文本", self)
-        self.act_exp_ocr_all.triggered.connect(self.export_all_ocr_txt)
+        self.act_exp_ocr_all.triggered.connect(self.exporter.export_all_ocr_txt)
         self.menu_export.addAction(self.act_exp_ocr_all)
         
         # New Markdown Exports
         self.act_exp_md_all = QAction("导出所有为Markdown", self)
-        self.act_exp_md_all.triggered.connect(lambda: self.export_all_markdown(with_images=False))
+        self.act_exp_md_all.triggered.connect(lambda: self.exporter.export_all_markdown(with_images=False))
         self.menu_export.addAction(self.act_exp_md_all)
         
         self.act_exp_md_img_all = QAction("导出所有为Markdown+图片", self)
-        self.act_exp_md_img_all.triggered.connect(lambda: self.export_all_markdown(with_images=True))
+        self.act_exp_md_img_all.triggered.connect(lambda: self.exporter.export_all_markdown(with_images=True))
         self.menu_export.addAction(self.act_exp_md_img_all)
         
         self.menu_export.addSeparator()
         
         self.act_exp_l_json = QAction("导出左侧文本(.json)", self)
-        self.act_exp_l_json.triggered.connect(lambda: self.export_parsed("left", "json"))
+        self.act_exp_l_json.triggered.connect(lambda: self.exporter.export_parsed("left", "json"))
         self.menu_export.addAction(self.act_exp_l_json)
         
         self.act_exp_r_json = QAction("导出右侧文本(.json)", self)
-        self.act_exp_r_json.triggered.connect(lambda: self.export_parsed("right", "json"))
+        self.act_exp_r_json.triggered.connect(lambda: self.exporter.export_parsed("right", "json"))
         self.menu_export.addAction(self.act_exp_r_json)
         
         self.act_exp_l_mdx = QAction("导出左侧文本(.mdx.txt)", self)
-        self.act_exp_l_mdx.triggered.connect(lambda: self.export_parsed("left", "mdx"))
+        self.act_exp_l_mdx.triggered.connect(lambda: self.exporter.export_parsed("left", "mdx"))
         self.menu_export.addAction(self.act_exp_l_mdx)
         
         self.act_exp_r_mdx = QAction("导出右侧文本(.mdx.txt)", self)
-        self.act_exp_r_mdx.triggered.connect(lambda: self.export_parsed("right", "mdx"))
+        self.act_exp_r_mdx.triggered.connect(lambda: self.exporter.export_parsed("right", "mdx"))
         self.menu_export.addAction(self.act_exp_r_mdx)
         
         self.menu_export.addSeparator()
         
         self.act_exp_l_json_img = QAction("导出左侧文本(.json)+图片", self)
-        self.act_exp_l_json_img.triggered.connect(lambda: self.export_parsed_with_images("left", "json"))
+        self.act_exp_l_json_img.triggered.connect(lambda: self.exporter.export_parsed_with_images("left", "json"))
         self.menu_export.addAction(self.act_exp_l_json_img)
         
         self.act_exp_r_json_img = QAction("导出右侧文本(.json)+图片", self)
-        self.act_exp_r_json_img.triggered.connect(lambda: self.export_parsed_with_images("right", "json"))
+        self.act_exp_r_json_img.triggered.connect(lambda: self.exporter.export_parsed_with_images("right", "json"))
         self.menu_export.addAction(self.act_exp_r_json_img)
         
         self.act_exp_l_mdx_img = QAction("导出左侧文本(.mdx.txt)+图片", self)
-        self.act_exp_l_mdx_img.triggered.connect(lambda: self.export_parsed_with_images("left", "mdx"))
+        self.act_exp_l_mdx_img.triggered.connect(lambda: self.exporter.export_parsed_with_images("left", "mdx"))
         self.menu_export.addAction(self.act_exp_l_mdx_img)
         
         self.act_exp_r_mdx_img = QAction("导出右侧文本(.mdx.txt)+图片", self)
-        self.act_exp_r_mdx_img.triggered.connect(lambda: self.export_parsed_with_images("right", "mdx"))
+        self.act_exp_r_mdx_img.triggered.connect(lambda: self.exporter.export_parsed_with_images("right", "mdx"))
         self.menu_export.addAction(self.act_exp_r_mdx_img)
         
         self.menu_export.addSeparator()
@@ -3772,6 +3479,14 @@ class MainWindow(QMainWindow):
         self.menu_export.addAction(self.action_force_recreate)
         
         self.retranslate_ui()
+        
+        # Shortcut Toolbar creation
+        self.shortcut_toolbar = QToolBar("Shortcuts")
+        self.addToolBarBreak()
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self.shortcut_toolbar)
+        
+        # Setup shortcuts after toolbar is created to populate the buttons
+        self.setup_shortcuts()
 
         # --- 主布局 ---
         main_widget = QWidget()
@@ -4713,6 +4428,7 @@ class MainWindow(QMainWindow):
             if worker.mode == 'single':
                 # Reload current page
                 self.combo_source.setCurrentText("OCR Results")
+                # Export methods removed and delegated to tools.export_manager.ExportManager
                 self.load_current_page()
             else:
                 QMessageBox.information(self, "Batch Done", msg)
@@ -4724,312 +4440,7 @@ class MainWindow(QMainWindow):
         if self.ocr_thread == worker:
             self.ocr_thread = None
 
-    def export_slices(self):
-        """如果当前是 OCR 模式且有 BBox 数据，则切割"""
-        if self.combo_source.currentText() != "OCR Results" or not self.current_ocr_data:
-            QMessageBox.warning(self, "Warning", "当前不是 OCR 模式或没有 OCR 数据，无法切割。")
-            return
-            
-        out_dir = "output_slices"
-        if not os.path.exists(out_dir): os.makedirs(out_dir)
-        
-        page_num = self.spin_page.text()
-        pix = self.get_page_pixmap(int(page_num))
-        if not pix: return
-        
-        img = pix.toImage()
-        
-        count = 0
-        for i, item in enumerate(self.current_ocr_data):
-            # 获取 bbox
-            x, y, w, h = 0, 0, 0, 0
-            if isinstance(item, dict):
-                b = item['bbox']
-                x, y, w, h = b[0], b[1], b[2]-b[0], b[3]-b[1]
-            elif isinstance(item, list):
-                pts = item[0]
-                xs = [p[0] for p in pts]
-                ys = [p[1] for p in pts]
-                x, y = min(xs), min(ys)
-                w, h = max(xs)-x, max(ys)-y
-            
-            # 切割
-            rect = img.copy(int(x), int(y), int(w), int(h))
-            rect.save(os.path.join(out_dir, f"{page_num}_{i}.jpg"))
-            count += 1
-            
-        QMessageBox.information(self, "Export", f"已导出 {count} 张切片到 {out_dir}")
 
-    def export_ocr_txt(self):
-        """Export OCR text to TXT"""
-        if not self.ocr_text_full:
-             QMessageBox.warning(self, "Export", "No OCR text available.")
-             return
-        
-        filename, _ = QFileDialog.getSaveFileName(self, "Export OCR Text", "ocr_export.txt", "Text Files (*.txt)")
-        if filename:
-            try:
-                with open(filename, 'w', encoding='utf-8') as f:
-                    f.write(self.ocr_text_full)
-                QMessageBox.information(self, "Export", f"Saved to {filename}")
-            except Exception as e:
-                QMessageBox.critical(self, "Error", str(e))
-
-    def export_ocr_dict_current(self):
-        # Alias for old export_ocr_txt but explicit
-        self.export_ocr_txt()
-
-    def export_all_ocr_txt(self):
-        # Dump all available OCR jsons to single text? Or per page?
-        # Usually user wants all text concatenated.
-        save_dir = self.project_config.get("ocr_json_path", "ocr_results")
-        start = self.project_config.get("start_page", 1)
-        end = self.project_config.get("end_page", 100)
-        
-        full_text = ""
-        for p in range(start, end + 1):
-             real_p = p + self.project_config.get("page_offset", 0)
-             # Reuse load_ocr_json logic? But that returns list. 
-             # We need generic method to get text from page.
-             # load_current_page logic duplicates this.
-             # Let's simple load
-             data = self.load_ocr_json(p) # Takes user page num
-             if data:
-                 t = self._extract_text_from_ocr_data(data)
-                 full_text += f"<{p}>\n{t}\n"
-                 
-        filename, _ = QFileDialog.getSaveFileName(self, "Export All OCR", f"{self.project_config.get('project_name','all')}_ocr.txt", "Text Files (*.txt)")
-        if filename:
-            with open(filename, 'w', encoding='utf-8') as f:
-                f.write(full_text)
-            QMessageBox.information(self, "Done", "Exported all OCR text.")
-
-    def _extract_text_from_ocr_data(self, ocr_data):
-        # Helper to join text from list
-        txt = []
-        for item in ocr_data:
-             if isinstance(item, dict): txt.append(item.get('text', ''))
-             elif isinstance(item, list): txt.append(item[1][0])
-        return "\n".join(txt)
-
-    def export_all_markdown(self, with_images=False):
-        export_dir = self.project_config.get("export_dir")
-        if not export_dir or not os.path.exists(export_dir):
-            export_dir = QFileDialog.getExistingDirectory(self, self.get_text("menu_export"))
-            if not export_dir: return
-            self.project_config["export_dir"] = export_dir
-            self.config_manager.save()
-            
-        ocr_dir = self.project_config.get("ocr_json_path")
-        if not ocr_dir or not os.path.exists(ocr_dir):
-            QMessageBox.warning(self, "Error", "OCR JSON path is invalid.")
-            return
-            
-        start_p = self.project_config.get("start_page", 1)
-        end_p = self.project_config.get("end_page", 1)
-        
-        md_texts = []
-        image_tasks = []
-        
-        for p in range(start_p, end_p + 1):
-            json_file = os.path.join(ocr_dir, f"page_{p}.json")
-            if os.path.exists(json_file):
-                try:
-                    with open(json_file, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                    res = data.get("layoutParsingResults", [])
-                    if res:
-                        md_data = res[0].get("markdown", {})
-                        md_text = md_data.get("text", "")
-                        images_dict = md_data.get("images", {})
-                        
-                        if with_images and images_dict:
-                            for img_key, img_url in images_dict.items():
-                                if not img_url.startswith("http"): continue
-                                img_filename = f"page_{p}_{os.path.basename(img_key)}"
-                                local_rel_path = f"imgs/{img_filename}"
-                                md_text = md_text.replace(f"src=\"{img_key}\"", f"src=\"{local_rel_path}\"")
-                                md_text = md_text.replace(f"]({img_key})", f"]({local_rel_path})")
-                                img_save_path = os.path.join(export_dir, "imgs", img_filename)
-                                image_tasks.append((img_url, img_save_path))
-                        
-                        if md_text:
-                            md_texts.append(md_text)
-                except Exception as e:
-                    print(f"Markdown parse error page {p}: {e}")
-
-        if not md_texts:
-            QMessageBox.warning(self, "Warning", "No markdown content found in OCR results.")
-            return
-
-        out_md_path = os.path.join(export_dir, f"{self.project_config.get('name', 'project')}.md")
-        try:
-            with open(out_md_path, "w", encoding='utf-8') as f:
-                f.write("\n\n---\n\n".join(md_texts))
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to save Markdown: {e}")
-            return
-            
-        if not with_images or not image_tasks:
-            QMessageBox.information(self, "Success", f"Exported Markdown to {out_md_path}")
-            return
-            
-        from ocr.ocr_worker import MarkdownImageDownloader
-        self.md_img_worker = MarkdownImageDownloader(image_tasks)
-        
-        from PyQt6.QtWidgets import QProgressDialog
-        self.progress_dlg = QProgressDialog("Downloading Images...", "Cancel", 0, len(image_tasks), self)
-        self.progress_dlg.setWindowTitle("Exporting Images")
-        self.progress_dlg.setWindowModality(Qt.WindowModality.WindowModal)
-        self.progress_dlg.setMinimumDuration(0)
-        self.progress_dlg.show()
-        
-        self.md_img_worker.progress_val.connect(self.progress_dlg.setValue)
-        self.md_img_worker.finished.connect(lambda s, c: self.on_md_img_finished(s, c, out_md_path))
-        self.progress_dlg.canceled.connect(self.md_img_worker.stop)
-        
-        self.md_img_worker.start()
-
-    def on_md_img_finished(self, success, count, out_md_path):
-        self.progress_dlg.close()
-        if count > 0:
-            msg = f"Exported Markdown and {count} images to {os.path.dirname(out_md_path)}"
-            if success:
-                QMessageBox.information(self, "Success", msg)
-            else:
-                QMessageBox.warning(self, "Incomplete", msg + "\n(Some images may have failed/cancelled)")
-        self.md_img_worker = None
-
-        
-    def export_parsed(self, side, fmt):
-        """Export parsed JSON/MDX"""
-        # 1. Get Pages Dict
-        pages = self.pages_left if side == 'left' else self.pages_right_text
-        if not pages:
-            QMessageBox.warning(self, "Error", f"No data for {side} side.")
-            return
-            
-        # 2. Get Regex
-        reg = self.project_config.get("regex_left" if side == 'left' else "regex_right")
-        if not reg:
-            QMessageBox.warning(self, "Error", f"No regex configured for {side} side.")
-            return
-            
-        grp = self.project_config.get("regex_group_left" if side == 'left' else "regex_group_right", 0)
-            
-        # 3. Parse
-        try:
-            parser = ExportParser(pages, reg, grp)
-            entries = parser.parse()
-            
-            if not entries:
-                QMessageBox.warning(self, "Result", "No entries parsing found (check regex).")
-                return
-                
-                
-            # 4. Save
-            project_name = self.project_config.get("name", "project")
-            base_name = f"{project_name}_{side}.{fmt if fmt=='json' else 'txt'}"
-            
-            export_dir = self.project_config.get("export_dir")
-            filename = ""
-            
-            if export_dir and os.path.exists(export_dir):
-                filename = os.path.join(export_dir, base_name)
-                if not self._confirm_overwrite_if_exists(filename): return
-            else:
-                filename, _ = QFileDialog.getSaveFileName(self, f"Export {side.upper()} {fmt.upper()}", base_name, 
-                                                          f"{fmt.upper()} (*.{fmt if fmt=='json' else 'txt'})")
-            
-            if not filename: return
-
-            with open(filename, 'w', encoding='utf-8') as f:
-                if fmt == 'json':
-                    json.dump(entries, f, ensure_ascii=False, indent=2)
-                elif fmt == 'mdx':
-                    for e in entries:
-                        f.write(f"{e['headword']}\n")
-                        f.write(f"{e['text']}\n".replace('\n','<br>\n'))
-                        f.write("</>\n")
-                        
-            QMessageBox.information(self, "Success", f"Exported {len(entries)} entries to {filename}")
-
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            QMessageBox.critical(self, "Error", str(e))
-
-    def export_parsed_with_images(self, side, fmt):
-        """Export parsed content AND generate stitched images"""
-        
-        # 1. Output Dir Check
-        export_dir = self.project_config.get("export_dir")
-        if not export_dir or not os.path.exists(export_dir):
-            export_dir = QFileDialog.getExistingDirectory(self, "Select Export Directory")
-            if not export_dir: return
-            
-            # Update config if new selection
-            self.project_config["export_dir"] = export_dir
-            self.config_manager.save()
-            
-        force_overwrite = self.action_force_recreate.isChecked()
-        
-        # 2. Get Data
-        pages = self.pages_left if side == 'left' else self.pages_right_text
-        if not pages:
-            QMessageBox.warning(self, "Error", f"No data for {side} side.")
-            return
-
-        reg = self.project_config.get("regex_left" if side == 'left' else "regex_right")
-        if not reg:
-            QMessageBox.warning(self, "Error", f"No regex configured for {side} side.")
-            return
-            
-        grp = self.project_config.get("regex_group_left" if side == 'left' else "regex_group_right", 0)
-
-        # 3. Parse entries first (Synchronous, fast enough usually)
-        try:
-            parser = ExportParser(pages, reg, grp)
-            entries = parser.parse()
-            if not entries:
-                QMessageBox.warning(self, "Result", "No entries found.")
-                return
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Parse failed: {e}")
-            return
-
-        # 4. Start Background Worker
-        self.img_export_worker = ImageExportWorker(entries, self.project_config, fmt, export_dir, side, force_overwrite)
-        
-        # Progress Dialog
-        from PyQt6.QtWidgets import QProgressDialog
-        self.progress_dlg = QProgressDialog("Exporting Images...", "Cancel", 0, len(entries), self)
-        self.progress_dlg.setWindowTitle("Exporting")
-        self.progress_dlg.setWindowModality(Qt.WindowModality.WindowModal)
-        self.progress_dlg.setMinimumDuration(0)
-        self.progress_dlg.show()
-        
-        self.img_export_worker.progress.connect(self.progress_dlg.setLabelText)
-        self.img_export_worker.progress_val.connect(self.progress_dlg.setValue)
-        self.img_export_worker.finished.connect(self.on_img_export_finished)
-        self.progress_dlg.canceled.connect(self.img_export_worker.stop) 
-        
-        self.img_export_worker.start()
-
-    def on_img_export_finished(self, success, msg):
-        self.progress_dlg.close()
-        if success:
-            QMessageBox.information(self, "Export Success", msg)
-        else:
-            QMessageBox.critical(self, "Export Failed", msg)
-        self.img_export_worker = None
-
-    def _confirm_overwrite_if_exists(self, filename):
-        if os.path.exists(filename):
-             ret = QMessageBox.question(self, "Overwrite", f"File exists:\n{filename}\nOverwrite?", 
-                                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-             return ret == QMessageBox.StandardButton.Yes
-        return True
             
 
 

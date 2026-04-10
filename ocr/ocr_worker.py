@@ -246,6 +246,7 @@ class ImageExportWorker(QThread):
 
 class MarkdownImageDownloader(QThread):
     progress_val = pyqtSignal(int)
+    progress_text = pyqtSignal(str)
     finished = pyqtSignal(bool, int)
 
     def __init__(self, tasks):
@@ -256,13 +257,17 @@ class MarkdownImageDownloader(QThread):
     def run(self):
         count = 0
         success = True
+        total = len(self.tasks)
         for i, (url, save_path) in enumerate(self.tasks):
             if not self.is_running:
                 success = False
                 break
                 
+            filename = os.path.basename(save_path)
+            
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             if not os.path.exists(save_path):
+                self.progress_text.emit(f"Downloading [{i+1}/{total}]: {filename}")
                 try:
                     r = requests.get(url, timeout=10)
                     if r.status_code == 200:
@@ -272,6 +277,7 @@ class MarkdownImageDownloader(QThread):
                 except Exception as e:
                     print(f"Failed to download image: {url} -> {e}")
             else:
+                self.progress_text.emit(f"Skipping (Exists) [{i+1}/{total}]: {filename}")
                 count += 1
             self.progress_val.emit(i + 1)
             
