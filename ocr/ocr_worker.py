@@ -9,14 +9,24 @@ from PyQt6.QtGui import QImageReader
 
 from ocr.ocr_utils import get_page_image, TextToBBoxMapper, BBoxMerger, ImageStitcher
 
-# Try importing local OCR
-HAS_LOCAL_OCR = False
-try:
-    from paddleocr import PaddleOCRVL
-    HAS_LOCAL_OCR = True
-    print("Local PaddleOCR detected.")
-except ImportError:
-    print("PaddleOCR not found. Local OCR disabled.")
+# ==========================================
+# OCR Engine Registry
+# ==========================================
+import importlib.util
+
+_ENGINES = [
+    {'id': 'remote', 'label': 'Remote API', 'available': True},
+]
+
+# Detect PaddleOCR without importing it (avoids heavy startup cost)
+if importlib.util.find_spec('paddleocr') is not None:
+    _ENGINES.append({'id': 'local', 'label': 'PaddleOCR (Local)', 'available': True})
+
+
+def get_available_engines():
+    """Return list of available OCR engine dicts (id, label)."""
+    return [e for e in _ENGINES if e['available']]
+
 
 
 class OCRWorker(QThread):
@@ -70,15 +80,18 @@ class OCRWorker(QThread):
                 result = None
                 
                 if self.engine == "local":
-                    if not HAS_LOCAL_OCR:
+                    if not any(e['id'] == 'local' for e in _ENGINES):
                         raise Exception("Local OCR module not loaded.")
+                    
+                    # Lazy import only at execution time
+                    from paddleocr import PaddleOCRVL
                     
                     temp_path = os.path.join(save_dir, f"temp_{real_page_num}.thumb")
                     with open(temp_path, "wb") as f:
                         f.write(img_bytes)
                         
                     try:
-                        ocr = PaddleOCRVL() 
+                        ocr = PaddleOCRVL()
                         res = ocr.predict(temp_path)
                         result = res[0] if res else []
                     finally:
@@ -244,44 +257,4 @@ class ImageExportWorker(QThread):
     def stop(self):
         self.is_running = False
 
-class MarkdownImageDownloader(QThread):
-    progress_val = pyqtSignal(int)
-    progress_text = pyqtSignal(str)
-    finished = pyqtSignal(bool, int)
 
-    def __init__(self, tasks):
-        super().__init__()
-        self.tasks = tasks
-        self.is_running = True
-
-    def run(self):
-        count = 0
-        success = True
-        total = len(self.tasks)
-        for i, (url, save_path) in enumerate(self.tasks):
-            if not self.is_running:
-                success = False
-                break
-                
-            filename = os.path.basename(save_path)
-            
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            if not os.path.exists(save_path):
-                self.progress_text.emit(f"Downloading [{i+1}/{total}]: {filename}")
-                try:
-                    r = requests.get(url, timeout=10)
-                    if r.status_code == 200:
-                        with open(save_path, 'wb') as f:
-                            f.write(r.content)
-                        count += 1
-                except Exception as e:
-                    print(f"Failed to download image: {url} -> {e}")
-            else:
-                self.progress_text.emit(f"Skipping (Exists) [{i+1}/{total}]: {filename}")
-                count += 1
-            self.progress_val.emit(i + 1)
-            
-        self.finished.emit(success, count)
-        
-    def stop(self):
-        self.is_running = False
