@@ -1,11 +1,16 @@
-name: Build Executable
+name: Build and Release
 
 on:
   push:
     branches: [ "main", "master" ]
+    tags:
+      - 'v*' # 只有推送 v 开头的 tag 时才会发布 Release (如 v1.0.0)
   pull_request:
     branches: [ "main", "master" ]
   workflow_dispatch: # 允许手动触发
+
+permissions:
+  contents: write # 允许 GITHUB_TOKEN 创建 Release 并在其中包括文件
 
 jobs:
   build:
@@ -34,3 +39,17 @@ jobs:
       with:
         name: OcrProofreadingTool-Windows
         path: dist/OcrProofreadingTool/
+
+    - name: Zip for Release
+      if: startsWith(github.ref, 'refs/tags/')
+      run: |
+        Compress-Archive -Path dist\OcrProofreadingTool -DestinationPath OcrProofreadingTool-Windows.zip
+        
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      if: startsWith(github.ref, 'refs/tags/')
+      with:
+        files: OcrProofreadingTool-Windows.zip
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -123,8 +123,7 @@ class SplitPdfDialog(QDialog):
             
         doc.close()
         QMessageBox.information(self, "Success", f"拆分完成，生成了 {len(chunks)} 个文件。")
-        self.accept()
-
+        # 移除 self.accept() 以保持窗口打开
 
 class ExportPdfImageDialog(QDialog):
     def __init__(self, parent=None):
@@ -159,8 +158,13 @@ class ExportPdfImageDialog(QDialog):
         layout.addRow("输出目录:", h_out)
         
         self.combo_ext = QComboBox()
-        self.combo_ext.addItems([".jpg", ".png"])
+        self.combo_ext.addItems(["Auto (原图格式)", ".jpg", ".png"])
         layout.addRow("图片格式:", self.combo_ext)
+        
+        from PyQt6.QtWidgets import QCheckBox
+        self.chk_invert = QCheckBox("自动反色二值图片 (bpc=1)")
+        self.chk_invert.setChecked(True)
+        layout.addRow("处理选项:", self.chk_invert)
         
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         btns.accepted.connect(self.run_export)
@@ -215,14 +219,60 @@ class ExportPdfImageDialog(QDialog):
         pages = sorted(list(pages_to_extract))
             
         count = 0
+        auto_invert = self.chk_invert.isChecked()
+        
         for p_num in pages:
             if 1 <= p_num <= len(doc):
                 page = doc[p_num-1]
-                pix = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5))
-                out_path = os.path.join(out_dir, f"page_{p_num}{ext}")
-                pix.save(out_path)
-                count += 1
+                if "Auto" in ext:
+                    # 尝试原图提取
+                    images = page.get_images()
+                    if not images:
+                        # 兜底渲染页面
+                        pix = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5))
+                        out_path = os.path.join(out_dir, f"page_{p_num}.png")
+                        pix.save(out_path)
+                        count += 1
+                        continue
+                    
+                    for img_index, img in enumerate(images):
+                        xref = img[0]
+                        base_image = doc.extract_image(xref)
+                        if not base_image: continue
+                        
+                        image_ext = base_image["ext"]
+                        image_bytes = base_image["image"]
+                        bpc = base_image["bpc"]
+                        colorspace = base_image.get("cs-name", "")
+                        
+                        out_name = f"page_{p_num}"
+                        if len(images) > 1:
+                            out_name += f"_{img_index}"
+                        
+                        if bpc == 1 and auto_invert:
+                            # 提取为 pixmap 并反转
+                            pix = fitz.Pixmap(doc, xref)
+                            if pix.n - pix.alpha < 4:
+                                pix.invert_irect()
+                            else:
+                                pix1 = fitz.Pixmap(fitz.csRGB, pix)
+                                pix1.invert_irect()
+                                pix = pix1
+                            out_path = os.path.join(out_dir, f"{out_name}.png")
+                            pix.save(out_path)
+                            pix = None
+                        else:
+                            # 原样保存
+                            out_path = os.path.join(out_dir, f"{out_name}.{image_ext}")
+                            with open(out_path, "wb") as f:
+                                f.write(image_bytes)
+                        count += 1
+                else:
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5))
+                    out_path = os.path.join(out_dir, f"page_{p_num}{ext}")
+                    pix.save(out_path)
+                    count += 1
                 
         doc.close()
-        QMessageBox.information(self, "Success", f"导出完成，共 {count} 张图片。")
-        self.accept()
+        QMessageBox.information(self, "Success", f"导出完成，共处理了 {count} 张图片。")
+        # 移除 self.accept() 以保持窗口打开
