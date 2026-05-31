@@ -1,9 +1,11 @@
 import os
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTabWidget, QWidget,
                              QDialogButtonBox, QFormLayout, QLineEdit, QKeySequenceEdit,
-                             QListWidget, QPushButton, QSpinBox, QLabel, QFileDialog, QInputDialog, QMessageBox)
+                             QListWidget, QPushButton, QSpinBox, QLabel, QFileDialog,
+                             QInputDialog, QMessageBox, QComboBox)
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QKeySequence
+from ocr.ocr_worker import refresh_remote_engine_label
 
 class ProjectManagerDialog(QDialog):
     def __init__(self, parent, config_manager):
@@ -35,23 +37,29 @@ class ProjectManagerDialog(QDialog):
     def init_global_tab(self):
         layout = QFormLayout(self.tab_global)
         
-        self.input_api_url = QLineEdit()
         self.input_api_token = QLineEdit()
+        self.spin_retry = QSpinBox()
+        self.spin_retry.setRange(1, 10)
+        self.spin_concurrent = QSpinBox()
+        self.spin_concurrent.setRange(1, 8)
         
         self.input_furigana = QKeySequenceEdit()
         self.inputs_alt = []
         
         # Load values
         g = self.config_manager.get_global()
-        self.input_api_url.setText(g.get("ocr_api_url", ""))
         self.input_api_token.setText(g.get("ocr_api_token", ""))
+        self.spin_retry.setValue(int(g.get("ocr_retry_count", 3)))
+        self.spin_concurrent.setValue(int(g.get("ocr_concurrent_tasks", 2)))
         
         # Connect save
-        self.input_api_url.textChanged.connect(self.save_global)
         self.input_api_token.textChanged.connect(self.save_global)
+        self.spin_retry.valueChanged.connect(self.save_global)
+        self.spin_concurrent.valueChanged.connect(self.save_global)
         
-        layout.addRow("OCR API URL:", self.input_api_url)
         layout.addRow("OCR API Token:", self.input_api_token)
+        layout.addRow("Retry Count:", self.spin_retry)
+        layout.addRow("Concurrent Tasks:", self.spin_concurrent)
         
         # Shortcuts logic
         self.input_furigana.setKeySequence(QKeySequence(g.get("shortcut_furigana", "Ctrl+Shift+F")))
@@ -68,8 +76,9 @@ class ProjectManagerDialog(QDialog):
         
     def save_global(self):
         g = self.config_manager.get_global()
-        g["ocr_api_url"] = self.input_api_url.text()
         g["ocr_api_token"] = self.input_api_token.text()
+        g["ocr_retry_count"] = self.spin_retry.value()
+        g["ocr_concurrent_tasks"] = self.spin_concurrent.value()
         
         if hasattr(self, 'input_furigana'):
             g["shortcut_furigana"] = self.input_furigana.keySequence().toString()

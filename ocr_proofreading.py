@@ -18,7 +18,7 @@ import bisect
 
 from tools.pdf_tools import SplitPdfDialog, ExportPdfImageDialog
 from tools.text_tools import MergeTextDialog, read_text_to_pages, write_pages_to_file, PAGE_PATTERN
-from tools.furigana import generate_furigana_string, HAS_KAKASI
+from tools.furigana import generate_furigana_string, HAS_FURIGANA, HAS_KAKASI
 from tools.project_manager_ui import ProjectManagerDialog
 from tools.export_manager import ExportManager
 
@@ -50,8 +50,10 @@ def to_py_pos(full_text: str, qt_pos: int) -> int:
 # ==========================================
 
 DEFAULT_GLOBAL_CONFIG = {
-    "ocr_api_url": "",
     "ocr_api_token": "",
+    "ocr_api_model": "PaddleOCR-VL-1.6",
+    "ocr_retry_count": 3,
+    "ocr_concurrent_tasks": 2,
     "ocr_engine": "remote",  # remote or local
     "find_history": [],
     "replace_history": [],
@@ -82,7 +84,7 @@ DEFAULT_PROJECT_CONFIG = {
 # ==========================================
 
 from ocr.ocr_utils import get_page_image, TextToBBoxMapper, BBoxMerger, ImageStitcher
-from ocr.ocr_worker import OCRWorker, ImageExportWorker, get_available_engines
+from ocr.ocr_worker import OCRWorker, ImageExportWorker, get_available_engines, refresh_remote_engine_label, V2_MODELS
 
 
 # ==========================================
@@ -1009,6 +1011,9 @@ class MainWindow(QMainWindow):
         self.project_config = self.config_manager.get_active_project()
         self.exporter = ExportManager(self)
         
+        # Sync engine label with saved model name
+        refresh_remote_engine_label(self.global_config.get("ocr_api_model", "PaddleOCR-VL-1.6"))
+        
         self.last_active_editor = None
         self._is_navigating_from_image = False
         self._is_loading = False
@@ -1173,7 +1178,7 @@ class MainWindow(QMainWindow):
             editor.setTextCursor(cursor)
             
     def apply_furigana_to_selection(self):
-        if not HAS_KAKASI: return
+        if not HAS_FURIGANA: return
         
         editor = self._get_focused_editor()
         if not editor: return
@@ -1300,6 +1305,24 @@ class MainWindow(QMainWindow):
         
         self.combo_ocr_engine.currentIndexChanged.connect(self.on_ocr_engine_changed)
         toolbar.addWidget(self.combo_ocr_engine)
+
+        # Model selector — only relevant for remote engine
+        self.lbl_ocr_model = QLabel(" 模型: ")
+        toolbar.addWidget(self.lbl_ocr_model)
+        self.combo_ocr_model = QComboBox()
+        for m in V2_MODELS:
+            self.combo_ocr_model.addItem(m)
+        saved_model = self.global_config.get("ocr_api_model", V2_MODELS[0])
+        midx = self.combo_ocr_model.findText(saved_model)
+        if midx >= 0:
+            self.combo_ocr_model.setCurrentIndex(midx)
+        self.combo_ocr_model.currentIndexChanged.connect(self.on_ocr_model_changed)
+        toolbar.addWidget(self.combo_ocr_model)
+
+        # Show/hide model selector based on current engine
+        is_remote = (current_engine == 'remote')
+        self.lbl_ocr_model.setVisible(is_remote)
+        self.combo_ocr_model.setVisible(is_remote)
         
         self.btn_ocr_cur = QPushButton("OCR当前页面")
         self.btn_ocr_cur.clicked.connect(self.run_current_ocr_unified)
@@ -2259,10 +2282,9 @@ class MainWindow(QMainWindow):
         engine = self.global_config.get("ocr_engine", "remote")
         
         if engine == "remote":
-            api_url = self.global_config.get("ocr_api_url")
             token = self.global_config.get("ocr_api_token")
-            if not api_url or not token:
-                QMessageBox.warning(self, "Config", "Missing URL/Token for Remote OCR")
+            if not token:
+                QMessageBox.warning(self, "Config", "Missing Token for Remote OCR (set in Settings)")
                 return
         elif engine == "local":
             if not any(e['id'] == 'local' for e in get_available_engines()):
@@ -2303,6 +2325,7 @@ class MainWindow(QMainWindow):
         worker = OCRWorker(mode, pages, self.project_config, self.global_config, engine)
         worker.project_name = self.project_config.get("name") # Tag with project name
         worker.progress.connect(self.on_ocr_progress)
+        worker.page_done.connect(self.on_ocr_page_done)
         worker.finished.connect(self.on_ocr_finished)
         
         self.ocr_thread = worker
@@ -2315,11 +2338,10 @@ class MainWindow(QMainWindow):
         # Display global progress with project context
         proj_name = getattr(worker, 'project_name', 'Unknown')
         self.statusBar().showMessage(f"[{proj_name}] {msg}")
-        
-        # Update progress bar for any batch job
-        if worker.mode == 'batch':
-             val = self.progress_bar.value()
-             self.progress_bar.setValue(val + 1)
+
+    def on_ocr_page_done(self, done: int, total: int):
+        """Slot for accurate page-level progress bar updates."""
+        self.progress_bar.setValue(done)
 
     def on_ocr_finished(self, success, msg):
         worker = self.sender()
@@ -2364,6 +2386,15 @@ class MainWindow(QMainWindow):
     def on_ocr_engine_changed(self):
         engine = self.combo_ocr_engine.currentData()
         self.global_config["ocr_engine"] = engine
+        self.config_manager.save()
+        # Show model selector only for remote engine
+        is_remote = (engine == 'remote')
+        self.lbl_ocr_model.setVisible(is_remote)
+        self.combo_ocr_model.setVisible(is_remote)
+
+    def on_ocr_model_changed(self):
+        model = self.combo_ocr_model.currentText()
+        self.global_config["ocr_api_model"] = model
         self.config_manager.save()
 
     def run_current_ocr_unified(self):
@@ -2422,7 +2453,7 @@ class MainWindow(QMainWindow):
         # After close: Config might have changed
         self.global_config = self.config_manager.get_global()
         self.project_config = self.config_manager.get_active_project()
-        
+
         self.update_project_combo()
         self.setup_shortcuts()
         self.reload_all_data()
