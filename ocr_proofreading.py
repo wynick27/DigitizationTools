@@ -1742,6 +1742,8 @@ class MainWindow(QMainWindow):
 
             # Force run immediately for first load? Or use deferred?
             # Use deferred to keep it async
+            self._show_similarity_after_load = not getattr(self, "_suppress_next_load_similarity_status", False)
+            self._suppress_next_load_similarity_status = False
             self.deferred_run_diff()
             
             # Record last loaded source
@@ -1927,9 +1929,11 @@ class MainWindow(QMainWindow):
 
 
 
-        page = self.current_loaded_page if self.current_loaded_page is not None else self.spin_page.text()
-        ratio = text_similarity(text_l, text_r)
-        self.statusBar().showMessage(f"Page {page} Similarity: {ratio * 100:.2f}%")
+        if getattr(self, "_show_similarity_after_load", False):
+            self._show_similarity_after_load = False
+            page = self.current_loaded_page if self.current_loaded_page is not None else self.spin_page.text()
+            ratio = text_similarity(text_l, text_r)
+            self.statusBar().showMessage(f"Page {page} Similarity: {ratio * 100:.2f}%")
 
     # ================= 交互 =================
 
@@ -2461,6 +2465,7 @@ class MainWindow(QMainWindow):
                 # Reload current page
                 self.combo_source.setCurrentText("OCR Results")
                 # Export methods removed and delegated to tools.export_manager.ExportManager
+                self._suppress_next_load_similarity_status = True
                 self.load_current_page()
             else:
                 QMessageBox.information(self, "Batch Done", msg)
