@@ -21,6 +21,8 @@ from tools.text_tools import MergeTextDialog, read_text_to_pages, write_pages_to
 from tools.furigana import generate_furigana_string, HAS_FURIGANA, HAS_KAKASI
 from tools.project_manager_ui import ProjectManagerDialog
 from tools.export_manager import ExportManager
+from tools.similarity_tools import SimilarityDialog, calculate_page_similarities, text_similarity
+from tools.headword_compare_tools import HeadwordCompareDialog
 
 from find_replace import FindReplaceDialog
 
@@ -1130,6 +1132,8 @@ class MainWindow(QMainWindow):
         self.act_split.setText(self.get_text("act_split"))
         self.act_exp_img.setText(self.get_text("act_exp_img"))
         self.act_merge.setText(self.get_text("act_merge"))
+        self.act_similarity.setText("相似度窗口")
+        self.act_headword_compare.setText("词头对比窗口")
         
         self.act_exp_slice.setText(self.get_text("act_exp_slice"))
         self.act_exp_ocr_curr.setText(self.get_text("act_exp_ocr_curr"))
@@ -1208,6 +1212,41 @@ class MainWindow(QMainWindow):
         d = MergeTextDialog(self)
         d.exec()
 
+    def show_similarity_dialog(self):
+        if not hasattr(self, "similarity_dialog") or self.similarity_dialog is None:
+            self.similarity_dialog = SimilarityDialog(self)
+            self.similarity_dialog.destroyed.connect(lambda: setattr(self, "similarity_dialog", None))
+        self.similarity_dialog.show()
+        self.similarity_dialog.raise_()
+        self.similarity_dialog.activateWindow()
+
+    def show_headword_compare_dialog(self):
+        if not hasattr(self, "headword_compare_dialog") or self.headword_compare_dialog is None:
+            self.headword_compare_dialog = HeadwordCompareDialog(self)
+            self.headword_compare_dialog.destroyed.connect(lambda: setattr(self, "headword_compare_dialog", None))
+        self.headword_compare_dialog.show()
+        self.headword_compare_dialog.raise_()
+        self.headword_compare_dialog.activateWindow()
+
+    def calculate_page_similarities(self):
+        return calculate_page_similarities(self.pages_left, self.pages_right_text)
+
+    def start_background_progress(self, label):
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setValue(0)
+        self.statusBar().showMessage(f"{label}: 准备计算...")
+
+    def update_background_progress(self, done, total, message):
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, max(total, 1))
+        self.progress_bar.setValue(done)
+        self.statusBar().showMessage(message)
+
+    def finish_background_progress(self, message):
+        self.progress_bar.setVisible(False)
+        self.statusBar().showMessage(message, 5000)
+
     def init_ui(self):
         # --- 工具栏 ---
         toolbar = QToolBar()
@@ -1248,6 +1287,14 @@ class MainWindow(QMainWindow):
         self.act_merge.triggered.connect(self.show_merge_text_dialog)
         self.tools_menu.addAction(self.act_merge)
         
+
+        self.tools_menu.addSeparator()
+        self.act_similarity = QAction("相似度窗口", self)
+        self.act_similarity.triggered.connect(self.show_similarity_dialog)
+        self.tools_menu.addAction(self.act_similarity)
+        self.act_headword_compare = QAction("词头对比窗口", self)
+        self.act_headword_compare.triggered.connect(self.show_headword_compare_dialog)
+        self.tools_menu.addAction(self.act_headword_compare)
 
         self.btn_manage = QPushButton("Settings / Manage")
         self.btn_manage.clicked.connect(self.open_project_manager)
@@ -1880,6 +1927,10 @@ class MainWindow(QMainWindow):
 
 
 
+        page = self.current_loaded_page if self.current_loaded_page is not None else self.spin_page.text()
+        ratio = text_similarity(text_l, text_r)
+        self.statusBar().showMessage(f"Page {page} Similarity: {ratio * 100:.2f}%")
+
     # ================= 交互 =================
 
     def toggle_word_wrap(self, checked):
@@ -2237,6 +2288,48 @@ class MainWindow(QMainWindow):
     def jump_page(self):
         # No check needed
         self.load_current_page()
+
+    def goto_page(self, page_num):
+        try:
+            page_num = int(page_num)
+        except (TypeError, ValueError):
+            return
+        if str(page_num) != self.spin_page.text():
+            self.spin_page.setText(str(page_num))
+            self.jump_page()
+            QApplication.processEvents()
+
+    def goto_headword(self, row, preferred_side="left"):
+        if not row:
+            return
+
+        side = preferred_side
+        span = row.get(f"{side}_span")
+        if not span:
+            side = "right" if side == "left" else "left"
+            span = row.get(f"{side}_span")
+        if not span:
+            return
+
+        if side == "right" and self.combo_source.currentText() != "Text File B":
+            self.combo_source.setCurrentText("Text File B")
+            QApplication.processEvents()
+        self.goto_page(row.get("page"))
+
+        editor = self.edit_left if side == "left" else self.edit_right
+        text = editor.toPlainText()
+        start_py, end_py = span
+        start_qt = to_qt_pos(text, start_py)
+        end_qt = to_qt_pos(text, end_py)
+        cursor = editor.textCursor()
+        try:
+            cursor.setPosition(start_qt)
+            cursor.setPosition(end_qt, QTextCursor.MoveMode.KeepAnchor)
+            editor.setTextCursor(cursor)
+            editor.ensureCursorVisible()
+            editor.setFocus()
+        except Exception:
+            pass
 
     def save_left_data(self):
         path = self.project_config.get('text_path_left')
