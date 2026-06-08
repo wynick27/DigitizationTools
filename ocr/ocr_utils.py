@@ -4,7 +4,47 @@ import difflib
 import fitz
 from PyQt6.QtGui import QImage, QPainter, QColor
 
-def get_page_image(doc, img_dir, real_page_num):
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp")
+
+
+def get_page_image_path(img_dir, real_page_num):
+    if not img_dir or not os.path.isdir(img_dir):
+        return None
+
+    bases = []
+    padded_numbers = [str(real_page_num)]
+    for width in (3, 4, 5, 6):
+        padded = f"{real_page_num:0{width}d}"
+        if padded not in padded_numbers:
+            padded_numbers.append(padded)
+    for n in padded_numbers:
+        bases.extend([f"page_{n}", n])
+
+    deduped_bases = []
+    for base in bases:
+        if base not in deduped_bases:
+            deduped_bases.append(base)
+    bases = deduped_bases
+
+    for base in bases:
+        for ext in IMAGE_EXTS:
+            path = os.path.join(img_dir, base + ext)
+            if os.path.exists(path):
+                return path
+
+    try:
+        wanted = {base.lower() for base in bases}
+        for filename in os.listdir(img_dir):
+            stem, ext = os.path.splitext(filename)
+            if ext.lower() in IMAGE_EXTS and stem.lower() in wanted:
+                return os.path.join(img_dir, filename)
+    except OSError:
+        pass
+
+    return None
+
+
+def get_page_image(doc, img_dir, real_page_num, allow_pdf_render=True):
     """
     Helper: Extract image bytes from PDF or local directory.
     Priority:
@@ -26,7 +66,7 @@ def get_page_image(doc, img_dir, real_page_num):
                     xref = images[0][0]
                     base_image = doc.extract_image(xref)
                     img_bytes = base_image["image"]
-                else:
+                elif allow_pdf_render:
                     # Fallback High DPI Render
                     pix = page.get_pixmap(matrix=fitz.Matrix(3.0, 3.0))
                     img_bytes = pix.tobytes("png")
@@ -35,16 +75,7 @@ def get_page_image(doc, img_dir, real_page_num):
             
     # 2. Try Local File
     if not img_bytes and img_dir:
-        candidates = [f"page_{real_page_num}", f"{real_page_num}"]
-        exts = [".jpg", ".jpeg", ".png", ".bmp"]
-        found_path = None
-        for c in candidates:
-            for ext in exts:
-                 p = os.path.join(img_dir, c + ext)
-                 if os.path.exists(p):
-                     found_path = p
-                     break
-            if found_path: break
+        found_path = get_page_image_path(img_dir, real_page_num)
             
         if found_path:
              try:

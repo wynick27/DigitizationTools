@@ -95,7 +95,6 @@ class OCRWorker(QThread):
 
         total = len(self.page_list)
         success_count = 0
-
         # ------ Local engine: simple serial loop ------
         if self.engine == "local":
             for i, page_num in enumerate(self.page_list):
@@ -109,6 +108,8 @@ class OCRWorker(QThread):
                         if self.mode == 'single':
                             raise Exception(f"No image found for page {page_num}")
                         else:
+                            self.progress.emit(f"Page {page_num} skipped: no image")
+                            self.page_done.emit(i + 1, total)
                             continue
 
                     if not any(e['id'] == 'local' for e in _ENGINES):
@@ -143,13 +144,34 @@ class OCRWorker(QThread):
         else:
             # Pre-load all images on the main doc thread (fitz is not thread-safe)
             page_images = {}  # page_num -> img_bytes
+            skipped_no_image = []
             for page_num in self.page_list:
                 real_page_num = page_num + self.project_config.get("page_offset", 0)
                 img_bytes = get_page_image(doc, self.project_config.get('image_dir'), real_page_num)
-                page_images[page_num] = img_bytes
+                if img_bytes:
+                    page_images[page_num] = img_bytes
+                else:
+                    skipped_no_image.append(page_num)
+
+            if skipped_no_image:
+                for page_num in skipped_no_image:
+                    self.progress.emit(f"Page {page_num} skipped: no image")
+                if self.mode == 'single':
+                    self.finished.emit(False, f"No image found for page {skipped_no_image[0]}")
+                    if doc:
+                        doc.close()
+                    return
+
+            if not page_images:
+                if doc:
+                    doc.close()
+                self.finished.emit(False, "No page images found. OCR not submitted.")
+                return
 
             counter_lock = threading.Lock()
-            done_count = 0
+            done_count = len(skipped_no_image)
+            if skipped_no_image:
+                self.page_done.emit(done_count, total)
 
             def process_page(page_num):
                 """Worker function executed in thread pool."""
@@ -188,11 +210,12 @@ class OCRWorker(QThread):
                 return False, page_num, str(last_exc)
 
             # Run concurrent tasks
-            effective_workers = min(concurrent, total) if total > 0 else 1
+            submit_pages = list(page_images.keys())
+            effective_workers = min(concurrent, len(submit_pages)) if submit_pages else 1
             self._executor = ThreadPoolExecutor(max_workers=effective_workers)
             futures = {
                 self._executor.submit(process_page, pn): pn
-                for pn in self.page_list
+                for pn in submit_pages
             }
 
             try:

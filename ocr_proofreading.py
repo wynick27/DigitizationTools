@@ -85,7 +85,7 @@ DEFAULT_PROJECT_CONFIG = {
 # 0.1b OCR Utility Imports & Detection
 # ==========================================
 
-from ocr.ocr_utils import get_page_image, TextToBBoxMapper, BBoxMerger, ImageStitcher
+from ocr.ocr_utils import get_page_image, get_page_image_path, TextToBBoxMapper, BBoxMerger, ImageStitcher
 from ocr.ocr_worker import OCRWorker, ImageExportWorker, get_available_engines, refresh_remote_engine_label, V2_MODELS
 
 
@@ -1650,17 +1650,15 @@ class MainWindow(QMainWindow):
             ocr_data = self.load_ocr_json(page_num)
             self.current_ocr_data = ocr_data # Store for highlighting
             
-            # 2. Load Image (High Res)
-            if self.doc or self.project_config.get('image_dir'):
-                # Check OCR status
-                ocr_state = " (OCR Done)" if ocr_data else " (No OCR)"
-                self.statusBar().showMessage(f"Page {page_num} Loaded{ocr_state}")
-                
-                pix = self.get_page_pixmap(page_num)
-                if pix:
-                    self.image_view.load_content(pix, ocr_data)
-                else:
-                    self.image_view.load_content(None)
+            # 2. Load Image (High Res). Always refresh the canvas; no image means blank preview.
+            ocr_state = " (OCR Done)" if ocr_data else " (No OCR)"
+            self.statusBar().showMessage(f"Page {page_num} Loaded{ocr_state}")
+
+            pix = self.get_page_pixmap(page_num)
+            if pix:
+                self.image_view.load_content(pix, ocr_data)
+            else:
+                self.image_view.load_content(None)
             
             # 3. 构建 OCR 映射 (如果存在)
             self.ocr_text_full = ""
@@ -1806,14 +1804,9 @@ class MainWindow(QMainWindow):
         img_dir = self.project_config['image_dir']
         if img_dir and os.path.exists(img_dir):
             real_page_num = page_num + self.project_config.get('page_offset', 0)
-            # 尝试 page_1.jpg 或 1.jpg
-            names = [f"page_{real_page_num}", f"{real_page_num}"]
-            exts = [".jpg", ".png", ".jpeg"]
-            for n in names:
-                for e in exts:
-                    p = os.path.join(img_dir, n + e)
-                    if os.path.exists(p):
-                        return QPixmap(p)
+            image_path = get_page_image_path(img_dir, real_page_num)
+            if image_path:
+                return QPixmap(image_path)
         return None
 
     def load_ocr_json(self, page_num):
@@ -2403,14 +2396,30 @@ class MainWindow(QMainWindow):
         if not missing_pages:
             QMessageBox.information(self, "Info", "No missing OCR pages found.")
             return
+
+        ocr_pages = []
+        skipped_pages = []
+        for p in missing_pages:
+            real_page_num = p + self.project_config.get("page_offset", 0)
+            if get_page_image(self.doc, self.project_config.get('image_dir'), real_page_num):
+                ocr_pages.append(p)
+            else:
+                skipped_pages.append(p)
+
+        if skipped_pages:
+            self.statusBar().showMessage(f"Skipped {len(skipped_pages)} pages without images.")
+
+        if not ocr_pages:
+            QMessageBox.information(self, "Info", "No page images found. OCR task was not started.")
+            return
             
         # Direct Start with Cancel Option
         self.btn_batch.setText("Cancel OCR")
         self.progress_bar.setVisible(True)
-        self.progress_bar.setRange(0, len(missing_pages))
+        self.progress_bar.setRange(0, len(ocr_pages))
         self.progress_bar.setValue(0)
         
-        self.start_ocr_thread('batch', missing_pages)
+        self.start_ocr_thread('batch', ocr_pages)
 
     def start_ocr_thread(self, mode, pages):
         # OCRWorker(mode, pages, project_config, global_config, engine, pdf_path)
@@ -2500,6 +2509,29 @@ class MainWindow(QMainWindow):
         try:
             page_num = int(self.spin_page.text())
         except: return
+
+        real_page_num = page_num + self.project_config.get("page_offset", 0)
+        doc = self.doc
+        should_close_doc = False
+        if not doc:
+            pdf_path = self.project_config.get('pdf_path')
+            if pdf_path and os.path.exists(pdf_path):
+                try:
+                    doc = fitz.open(pdf_path)
+                    should_close_doc = True
+                except Exception:
+                    doc = None
+        try:
+            if not get_page_image(
+                doc,
+                self.project_config.get('image_dir'),
+                real_page_num,
+            ):
+                QMessageBox.warning(self, "OCR", f"No image found for page {page_num}.")
+                return
+        finally:
+            if should_close_doc and doc:
+                doc.close()
         
         # Disable button?
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
