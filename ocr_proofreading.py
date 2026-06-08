@@ -56,7 +56,7 @@ DEFAULT_GLOBAL_CONFIG = {
     "ocr_api_model": "PaddleOCR-VL-1.6",
     "ocr_retry_count": 3,
     "ocr_concurrent_tasks": 2,
-    "ocr_engine": "remote",  # remote or local
+    "ocr_engine": "paddleocr",
     "find_history": [],
     "replace_history": [],
     "shortcuts_alt": [""] * 10,
@@ -87,6 +87,7 @@ DEFAULT_PROJECT_CONFIG = {
 
 from ocr.ocr_utils import get_page_image, get_page_image_path, TextToBBoxMapper, BBoxMerger, ImageStitcher
 from ocr.ocr_worker import OCRWorker, ImageExportWorker, get_available_engines, refresh_remote_engine_label, V2_MODELS
+from ocr.ocr_engines import discover_ocr_results, normalize_ocr_result, PADDLE_ENGINE_ID, canonical_engine_id
 
 
 # ==========================================
@@ -141,6 +142,8 @@ class ConfigManager:
                     self.data["projects"] = [DEFAULT_PROJECT_CONFIG.copy()]
                 if "active_project" not in self.data:
                     self.data["active_project"] = self.data["projects"][0]["name"]
+                if self.data.get("global", {}).get("ocr_engine") == "remote":
+                    self.data["global"]["ocr_engine"] = "paddleocr"
                     
         except Exception as e:
             print(f"Config load error: {e}")
@@ -672,6 +675,25 @@ class ImageCanvas(QGraphicsView):
                 self.draw_bboxes(ocr_data)
         # self.scale_factor = 1.0 # Removed to persist zoom
         # self.resetTransform()   # Removed to persist zoom
+
+    def normalize_bbox_for_scene(self, bbox, coordinate_type=None):
+        if not bbox or len(bbox) != 4:
+            return None
+        x1, y1, x2, y2 = bbox
+        sw = self.sceneRect().width()
+        sh = self.sceneRect().height()
+        if sw <= 0 or sh <= 0:
+            return [x1, y1, x2, y2]
+        if coordinate_type == "mineru_page_1000":
+            return [
+                x1 * sw / 1000.0,
+                y1 * sh / 1000.0,
+                x2 * sw / 1000.0,
+                y2 * sh / 1000.0,
+            ]
+        if max(abs(x1), abs(y1), abs(x2), abs(y2)) <= 1.5:
+            return [x1 * sw, y1 * sh, x2 * sw, y2 * sh]
+        return [x1, y1, x2, y2]
         
     def draw_bboxes(self, ocr_data):
         pen = QPen(QColor(255, 0, 0, 200))
@@ -685,8 +707,11 @@ class ImageCanvas(QGraphicsView):
             
             if isinstance(item, dict) and 'bbox' in item:
                 bbox = item['bbox'] # [x1, y1, x2, y2]
-                x, y = bbox[0], bbox[1]
-                w, h = bbox[2]-x, bbox[3]-y
+                scene_bbox = self.normalize_bbox_for_scene(bbox, item.get('bbox_coordinate_type'))
+                if not scene_bbox:
+                    continue
+                x, y, x2, y2 = scene_bbox
+                w, h = x2 - x, y2 - y
                 text = item.get('text', '')
             elif isinstance(item, list) and len(item) == 2:
                 # Paddle raw: [[[x1,y1],...], ("text", conf)]
@@ -1342,14 +1367,6 @@ class MainWindow(QMainWindow):
         self.lbl_engine = QLabel(" OCR Engine: ")
         toolbar.addWidget(self.lbl_engine)
         self.combo_ocr_engine = QComboBox()
-        for engine in get_available_engines():
-            self.combo_ocr_engine.addItem(engine['label'], engine['id'])
-            
-        # Select current
-        current_engine = self.global_config.get("ocr_engine", "remote")
-        idx = self.combo_ocr_engine.findData(current_engine)
-        if idx >= 0: self.combo_ocr_engine.setCurrentIndex(idx)
-        
         self.combo_ocr_engine.currentIndexChanged.connect(self.on_ocr_engine_changed)
         toolbar.addWidget(self.combo_ocr_engine)
 
@@ -1357,19 +1374,8 @@ class MainWindow(QMainWindow):
         self.lbl_ocr_model = QLabel(" 模型: ")
         toolbar.addWidget(self.lbl_ocr_model)
         self.combo_ocr_model = QComboBox()
-        for m in V2_MODELS:
-            self.combo_ocr_model.addItem(m)
-        saved_model = self.global_config.get("ocr_api_model", V2_MODELS[0])
-        midx = self.combo_ocr_model.findText(saved_model)
-        if midx >= 0:
-            self.combo_ocr_model.setCurrentIndex(midx)
         self.combo_ocr_model.currentIndexChanged.connect(self.on_ocr_model_changed)
         toolbar.addWidget(self.combo_ocr_model)
-
-        # Show/hide model selector based on current engine
-        is_remote = (current_engine == 'remote')
-        self.lbl_ocr_model.setVisible(is_remote)
-        self.combo_ocr_model.setVisible(is_remote)
         
         self.btn_ocr_cur = QPushButton("OCR当前页面")
         self.btn_ocr_cur.clicked.connect(self.run_current_ocr_unified)
@@ -1378,6 +1384,7 @@ class MainWindow(QMainWindow):
         self.btn_batch = QPushButton("OCR所有缺失页面")
         self.btn_batch.clicked.connect(self.run_batch_ocr)
         toolbar.addWidget(self.btn_batch)
+        self.refresh_ocr_engine_combo()
 
         # Export Menu (Moved to Menu Bar)
         self.menu_export = self.menubar.addMenu("Export (导出)")
@@ -1629,6 +1636,44 @@ class MainWindow(QMainWindow):
 
  
 
+    def refresh_ocr_source_options(self, page_num):
+        current_text = self.combo_source.currentText() if hasattr(self, "combo_source") else "Text File B"
+        current_path = None
+        current_data = self.combo_source.currentData() if hasattr(self, "combo_source") else None
+        if isinstance(current_data, dict):
+            current_path = current_data.get("path")
+
+        real_page_num = page_num + self.project_config.get('page_offset', 0)
+        results = discover_ocr_results(self.project_config.get('ocr_json_path'), real_page_num)
+
+        self.combo_source.blockSignals(True)
+        self.combo_source.clear()
+        self.combo_source.addItem("Text File B", None)
+        for idx, info in enumerate(results):
+            label = "OCR Results" if idx == 0 and info.get("legacy") else info.get("label", "OCR")
+            if label in [self.combo_source.itemText(i) for i in range(self.combo_source.count())]:
+                label = f"{label} ({os.path.basename(info.get('path', ''))})"
+            self.combo_source.addItem(label, info)
+
+        target_idx = 0
+        if current_path:
+            for i in range(self.combo_source.count()):
+                data = self.combo_source.itemData(i)
+                if isinstance(data, dict) and data.get("path") == current_path:
+                    target_idx = i
+                    break
+        elif current_text != "Text File B":
+            for i in range(self.combo_source.count()):
+                if self.combo_source.itemText(i) == current_text:
+                    target_idx = i
+                    break
+            else:
+                if self.combo_source.count() > 1:
+                    target_idx = 1
+
+        self.combo_source.setCurrentIndex(target_idx)
+        self.combo_source.blockSignals(False)
+
     def load_current_page(self):
         # Session-based dirty tracking: No prompts here.
         # Save previous page first
@@ -1645,9 +1690,13 @@ class MainWindow(QMainWindow):
             self.current_loaded_page = page_num
             
             self.spin_page.setText(str(page_num))
+
+            self.refresh_ocr_source_options(page_num)
         
             # 1. Load OCR Data
-            ocr_data = self.load_ocr_json(page_num)
+            current_source_data = self.combo_source.currentData()
+            ocr_result_info = current_source_data if isinstance(current_source_data, dict) else None
+            ocr_data = self.load_ocr_json(page_num, ocr_result_info)
             self.current_ocr_data = ocr_data # Store for highlighting
             
             # 2. Load Image (High Res). Always refresh the canvas; no image means blank preview.
@@ -1668,9 +1717,13 @@ class MainWindow(QMainWindow):
                 current_idx = 0
                 for item in ocr_data:
                     text, bbox = "", []
+                    sub_items = []
+                    bbox_coordinate_type = None
                     if isinstance(item, dict):
                         text = item.get('text', '')
                         bbox = item.get('bbox', [])
+                        sub_items = item.get('sub_items', [])
+                        bbox_coordinate_type = item.get('bbox_coordinate_type')
                     elif isinstance(item, list) and len(item) == 2:
                         text = item[1][0]
                         # Parse Paddle points to rect
@@ -1695,11 +1748,13 @@ class MainWindow(QMainWindow):
                     self.ocr_char_map.append({
                         'start_index': current_idx,
                         'end_index': current_idx + len(text), # exclude newline for click mapping
-                        'bbox': bbox
+                        'bbox': bbox,
+                        'sub_items': sub_items,
+                        'bbox_coordinate_type': bbox_coordinate_type,
                     })
                     current_idx += length
             
-            is_ocr_mode = (self.combo_source.currentText() == "OCR Results")
+            is_ocr_mode = (self.combo_source.currentText() != "Text File B")
             
             # Draw bboxes (Use red for all detected, or maybe lighter if not in OCR mode)
             #self.image_view.load_content(pix, ocr_data if ocr_data else [])
@@ -1809,14 +1864,25 @@ class MainWindow(QMainWindow):
                 return QPixmap(image_path)
         return None
 
-    def load_ocr_json(self, page_num):
+    def load_ocr_json(self, page_num, result_info=None):
         """加载 PaddleOCR 格式 JSON"""
-        path = self.project_config['ocr_json_path']
-        real_page_num = page_num + self.project_config.get('page_offset', 0)
-        f_path = os.path.join(path, f"page_{real_page_num}.json")
-        if not os.path.exists(f_path):
-            # 尝试直接数字
-            f_path = os.path.join(path, f"{real_page_num}.json")
+        if result_info and result_info.get("path"):
+            f_path = result_info["path"]
+            engine_id = result_info.get("engine_id", PADDLE_ENGINE_ID)
+        else:
+            path = self.project_config['ocr_json_path']
+            real_page_num = page_num + self.project_config.get('page_offset', 0)
+            discovered = discover_ocr_results(path, real_page_num)
+            if discovered:
+                result_info = discovered[0]
+                f_path = result_info["path"]
+                engine_id = result_info.get("engine_id", PADDLE_ENGINE_ID)
+            else:
+                f_path = os.path.join(path, f"page_{real_page_num}.json")
+                engine_id = PADDLE_ENGINE_ID
+                if not os.path.exists(f_path):
+                    # 尝试直接数字
+                    f_path = os.path.join(path, f"{real_page_num}.json")
         
         if os.path.exists(f_path):
             try:
@@ -1826,24 +1892,7 @@ class MainWindow(QMainWindow):
                     # 如果是标准 Paddle list: [[points, (text, conf)], ...]
                     # 如果是 layout parser: data['fullContent']... (需要解析)
                     
-                    if isinstance(data, list):
-                        return data
-                    elif isinstance(data, dict) and ("fullContent" in data or "layoutParsingResults" in data):
-                        # 简化解析 PaddleOCR VL
-                        res = []
-                        if "fullContent" in data:
-                            data = data["fullContent"]
-                        if "layoutParsingResults" in data:
-                            data = data["layoutParsingResults"][0]
-                        blocks = data.get("prunedResult", {}).get("parsing_res_list", [])
-                        for b in blocks:
-                            if b.get('block_label') in ['text','paragraph_title','vertical_text']:
-                                res.append({
-                                    'block_label': b.get('block_label'),
-                                    'text': b.get('block_content'),
-                                    'bbox': b.get('block_bbox')
-                                })
-                        return res
+                    return normalize_ocr_result(data, engine_id, self.global_config)
             except Exception as e:
                 print(f"JSON Load error: {e}")
         return []
@@ -1880,7 +1929,7 @@ class MainWindow(QMainWindow):
         text_l = self.edit_left.toPlainText()
         text_r = self.edit_right.toPlainText()
         
-        need_ocr_map = (self.combo_source.currentText() != "OCR Results" and bool(self.ocr_text_full))
+        need_ocr_map = (self.combo_source.currentText() == "Text File B" and bool(self.ocr_text_full))
         
         self.diff_worker = DiffWorker(text_l, text_r, self.ocr_text_full, need_ocr_map)
         self.diff_worker.result_ready.connect(self.on_diff_finished)
@@ -1917,7 +1966,7 @@ class MainWindow(QMainWindow):
             self.ocr_diff_opcodes = ocr_opcodes
         else:
             # If not calculated, maybe we use main diff if right is OCR
-            if self.combo_source.currentText() == "OCR Results":
+            if self.combo_source.currentText() != "Text File B":
                  self.ocr_diff_opcodes = opcodes
 
 
@@ -2179,7 +2228,7 @@ class MainWindow(QMainWindow):
         if not self.current_ocr_data: return
         
         # 如果是 Right Editor 且处于 OCR 模式，直接用行号 (旧逻辑保留，简单快速)
-        is_ocr_mode = (self.combo_source.currentText() == "OCR Results")
+        is_ocr_mode = (self.combo_source.currentText() != "Text File B")
         if editor == self.edit_right and is_ocr_mode:
             self._handle_right_editor_ocr_scroll(editor, idx)
             return
@@ -2209,20 +2258,34 @@ class MainWindow(QMainWindow):
                      break
         
         # 2. Find BBox for target_ocr_idx
-        if target_ocr_idx >= 0 and hasattr(self, 'ocr_char_map'):
-            for mapping in self.ocr_char_map:
-                # {start_index, end_index, bbox}
-                # Use loose check: if index falls in line range
-                if mapping['start_index'] <= target_ocr_idx <= mapping['end_index'] + 1: # +1 includes newline
-                    bbox = mapping['bbox']
-                    # standardize bbox to x,y,w,h
-                    x, y, w, h = 0,0,0,0
-                    if len(bbox) == 4:
-                         x, y = bbox[0], bbox[1]
-                         w, h = bbox[2]-bbox[0], bbox[3]-bbox[1]
-                         
-                    self.image_view.set_highlight_bbox(x, y, w, h)
-                    return
+        if target_ocr_idx >= 0:
+            bbox = self.find_ocr_bbox_for_index(target_ocr_idx)
+            if bbox:
+                x1, y1, x2, y2 = bbox
+                self.image_view.set_highlight_bbox(x1, y1, x2 - x1, y2 - y1)
+                return
+
+    def normalize_display_bbox(self, bbox, coordinate_type=None):
+        return self.image_view.normalize_bbox_for_scene(bbox, coordinate_type)
+
+    def find_ocr_bbox_for_index(self, ocr_idx):
+        if not hasattr(self, 'ocr_char_map'):
+            return None
+        for mapping in self.ocr_char_map:
+            start = mapping.get('start_index', 0)
+            end = mapping.get('end_index', 0)
+            if start <= ocr_idx <= end + 1:
+                local_idx = max(0, min(ocr_idx - start, max(0, end - start)))
+                for sub in mapping.get('sub_items') or []:
+                    if sub.get('start', 0) <= local_idx <= sub.get('end', 0):
+                        bbox = self.normalize_display_bbox(
+                            sub.get('bbox'),
+                            sub.get('bbox_coordinate_type') or mapping.get('bbox_coordinate_type'),
+                        )
+                        if bbox:
+                            return bbox
+                return self.normalize_display_bbox(mapping.get('bbox'), mapping.get('bbox_coordinate_type'))
+        return None
 
     def _handle_right_editor_ocr_scroll(self, editor, idx):
         # New Logic: Char based mapping using to_py_pos and ocr_char_map
@@ -2231,15 +2294,11 @@ class MainWindow(QMainWindow):
         
         if not hasattr(self, 'ocr_char_map'): return
         
-        for mapping in self.ocr_char_map:
-            if mapping['start_index'] <= py_idx <= mapping['end_index'] + 1:
-                bbox = mapping['bbox']
-                x, y, w, h = 0, 0, 0, 0
-                if len(bbox) == 4:
-                     x, y = bbox[0], bbox[1]
-                     w, h = bbox[2]-bbox[0], bbox[3]-bbox[1]
-                self.image_view.set_highlight_bbox(x, y, w, h)
-                return
+        bbox = self.find_ocr_bbox_for_index(py_idx)
+        if bbox:
+            x1, y1, x2, y2 = bbox
+            self.image_view.set_highlight_bbox(x1, y1, x2 - x1, y2 - y1)
+            return
 
     def on_cursor_left(self):
         if self._is_syncing_cursor: return
@@ -2369,12 +2428,30 @@ class MainWindow(QMainWindow):
             return
 
         # Check prereqs based on engine
-        engine = self.global_config.get("ocr_engine", "remote")
+        engine = canonical_engine_id(self.global_config.get("ocr_engine", "remote"))
+        if self.combo_ocr_engine.currentData() is None:
+            QMessageBox.warning(self, "Config", "No configured OCR engine is available.")
+            return
         
-        if engine == "remote":
+        if engine == PADDLE_ENGINE_ID:
             token = self.global_config.get("ocr_api_token")
             if not token:
                 QMessageBox.warning(self, "Config", "Missing Token for Remote OCR (set in Settings)")
+                return
+        elif engine == "textin":
+            cfg = self.global_config.get("ocr_engines", {}).get("textin", {})
+            if not cfg.get("app_id") or not cfg.get("secret_code"):
+                QMessageBox.warning(self, "Config", "Missing Textin App ID or Secret Code")
+                return
+        elif engine == "quark":
+            cfg = self.global_config.get("ocr_engines", {}).get("quark", {})
+            if not cfg.get("client_id") or not cfg.get("client_secret"):
+                QMessageBox.warning(self, "Config", "Missing Quark Client ID or Client Secret")
+                return
+        elif engine == "mineru":
+            cfg = self.global_config.get("ocr_engines", {}).get("mineru", {})
+            if not cfg.get("token"):
+                QMessageBox.warning(self, "Config", "Missing MinerU Token")
                 return
         elif engine == "local":
             if not any(e['id'] == 'local' for e in get_available_engines()):
@@ -2387,10 +2464,13 @@ class MainWindow(QMainWindow):
         
         missing_pages = []
         save_dir = self.project_config.get("ocr_json_path", "ocr_results")
+        from ocr.ocr_engines import get_result_path, get_legacy_result_paths
         
         for p in range(start, end + 1):
             real_page_num = p + self.project_config.get("page_offset", 0)
-            if not os.path.exists(os.path.join(save_dir, f"page_{real_page_num}.json")):
+            engine_result_path = get_result_path(save_dir, real_page_num, engine, self.global_config)
+            legacy_paths = get_legacy_result_paths(save_dir, real_page_num) if engine == PADDLE_ENGINE_ID else []
+            if not os.path.exists(engine_result_path) and not any(os.path.exists(path) for path in legacy_paths):
                 missing_pages.append(p)
                 
         if not missing_pages:
@@ -2423,7 +2503,7 @@ class MainWindow(QMainWindow):
 
     def start_ocr_thread(self, mode, pages):
         # OCRWorker(mode, pages, project_config, global_config, engine, pdf_path)
-        engine = self.global_config.get("ocr_engine", "remote")
+        engine = canonical_engine_id(self.global_config.get("ocr_engine", "remote"))
         
         # Ensure pdf path is passed properly or handled in thread
         pdf_path = self.project_config.get('pdf_path')
@@ -2472,9 +2552,15 @@ class MainWindow(QMainWindow):
         if success:
             if worker.mode == 'single':
                 # Reload current page
-                self.combo_source.setCurrentText("OCR Results")
                 # Export methods removed and delegated to tools.export_manager.ExportManager
                 self._suppress_next_load_similarity_status = True
+                try:
+                    current_page = int(self.spin_page.text())
+                    self.refresh_ocr_source_options(current_page)
+                    if self.combo_source.count() > 1:
+                        self.combo_source.setCurrentIndex(1)
+                except Exception:
+                    pass
                 self.load_current_page()
             else:
                 QMessageBox.information(self, "Batch Done", msg)
@@ -2491,24 +2577,101 @@ class MainWindow(QMainWindow):
 
 
     def on_ocr_engine_changed(self):
-        engine = self.combo_ocr_engine.currentData()
+        raw_engine = self.combo_ocr_engine.currentData()
+        if not raw_engine:
+            self.refresh_ocr_model_combo(None)
+            return
+        engine = canonical_engine_id(raw_engine)
         self.global_config["ocr_engine"] = engine
         self.config_manager.save()
-        # Show model selector only for remote engine
-        is_remote = (engine == 'remote')
-        self.lbl_ocr_model.setVisible(is_remote)
-        self.combo_ocr_model.setVisible(is_remote)
+        self.refresh_ocr_model_combo(engine)
 
     def on_ocr_model_changed(self):
-        model = self.combo_ocr_model.currentText()
-        self.global_config["ocr_api_model"] = model
+        model = self.combo_ocr_model.currentData() or self.combo_ocr_model.currentText()
+        raw_engine = self.combo_ocr_engine.currentData()
+        if not raw_engine:
+            return
+        engine = canonical_engine_id(raw_engine)
+        if engine == PADDLE_ENGINE_ID:
+            self.global_config["ocr_api_model"] = model
+            refresh_remote_engine_label(model)
+            idx = self.combo_ocr_engine.findData(PADDLE_ENGINE_ID)
+            if idx >= 0:
+                self.combo_ocr_engine.setItemText(idx, "PaddleOCR")
+        elif engine == "mineru":
+            self.global_config.setdefault("ocr_engines", {}).setdefault("mineru", {})["model_version"] = model
+        elif engine in ("textin", "quark", "chrome_lens"):
+            self.global_config.setdefault("ocr_engines", {}).setdefault(engine, {})["model"] = model
         self.config_manager.save()
+
+    def refresh_ocr_engine_combo(self):
+        if not hasattr(self, "combo_ocr_engine"):
+            return
+        current_engine = canonical_engine_id(self.global_config.get("ocr_engine", "remote"))
+        self.combo_ocr_engine.blockSignals(True)
+        self.combo_ocr_engine.clear()
+        available_engines = get_available_engines(self.global_config)
+        for engine in available_engines:
+            self.combo_ocr_engine.addItem(engine['label'], engine['id'])
+        if not available_engines:
+            self.combo_ocr_engine.addItem("未配置 OCR 引擎", None)
+        idx = self.combo_ocr_engine.findData(current_engine)
+        if idx < 0:
+            idx = 0
+            if available_engines:
+                self.global_config["ocr_engine"] = self.combo_ocr_engine.itemData(0)
+                self.config_manager.save()
+        self.combo_ocr_engine.setCurrentIndex(idx)
+        self.combo_ocr_engine.blockSignals(False)
+        self.btn_ocr_cur.setEnabled(bool(available_engines))
+        self.btn_batch.setEnabled(bool(available_engines))
+        self.refresh_ocr_model_combo(self.combo_ocr_engine.currentData())
+
+    def refresh_ocr_model_combo(self, engine):
+        engine = canonical_engine_id(engine)
+        self.combo_ocr_model.blockSignals(True)
+        self.combo_ocr_model.clear()
+
+        if engine == PADDLE_ENGINE_ID:
+            saved = self.global_config.get("ocr_api_model", V2_MODELS[0])
+            for model in V2_MODELS:
+                self.combo_ocr_model.addItem(model, model)
+            idx = self.combo_ocr_model.findData(saved)
+        elif engine == "mineru":
+            models = ["vlm", "pipeline"]
+            saved = self.global_config.get("ocr_engines", {}).get("mineru", {}).get("model_version", "vlm")
+            for model in models:
+                self.combo_ocr_model.addItem(model, model)
+            idx = self.combo_ocr_model.findData(saved)
+        elif engine == "textin":
+            saved = self.global_config.get("ocr_engines", {}).get("textin", {}).get("model", "默认")
+            self.combo_ocr_model.addItem("默认", "默认")
+            idx = self.combo_ocr_model.findData(saved)
+        elif engine == "quark":
+            saved = self.global_config.get("ocr_engines", {}).get("quark", {}).get("model", "RecognizeGeneralDocument")
+            self.combo_ocr_model.addItem("RecognizeGeneralDocument", "RecognizeGeneralDocument")
+            idx = self.combo_ocr_model.findData(saved)
+        elif engine == "chrome_lens":
+            saved = self.global_config.get("ocr_engines", {}).get("chrome_lens", {}).get("model", "默认")
+            self.combo_ocr_model.addItem("默认", "默认")
+            idx = self.combo_ocr_model.findData(saved)
+        else:
+            self.combo_ocr_model.addItem("默认", "默认")
+            idx = 0
+
+        if idx is None or idx < 0:
+            idx = 0
+        self.combo_ocr_model.setCurrentIndex(idx)
+        self.combo_ocr_model.blockSignals(False)
 
     def run_current_ocr_unified(self):
         """Unified entry point for Single Page OCR"""
         try:
             page_num = int(self.spin_page.text())
         except: return
+        if self.combo_ocr_engine.currentData() is None:
+            QMessageBox.warning(self, "Config", "No configured OCR engine is available.")
+            return
 
         real_page_num = page_num + self.project_config.get("page_offset", 0)
         doc = self.doc
@@ -2578,6 +2741,7 @@ class MainWindow(QMainWindow):
     def open_project_manager(self):
         if not self.check_unsaved_changes(): return
         dlg = ProjectManagerDialog(self, self.config_manager)
+        dlg.settings_changed.connect(self.on_settings_changed)
         dlg.exec()
         
         # After close: Config might have changed
@@ -2587,6 +2751,10 @@ class MainWindow(QMainWindow):
         self.update_project_combo()
         self.setup_shortcuts()
         self.reload_all_data()
+
+    def on_settings_changed(self):
+        self.global_config = self.config_manager.get_global()
+        self.refresh_ocr_engine_combo()
 
     def on_editor_focus(self):
         self.last_active_editor = self.sender()
@@ -2627,7 +2795,7 @@ class MainWindow(QMainWindow):
         
         target_pos = -1
         
-        if target == self.edit_right and self.combo_source.currentText() == "OCR Results":
+        if target == self.edit_right and self.combo_source.currentText() != "Text File B":
              # OCR Mode: Right IS OCR.
              target_pos = to_qt_pos(self.edit_right.toPlainText(), start_py_idx)
         else:

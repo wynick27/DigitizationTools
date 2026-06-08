@@ -5,6 +5,7 @@ import threading
 import requests
 import re
 import fitz
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QImageReader
@@ -27,13 +28,28 @@ V2_MODELS = [
 # OCR Engine Registry
 # ==========================================
 import importlib.util
+from ocr.ocr_engines import (
+    PADDLE_ENGINE_ID,
+    canonical_engine_id,
+    get_result_path,
+    normalize_ocr_result,
+    run_mineru_agent,
+    run_quark,
+    run_textin,
+)
 
 def _build_remote_label(model: str) -> str:
-    return "远程 API"
+    return "PaddleOCR"
 
 _ENGINES = [
-    {'id': 'remote', 'label': '远程 API', 'available': True},
+    {'id': PADDLE_ENGINE_ID, 'label': 'PaddleOCR', 'available': True},
+    {'id': 'textin', 'label': 'Textin', 'available': True},
+    {'id': 'mineru', 'label': 'MinerU', 'available': True},
+    {'id': 'quark', 'label': 'Quark', 'available': True},
 ]
+
+if importlib.util.find_spec('chrome_lens_py') is not None:
+    _ENGINES.append({'id': 'chrome_lens', 'label': 'Chrome Lens', 'available': True})
 
 # Detect PaddleOCR without importing it (avoids heavy startup cost)
 if importlib.util.find_spec('paddleocr') is not None:
@@ -43,14 +59,34 @@ if importlib.util.find_spec('paddleocr') is not None:
 def refresh_remote_engine_label(model: str):
     """Update the remote engine label when the model config changes."""
     for e in _ENGINES:
-        if e['id'] == 'remote':
+        if e['id'] == PADDLE_ENGINE_ID:
             e['label'] = _build_remote_label(model)
             break
 
 
-def get_available_engines():
+def get_available_engines(global_config=None):
     """Return list of available OCR engine dicts (id, label)."""
-    return [e for e in _ENGINES if e['available']]
+    engines = [e for e in _ENGINES if e['available']]
+    if not global_config:
+        return engines
+    cfgs = global_config.get("ocr_engines", {})
+    filtered = []
+    for engine in engines:
+        engine_id = engine["id"]
+        if engine_id == PADDLE_ENGINE_ID and not global_config.get("ocr_api_token"):
+            continue
+        if engine_id == "textin":
+            cfg = cfgs.get("textin", {})
+            if not cfg.get("app_id") or not cfg.get("secret_code"):
+                continue
+        if engine_id == "mineru" and not cfgs.get("mineru", {}).get("token"):
+            continue
+        if engine_id == "quark":
+            cfg = cfgs.get("quark", {})
+            if not cfg.get("client_id") or not cfg.get("client_secret"):
+                continue
+        filtered.append(engine)
+    return filtered
 
 
 
@@ -65,7 +101,7 @@ class OCRWorker(QThread):
         self.page_list = page_list  # list of page numbers (int)
         self.project_config = project_config
         self.global_config = global_config
-        self.engine = engine
+        self.engine = canonical_engine_id(engine)
         self.pdf_path = project_config.get('pdf_path')
         self._is_running = True
         self._executor = None  # ThreadPoolExecutor reference for shutdown
@@ -126,9 +162,16 @@ class OCRWorker(QThread):
                         if os.path.exists(temp_path):
                             os.remove(temp_path)
 
-                    json_path = os.path.join(save_dir, f"page_{real_page_num}.json")
+                    json_path = get_result_path(save_dir, real_page_num, self.engine, self.global_config)
+                    normalized = normalize_ocr_result(result, self.engine, self.global_config)
+                    payload = {
+                        "__engine": self.engine,
+                        "__model": "PaddleOCR Local",
+                        "__normalized_blocks": normalized,
+                        "raw": result,
+                    }
                     with open(json_path, "w", encoding='utf8') as jf:
-                        json.dump(result, jf, ensure_ascii=False, indent=2)
+                        json.dump(payload, jf, ensure_ascii=False, indent=2)
                     success_count += 1
                     self.page_done.emit(i + 1, total)
 
@@ -188,10 +231,17 @@ class OCRWorker(QThread):
                     if not self._is_running:
                         return False, page_num, "cancelled"
                     try:
-                        result = self._run_v2_remote(img_bytes, token, model, page_num)
-                        json_path = os.path.join(save_dir, f"page_{real_page_num}.json")
+                        result = self._run_engine(img_bytes, token, model, page_num)
+                        json_path = get_result_path(save_dir, real_page_num, self.engine, self.global_config)
+                        normalized = normalize_ocr_result(result, self.engine, self.global_config)
+                        payload = {
+                            "__engine": self.engine,
+                            "__model": model if self.engine == PADDLE_ENGINE_ID else self.engine,
+                            "__normalized_blocks": normalized,
+                            "raw": result,
+                        }
                         with open(json_path, "w", encoding='utf8') as jf:
-                            json.dump(result, jf, ensure_ascii=False, indent=2)
+                            json.dump(payload, jf, ensure_ascii=False, indent=2)
                         return True, page_num, None
                     except Exception as e:
                         last_exc = e
@@ -263,6 +313,64 @@ class OCRWorker(QThread):
     # ------------------------------------------------------------------
     # v2 Async Job API
     # ------------------------------------------------------------------
+    def _run_engine(self, img_bytes: bytes, token: str, model: str, page_num) -> dict:
+        if self.engine == PADDLE_ENGINE_ID:
+            return self._run_v2_remote(img_bytes, token, model, page_num)
+        engine_configs = self.global_config.get("ocr_engines", {})
+        config = engine_configs.get(self.engine, {})
+        if self.engine == "textin":
+            return run_textin(img_bytes, config)
+        if self.engine == "mineru":
+            return run_mineru_agent(
+                img_bytes,
+                config,
+                filename=f"page_{page_num}.jpg",
+                progress=lambda message: self.progress.emit(f"Page {page_num}: {message}"),
+            )
+        if self.engine == "quark":
+            return run_quark(img_bytes, config)
+        if self.engine == "chrome_lens":
+            return self._run_chrome_lens(img_bytes)
+        raise Exception(f"Unsupported OCR engine: {self.engine}")
+
+    def _run_chrome_lens(self, img_bytes: bytes) -> dict:
+        try:
+            from chrome_lens_py import LensAPI
+        except Exception as e:
+            raise Exception(f"chrome-lens-py is not installed or importable: {e}")
+        try:
+            import asyncio
+            async def run():
+                api = LensAPI()
+                suffix = ".jpg"
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                    tmp.write(img_bytes)
+                    tmp_path = tmp.name
+                try:
+                    return await api.process_image(
+                        image_path=tmp_path,
+                        output_format="detailed"
+                    )
+                finally:
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+            result = asyncio.run(run())
+            if isinstance(result, dict):
+                return {
+                    "word_data": result.get("word_data", []),
+                    "detailed_blocks": result.get("detailed_blocks", []),
+                }
+            if hasattr(result, "json"):
+                return result.json()
+            if hasattr(result, "__dict__"):
+                return result.__dict__
+            return {"raw": str(result)}
+        except Exception as e:
+            raise Exception(f"Chrome Lens OCR failed: {e}")
+
+    # ------------------------------------------------------------------
     def _run_v2_remote(self, img_bytes: bytes, token: str, model: str, page_num) -> dict:
         """Submit image to PaddleOCR v2 async job API and wait for result."""
         headers = {"Authorization": f"bearer {token}"}
@@ -271,6 +379,10 @@ class OCRWorker(QThread):
             "useDocUnwarping": False,
             "useChartRecognition": False,
         }
+        paddle_config = self.global_config.get("ocr_engines", {}).get(PADDLE_ENGINE_ID, {})
+        for key in ["useDocOrientationClassify", "useDocUnwarping", "useChartRecognition"]:
+            if key in paddle_config:
+                optional_payload[key] = bool(paddle_config[key])
         data = {
             "model": model,
             "optionalPayload": json.dumps(optional_payload),

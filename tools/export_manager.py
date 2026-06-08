@@ -291,7 +291,7 @@ class ExportManager:
                                 image_tasks.append((img_url, img_save_path))
                         
                         if md_text:
-                            md_texts.append(md_text)
+                            md_texts.append(f"<{p}>\n{md_text}")
                 except Exception as e:
                     print(f"Markdown parse error page {p}: {e}")
 
