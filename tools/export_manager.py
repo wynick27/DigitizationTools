@@ -1,9 +1,69 @@
 import os
 import json
 import re
-from PyQt6.QtWidgets import QMessageBox, QFileDialog, QProgressDialog
+import base64
+from PyQt6.QtWidgets import (
+    QMessageBox, QFileDialog, QProgressDialog, QDialog, QVBoxLayout, QFormLayout,
+    QComboBox, QDialogButtonBox, QLabel,
+)
 import requests
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from ocr.ocr_engines import (
+    discover_ocr_results,
+    sort_ocr_results_by_priority,
+    canonical_engine_id,
+    ENGINE_DEFS,
+)
+
+
+class OcrTextExportDialog(QDialog):
+    def __init__(self, parent, sources):
+        super().__init__(parent)
+        self.setWindowTitle("Export OCR Text")
+        self.resize(420, 150)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("Current priority (one result per page)", "priority")
+        self.mode_combo.addItem("Specified OCR engine", "engine")
+        self.mode_combo.addItem("All OCR sources separately", "all")
+        form.addRow("Mode:", self.mode_combo)
+
+        self.engine_combo = QComboBox()
+        for engine_id, label in sources:
+            self.engine_combo.addItem(label, engine_id)
+        form.addRow("Engine:", self.engine_combo)
+
+        layout.addLayout(form)
+        self.hint = QLabel("")
+        self.hint.setWordWrap(True)
+        layout.addWidget(self.hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.mode_combo.currentIndexChanged.connect(self._update_state)
+        self._update_state()
+
+    def _update_state(self):
+        mode = self.mode_combo.currentData()
+        self.engine_combo.setEnabled(mode == "engine")
+        if mode == "priority":
+            self.hint.setText("Export one OCR result per page using the global OCR priority order.")
+        elif mode == "engine":
+            self.hint.setText("Export only pages where the selected engine has an OCR result.")
+        else:
+            self.hint.setText("Create one text file per discovered OCR source.")
+
+    def selected_mode(self):
+        return self.mode_combo.currentData()
+
+    def selected_engine(self):
+        return self.engine_combo.currentData()
 
 class MarkdownImageDownloader(QThread):
     progress_val = pyqtSignal(int)
@@ -30,11 +90,17 @@ class MarkdownImageDownloader(QThread):
             if not os.path.exists(save_path):
                 self.progress_text.emit(f"Downloading [{i+1}/{total}]: {filename}")
                 try:
-                    r = requests.get(url, timeout=10)
-                    if r.status_code == 200:
+                    if isinstance(url, str) and url.startswith("data:image"):
+                        _, payload = url.split(",", 1)
                         with open(save_path, 'wb') as f:
-                            f.write(r.content)
+                            f.write(base64.b64decode(payload))
                         count += 1
+                    elif isinstance(url, str) and url.startswith("http"):
+                        r = requests.get(url, timeout=10)
+                        if r.status_code == 200:
+                            with open(save_path, 'wb') as f:
+                                f.write(r.content)
+                            count += 1
                 except Exception as e:
                     print(f"Failed to download image: {url} -> {e}")
             else:
@@ -155,6 +221,169 @@ class ExportManager:
              elif isinstance(item, list): txt.append(item[1][0])
         return "\n".join(txt)
 
+    def _scan_ocr_sources(self, start, end):
+        ocr_dir = self.mw.project_config.get("ocr_json_path")
+        sources = {}
+        pages = {}
+        for p in range(start, end + 1):
+            real_page = p + self.mw.project_config.get('page_offset', 0)
+            results = sort_ocr_results_by_priority(
+                discover_ocr_results(ocr_dir, real_page),
+                self.mw.global_config,
+            )
+            pages[p] = results
+            for info in results:
+                engine_id = canonical_engine_id(info.get("engine_id", ""))
+                if engine_id not in sources:
+                    sources[engine_id] = info.get("label") or ENGINE_DEFS.get(engine_id, ENGINE_DEFS["paddleocr"]).label
+        priority = self.mw.global_config.get("ocr_result_priority") or []
+        order = {canonical_engine_id(str(engine_id)): idx for idx, engine_id in enumerate(priority)}
+        return pages, sorted(sources.items(), key=lambda item: (order.get(item[0], len(order)), item[1]))
+
+    def _make_ocr_text_for_pages(self, page_results, engine_id=None):
+        chunks = []
+        used = {}
+        for p, results in page_results.items():
+            selected = None
+            if engine_id:
+                wanted = canonical_engine_id(engine_id)
+                for info in results:
+                    if canonical_engine_id(info.get("engine_id", "")) == wanted:
+                        selected = info
+                        break
+            elif results:
+                selected = results[0]
+            if not selected:
+                continue
+
+            data = self.mw.load_ocr_json(p, selected)
+            if not data:
+                continue
+            text = self._extract_text_from_ocr_data(data)
+            if not text.strip():
+                continue
+            source_label = selected.get("label") or selected.get("engine_id") or "OCR"
+            used[source_label] = used.get(source_label, 0) + 1
+            chunks.append(f"<{p}>\n{text}\n")
+        return "".join(chunks), used
+
+    def _safe_filename_part(self, text):
+        return re.sub(r'[\\/*?:"<>|]+', '_', text).strip() or "ocr"
+
+    def _extract_markdown_payload_by_engine(self, raw, engine_id):
+        engine_id = canonical_engine_id(engine_id)
+        images = {}
+
+        if engine_id == "textin":
+            data = raw.get("data", raw) if isinstance(raw, dict) else {}
+            md_text = data.get("markdown", "") if isinstance(data, dict) else ""
+            for element in data.get("elements", []) if isinstance(data, dict) else []:
+                if not isinstance(element, dict) or element.get("type") != "Image":
+                    continue
+                image_data = element.get("image_data") or {}
+                image_url = image_data.get("image_url")
+                image_b64 = image_data.get("base64")
+                image_ref = element.get("element_id") or f"textin_image_{len(images) + 1}"
+                if image_url:
+                    images[image_ref] = image_url
+                elif image_b64:
+                    mime = image_data.get("mime_type") or "image/png"
+                    images[image_ref] = f"data:{mime};base64,{image_b64}"
+            return md_text, images
+
+        if engine_id == "mineru":
+            if not isinstance(raw, dict):
+                return "", {}
+            return raw.get("markdown") or raw.get("data", {}).get("markdown") or "", {}
+
+        if engine_id == "quark":
+            return "", {}
+
+        if not isinstance(raw, dict):
+            return "", {}
+        results = raw.get("layoutParsingResults") or []
+        if results and isinstance(results[0], dict):
+            md_data = results[0].get("markdown") or {}
+            if isinstance(md_data, dict):
+                return md_data.get("text", ""), md_data.get("images", {}) or {}
+            if isinstance(md_data, str):
+                return md_data, {}
+        return "", {}
+
+    def _image_extension_from_url(self, url):
+        if isinstance(url, str) and url.startswith("data:image"):
+            match = re.match(r"data:image/([^;]+);", url)
+            if match:
+                ext = match.group(1).lower()
+                return "jpg" if ext == "jpeg" else ext
+        name = os.path.basename(str(url).split("?", 1)[0])
+        ext = os.path.splitext(name)[1].lstrip(".")
+        return ext or "png"
+
+    def _replace_markdown_image_refs(self, md_text, page_num, images_dict, md_dir, image_tasks):
+        if not images_dict:
+            return md_text
+        for img_key, img_url in images_dict.items():
+            if not (isinstance(img_url, str) and (img_url.startswith("http") or img_url.startswith("data:image"))):
+                continue
+            key_name = os.path.basename(str(img_key)) or f"image_{len(image_tasks) + 1}"
+            if "." not in key_name:
+                key_name = f"{key_name}.{self._image_extension_from_url(img_url)}"
+            img_filename = f"page_{page_num}_{self._safe_filename_part(key_name)}"
+            local_rel_path = f"imgs/{img_filename}"
+            for old in {str(img_key), img_url}:
+                md_text = md_text.replace(f'src="{old}"', f'src="{local_rel_path}"')
+                md_text = md_text.replace(f"src='{old}'", f"src='{local_rel_path}'")
+                md_text = md_text.replace(f"]({old})", f"]({local_rel_path})")
+            image_tasks.append((img_url, os.path.join(md_dir, "imgs", img_filename)))
+        return md_text
+
+    def _markdown_from_ocr_result(self, page_num, result_info, with_images, md_dir, image_tasks):
+        try:
+            with open(result_info["path"], 'r', encoding='utf-8') as f:
+                raw = json.load(f)
+        except Exception as e:
+            print(f"Markdown parse error page {page_num}: {e}")
+            return ""
+
+        md_text, images_dict = self._extract_markdown_payload_by_engine(
+            raw,
+            result_info.get("engine_id", "paddleocr"),
+        )
+        if not md_text:
+            data = self.mw.load_ocr_json(page_num, result_info)
+            md_text = self._extract_text_from_ocr_data(data) if data else ""
+        if not md_text.strip():
+            return ""
+
+        if with_images:
+            md_text = self._replace_markdown_image_refs(md_text, page_num, images_dict, md_dir, image_tasks)
+        return md_text
+
+    def _make_markdown_for_pages(self, page_results, engine_id=None, with_images=False, md_dir=""):
+        md_texts = []
+        image_tasks = []
+        used = {}
+        for p, results in page_results.items():
+            selected = None
+            if engine_id:
+                wanted = canonical_engine_id(engine_id)
+                for info in results:
+                    if canonical_engine_id(info.get("engine_id", "")) == wanted:
+                        selected = info
+                        break
+            elif results:
+                selected = results[0]
+            if not selected:
+                continue
+            md_text = self._markdown_from_ocr_result(p, selected, with_images, md_dir, image_tasks)
+            if not md_text:
+                continue
+            label = selected.get("label") or selected.get("engine_id") or "OCR"
+            used[label] = used.get(label, 0) + 1
+            md_texts.append(f"<{p}>\n{md_text}")
+        return "\n\n---\n\n".join(md_texts), image_tasks, used
+
     def export_slices(self):
         pg = self.mw.get_current_page()
         data = self.mw.load_ocr_json(pg)
@@ -234,95 +463,162 @@ class ExportManager:
     def export_all_ocr_txt(self):
         start = self.mw.project_config.get("start_page", 1)
         end = self.mw.project_config.get("end_page", 1)
-        
-        full_text = ""
-        for p in range(start, end + 1):
-             data = self.mw.load_ocr_json(p)
-             if data:
-                 t = self._extract_text_from_ocr_data(data)
-                 full_text += f"<{p}>\n{t}\n"
-                 
+        page_results, sources = self._scan_ocr_sources(start, end)
+        if not any(page_results.values()):
+            QMessageBox.warning(self.mw, "Warning", "No OCR results found.")
+            return
+
+        dlg = OcrTextExportDialog(self.mw, sources)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
         proj_name = self.mw.project_config.get("name", "project")
-        filename, _ = QFileDialog.getSaveFileName(self.mw, "Export All OCR", f"{proj_name}_paddleocr.txt", "Text Files (*.txt)")
-        if filename:
-            with open(filename, 'w', encoding='utf-8') as f:
-                f.write(full_text)
-            QMessageBox.information(self.mw, "Done", f"Exported all OCR text to {filename}.")
+        mode = dlg.selected_mode()
+
+        if mode == "all":
+            export_dir = QFileDialog.getExistingDirectory(
+                self.mw,
+                "Select OCR text export directory",
+                self.mw.project_config.get("export_dir", ""),
+            )
+            if not export_dir:
+                return
+            written = []
+            for engine_id, label in sources:
+                text, used = self._make_ocr_text_for_pages(page_results, engine_id)
+                if not text.strip():
+                    continue
+                filename = os.path.join(export_dir, f"{proj_name}_{self._safe_filename_part(label)}.txt")
+                with open(filename, 'w', encoding='utf-8') as f:
+                    f.write(text)
+                written.append(os.path.basename(filename))
+            if written:
+                QMessageBox.information(self.mw, "Done", "Exported OCR text files:\n" + "\n".join(written))
+            else:
+                QMessageBox.warning(self.mw, "Warning", "No text content found in OCR results.")
+            return
+
+        engine_id = dlg.selected_engine() if mode == "engine" else None
+        full_text, used = self._make_ocr_text_for_pages(page_results, engine_id)
+        if not full_text.strip():
+            QMessageBox.warning(self.mw, "Warning", "No text content found for the selected OCR source.")
+            return
+
+        if mode == "engine":
+            label = dict(sources).get(engine_id, engine_id or "ocr")
+            default_name = f"{proj_name}_{self._safe_filename_part(label)}.txt"
+        else:
+            labels = list(used.keys())
+            suffix = "mixed_ocr" if len(labels) > 1 else self._safe_filename_part(labels[0] if labels else "ocr")
+            default_name = f"{proj_name}_{suffix}.txt"
+
+        filename, _ = QFileDialog.getSaveFileName(self.mw, "Export All OCR", default_name, "Text Files (*.txt)")
+        if not filename:
+            return
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(full_text)
+        source_summary = ", ".join(f"{label}: {count}" for label, count in sorted(used.items()))
+        QMessageBox.information(self.mw, "Done", f"Exported all OCR text to {filename}.\nSources: {source_summary}")
 
     def export_all_markdown(self, with_images=False):
         ocr_dir = self.mw.project_config.get("ocr_json_path")
         if not ocr_dir or not os.path.exists(ocr_dir):
             QMessageBox.warning(self.mw, "Error", "OCR JSON path is invalid. Please check settings.")
             return
-            
-        proj_name = self.mw.project_config.get("name", "project")
-        default_name = f"{proj_name}_paddleocr.md"
-        out_md_path, _ = QFileDialog.getSaveFileName(self.mw, "Save Markdown", default_name, "Markdown (*.md)")
-        if not out_md_path: return
 
-        md_dir = os.path.dirname(out_md_path)
-            
         start_p = self.mw.project_config.get("start_page", 1)
         end_p = self.mw.project_config.get("end_page", 1)
-        
-        md_texts = []
-        image_tasks = []
-        
-        for p in range(start_p, end_p + 1):
-            json_file = os.path.join(ocr_dir, f"page_{p}.json")
-            if os.path.exists(json_file):
-                try:
-                    with open(json_file, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                    res = data.get("layoutParsingResults", [])
-                    if res:
-                        md_data = res[0].get("markdown", {})
-                        md_text = md_data.get("text", "")
-                        images_dict = md_data.get("images", {})
-                        
-                        if with_images and images_dict:
-                            for img_key, img_url in images_dict.items():
-                                if not img_url.startswith("http"): continue
-                                img_filename = f"page_{p}_{os.path.basename(img_key)}"
-                                local_rel_path = f"imgs/{img_filename}"
-                                md_text = md_text.replace(f'src="{img_key}"', f'src="{local_rel_path}"')
-                                md_text = md_text.replace(f"]({img_key})", f"]({local_rel_path})")
-                                img_save_path = os.path.join(md_dir, "imgs", img_filename)
-                                image_tasks.append((img_url, img_save_path))
-                        
-                        if md_text:
-                            md_texts.append(f"<{p}>\n{md_text}")
-                except Exception as e:
-                    print(f"Markdown parse error page {p}: {e}")
+        page_results, sources = self._scan_ocr_sources(start_p, end_p)
+        if not any(page_results.values()):
+            QMessageBox.warning(self.mw, "Warning", "No OCR results found.")
+            return
 
-        if not md_texts:
+        dlg = OcrTextExportDialog(self.mw, sources)
+        dlg.setWindowTitle("Export OCR Markdown")
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        proj_name = self.mw.project_config.get("name", "project")
+        mode = dlg.selected_mode()
+
+        if mode == "all":
+            export_dir = QFileDialog.getExistingDirectory(
+                self.mw,
+                "Select Markdown export directory",
+                self.mw.project_config.get("export_dir", ""),
+            )
+            if not export_dir:
+                return
+            written = []
+            all_image_tasks = []
+            for engine_id, label in sources:
+                md_text, image_tasks, used = self._make_markdown_for_pages(
+                    page_results, engine_id, with_images, export_dir
+                )
+                if not md_text.strip():
+                    continue
+                filename = os.path.join(export_dir, f"{proj_name}_{self._safe_filename_part(label)}.md")
+                try:
+                    with open(filename, "w", encoding='utf-8') as f:
+                        f.write(md_text)
+                    written.append(os.path.basename(filename))
+                    all_image_tasks.extend(image_tasks)
+                except Exception as e:
+                    QMessageBox.critical(self.mw, "Error", f"Failed to save Markdown: {e}")
+                    return
+            if not written:
+                QMessageBox.warning(self.mw, "Warning", "No markdown content found in OCR results.")
+                return
+            if with_images and all_image_tasks:
+                self._start_markdown_image_download(all_image_tasks, export_dir)
+            else:
+                QMessageBox.information(self.mw, "Success", "Exported Markdown files:\n" + "\n".join(written))
+            return
+
+        engine_id = dlg.selected_engine() if mode == "engine" else None
+        if mode == "engine":
+            label = dict(sources).get(engine_id, engine_id or "ocr")
+            default_name = f"{proj_name}_{self._safe_filename_part(label)}.md"
+        else:
+            default_name = f"{proj_name}_mixed_ocr.md"
+
+        out_md_path, _ = QFileDialog.getSaveFileName(self.mw, "Save Markdown", default_name, "Markdown (*.md)")
+        if not out_md_path:
+            return
+
+        md_dir = os.path.dirname(out_md_path)
+        md_text, image_tasks, used = self._make_markdown_for_pages(page_results, engine_id, with_images, md_dir)
+        if not md_text.strip():
             QMessageBox.warning(self.mw, "Warning", "No markdown content found in OCR results.")
             return
 
         try:
             with open(out_md_path, "w", encoding='utf-8') as f:
-                f.write("\n\n---\n\n".join(md_texts))
+                f.write(md_text)
         except Exception as e:
             QMessageBox.critical(self.mw, "Error", f"Failed to save Markdown: {e}")
             return
-            
-        if not with_images or not image_tasks:
-            QMessageBox.information(self.mw, "Success", f"Exported Markdown to {out_md_path}")
-            return
-            
+
+        if with_images and image_tasks:
+            self._start_markdown_image_download(image_tasks, out_md_path)
+        else:
+            source_summary = ", ".join(f"{label}: {count}" for label, count in sorted(used.items()))
+            QMessageBox.information(self.mw, "Success", f"Exported Markdown to {out_md_path}\nSources: {source_summary}")
+
+    def _start_markdown_image_download(self, image_tasks, out_path):
         self.mw.md_img_worker = MarkdownImageDownloader(image_tasks)
-        
+
         self.mw.progress_dlg = QProgressDialog("Downloading Images...", "Cancel", 0, len(image_tasks), self.mw)
         self.mw.progress_dlg.setWindowTitle("Exporting Images")
         self.mw.progress_dlg.setWindowModality(Qt.WindowModality.WindowModal)
         self.mw.progress_dlg.setMinimumDuration(0)
         self.mw.progress_dlg.show()
-        
+
         self.mw.md_img_worker.progress_val.connect(self.mw.progress_dlg.setValue)
         self.mw.md_img_worker.progress_text.connect(self.mw.progress_dlg.setLabelText)
-        self.mw.md_img_worker.finished.connect(lambda s, c: self.on_md_img_finished(s, c, out_md_path))
+        self.mw.md_img_worker.finished.connect(lambda s, c: self.on_md_img_finished(s, c, out_path))
         self.mw.progress_dlg.canceled.connect(self.mw.md_img_worker.stop)
-        
+
         self.mw.md_img_worker.start()
 
     def on_md_img_finished(self, success, count, out_md_path):

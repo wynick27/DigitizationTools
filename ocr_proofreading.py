@@ -87,7 +87,7 @@ DEFAULT_PROJECT_CONFIG = {
 
 from ocr.ocr_utils import get_page_image, get_page_image_path, TextToBBoxMapper, BBoxMerger, ImageStitcher
 from ocr.ocr_worker import OCRWorker, ImageExportWorker, get_available_engines, refresh_remote_engine_label, V2_MODELS
-from ocr.ocr_engines import discover_ocr_results, normalize_ocr_result, PADDLE_ENGINE_ID, canonical_engine_id
+from ocr.ocr_engines import discover_ocr_results, normalize_ocr_result, PADDLE_ENGINE_ID, canonical_engine_id, sort_ocr_results_by_priority
 
 
 # ==========================================
@@ -997,10 +997,10 @@ class FileHeaderWidget(QWidget):
             # Update config and reload
             if self.side == "left":
                 self.main_window.project_config['text_path_left'] = filename
+                self.main_window.config_manager.save()
+                self.main_window.reload_all_data()
             else:
-                self.main_window.project_config['text_path_right'] = filename
-            self.main_window.config_manager.save()
-            self.main_window.reload_all_data()
+                self.main_window.set_current_right_text_path(filename)
 
     def save_file(self):
         if self.side == "left":
@@ -1062,8 +1062,7 @@ class MainWindow(QMainWindow):
         
         # 脏标记 (Session Sets)
         self.dirty_pages_left = set()
-        self.dirty_pages_right = set()
-        self.dirty_pages_right = set()
+        self.dirty_pages_right = {}
         self._is_updating_diff = False # Recursion Guard
         
         # Global Undo Stack (for Find/Replace)
@@ -1072,6 +1071,7 @@ class MainWindow(QMainWindow):
         self.last_manual_edit_time = 0
         self.current_loaded_page = None # Track actual loaded page index
         self.last_active_editor = None # Track last focused editor for shortcuts
+        self.last_loaded_right_candidate_index = 0
         
         # 初始化界面
         self.init_ui()
@@ -1346,7 +1346,10 @@ class MainWindow(QMainWindow):
         self.lbl_source = QLabel(" 右侧数据源: ")
         toolbar.addWidget(self.lbl_source)
         self.combo_source = QComboBox()
-        self.combo_source.addItems(["Text File B", "OCR Results"])
+        self.combo_source.setMinimumWidth(220)
+        self.combo_source.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.combo_source.setMinimumContentsLength(24)
+        self.combo_source.addItem("Text File B", {"type": "text", "candidate_index": 0})
         self.combo_source.currentIndexChanged.connect(lambda: self.load_current_page())
         toolbar.addWidget(self.combo_source)
         
@@ -1374,6 +1377,9 @@ class MainWindow(QMainWindow):
         self.lbl_ocr_model = QLabel(" 模型: ")
         toolbar.addWidget(self.lbl_ocr_model)
         self.combo_ocr_model = QComboBox()
+        self.combo_ocr_model.setMinimumWidth(180)
+        self.combo_ocr_model.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.combo_ocr_model.setMinimumContentsLength(18)
         self.combo_ocr_model.currentIndexChanged.connect(self.on_ocr_model_changed)
         toolbar.addWidget(self.combo_ocr_model)
         
@@ -1616,7 +1622,17 @@ class MainWindow(QMainWindow):
         self.last_loaded_source = "Text File B" # Track source for saving
         self.current_ocr_data = None      # 1. 加载文本
         self.pages_left = read_text_to_pages(self.project_config['text_path_left'])
-        self.pages_right_text = read_text_to_pages(self.project_config['text_path_right'])
+        self.right_text_candidates = self.get_right_text_candidates()
+        self.current_right_candidate_index = min(
+            int(self.project_config.get("active_right_text_candidate", 0) or 0),
+            max(0, len(self.right_text_candidates) - 1),
+        )
+        self.right_candidate_pages = {
+            idx: read_text_to_pages(candidate.get("path", ""))
+            for idx, candidate in enumerate(self.right_text_candidates)
+        }
+        self.pages_right_text = self.right_candidate_pages.get(self.current_right_candidate_index, {})
+        self.refresh_right_candidate_combo()
         
         # 2. 加载 PDF
         self.doc = None
@@ -1628,38 +1644,143 @@ class MainWindow(QMainWindow):
         
         # 3. Update Headers
         self.header_left.set_path(self.project_config.get('text_path_left', ''))
-        self.header_right.set_path(self.project_config.get('text_path_right', ''))
+        self.header_right.set_path(self.get_current_right_text_path())
 
         self.dirty_pages_left.clear()
         self.dirty_pages_right.clear()
         self.load_current_page()
 
  
+    def get_right_text_candidates(self):
+        candidates = []
+        primary_path = self.project_config.get("text_path_right", "")
+        candidates.append({
+            "label": "Text B",
+            "path": primary_path,
+        })
+        for candidate in self.project_config.get("right_text_candidates", []):
+            if isinstance(candidate, dict):
+                path = candidate.get("path", "")
+                label = candidate.get("label") or os.path.basename(path) or "Candidate"
+            else:
+                path = str(candidate)
+                label = os.path.basename(path) or "Candidate"
+            if path and path != primary_path:
+                candidates.append({"label": label, "path": path})
+        return candidates
+
+    def get_current_right_text_path(self):
+        candidates = getattr(self, "right_text_candidates", None) or self.get_right_text_candidates()
+        idx = getattr(self, "current_right_candidate_index", 0)
+        if 0 <= idx < len(candidates):
+            return candidates[idx].get("path", "")
+        return self.project_config.get("text_path_right", "")
+
+    def is_text_source_selected(self):
+        data = self.combo_source.currentData() if hasattr(self, "combo_source") else None
+        return isinstance(data, dict) and data.get("type") == "text"
+
+    def select_text_source(self, candidate_index=None):
+        candidate_index = getattr(self, "current_right_candidate_index", 0) if candidate_index is None else candidate_index
+        for i in range(self.combo_source.count()):
+            data = self.combo_source.itemData(i)
+            if isinstance(data, dict) and data.get("type") == "text" and data.get("candidate_index") == candidate_index:
+                self.combo_source.setCurrentIndex(i)
+                return
+
+    def get_right_candidate_label(self, idx):
+        candidates = getattr(self, "right_text_candidates", [])
+        if 0 <= idx < len(candidates):
+            return candidates[idx].get("label") or os.path.basename(candidates[idx].get("path", "")) or f"Text B {idx + 1}"
+        return f"Text B {idx + 1}"
+
+    def set_current_right_text_path(self, path):
+        idx = getattr(self, "current_right_candidate_index", 0)
+        candidates = getattr(self, "right_text_candidates", [])
+        if idx <= 0 or idx >= len(candidates):
+            idx = 0
+            self.project_config['text_path_right'] = path
+        else:
+            candidates[idx]["path"] = path
+            configured = self.project_config.setdefault("right_text_candidates", [])
+            config_idx = idx - 1
+            while len(configured) <= config_idx:
+                configured.append({})
+            if not isinstance(configured[config_idx], dict):
+                configured[config_idx] = {"path": str(configured[config_idx])}
+            configured[config_idx]["path"] = path
+            if not configured[config_idx].get("label"):
+                configured[config_idx]["label"] = os.path.basename(path)
+
+        self.current_right_candidate_index = idx
+        self.project_config["active_right_text_candidate"] = idx
+        self.right_text_candidates = self.get_right_text_candidates()
+        self.right_candidate_pages[idx] = read_text_to_pages(path)
+        self.pages_right_text = self.right_candidate_pages.get(idx, {})
+        self.header_right.set_path(path)
+        self.config_manager.save()
+        self.refresh_ocr_source_options(self.current_loaded_page or self.project_config.get('start_page', 1))
+        self.select_text_source(idx)
+        self.load_current_page()
+
+    def current_right_dirty_pages(self):
+        idx = getattr(self, "current_right_candidate_index", 0)
+        return self.dirty_pages_right.setdefault(idx, set())
+
+    def has_dirty_right_pages(self):
+        return any(bool(pages) for pages in self.dirty_pages_right.values())
+
+    def refresh_right_candidate_combo(self):
+        return
 
     def refresh_ocr_source_options(self, page_num):
         current_text = self.combo_source.currentText() if hasattr(self, "combo_source") else "Text File B"
         current_path = None
+        current_candidate = getattr(self, "current_right_candidate_index", 0)
         current_data = self.combo_source.currentData() if hasattr(self, "combo_source") else None
         if isinstance(current_data, dict):
-            current_path = current_data.get("path")
+            if current_data.get("type") == "ocr":
+                current_path = current_data.get("path")
+            elif current_data.get("type") == "text":
+                current_candidate = current_data.get("candidate_index", current_candidate)
 
         real_page_num = page_num + self.project_config.get('page_offset', 0)
-        results = discover_ocr_results(self.project_config.get('ocr_json_path'), real_page_num)
+        results = sort_ocr_results_by_priority(
+            discover_ocr_results(self.project_config.get('ocr_json_path'), real_page_num),
+            self.global_config,
+        )
 
         self.combo_source.blockSignals(True)
         self.combo_source.clear()
-        self.combo_source.addItem("Text File B", None)
+        for idx, candidate in enumerate(getattr(self, "right_text_candidates", [])):
+            path = candidate.get("path", "")
+            path_name = os.path.basename(path)
+            label = candidate.get("label") or path_name or f"Text B {idx + 1}"
+            display = f"Text B: {path_name or label}" if idx == 0 and (path_name or label != "Text B") else "Text B"
+            if idx > 0:
+                display = f"Text B: {label}"
+            self.combo_source.addItem(display, {"type": "text", "candidate_index": idx})
+            self.combo_source.setItemData(self.combo_source.count() - 1, path, Qt.ItemDataRole.ToolTipRole)
         for idx, info in enumerate(results):
             label = "OCR Results" if idx == 0 and info.get("legacy") else info.get("label", "OCR")
             if label in [self.combo_source.itemText(i) for i in range(self.combo_source.count())]:
                 label = f"{label} ({os.path.basename(info.get('path', ''))})"
-            self.combo_source.addItem(label, info)
+            ocr_info = dict(info)
+            ocr_info["type"] = "ocr"
+            self.combo_source.addItem(label, ocr_info)
+            self.combo_source.setItemData(self.combo_source.count() - 1, info.get("path", ""), Qt.ItemDataRole.ToolTipRole)
 
         target_idx = 0
         if current_path:
             for i in range(self.combo_source.count()):
                 data = self.combo_source.itemData(i)
-                if isinstance(data, dict) and data.get("path") == current_path:
+                if isinstance(data, dict) and data.get("type") == "ocr" and data.get("path") == current_path:
+                    target_idx = i
+                    break
+        elif isinstance(current_data, dict) and current_data.get("type") == "text":
+            for i in range(self.combo_source.count()):
+                data = self.combo_source.itemData(i)
+                if isinstance(data, dict) and data.get("type") == "text" and data.get("candidate_index") == current_candidate:
                     target_idx = i
                     break
         elif current_text != "Text File B":
@@ -1695,7 +1816,15 @@ class MainWindow(QMainWindow):
         
             # 1. Load OCR Data
             current_source_data = self.combo_source.currentData()
-            ocr_result_info = current_source_data if isinstance(current_source_data, dict) else None
+            if isinstance(current_source_data, dict) and current_source_data.get("type") == "text":
+                candidate_idx = int(current_source_data.get("candidate_index", 0) or 0)
+                if candidate_idx != getattr(self, "current_right_candidate_index", 0):
+                    self.current_right_candidate_index = candidate_idx
+                    self.project_config["active_right_text_candidate"] = candidate_idx
+                    self.pages_right_text = self.right_candidate_pages.get(candidate_idx, {})
+                    self.header_right.set_path(self.get_current_right_text_path())
+                    self.config_manager.save()
+            ocr_result_info = current_source_data if isinstance(current_source_data, dict) and current_source_data.get("type") == "ocr" else None
             ocr_data = self.load_ocr_json(page_num, ocr_result_info)
             self.current_ocr_data = ocr_data # Store for highlighting
             
@@ -1754,7 +1883,10 @@ class MainWindow(QMainWindow):
                     })
                     current_idx += length
             
-            is_ocr_mode = (self.combo_source.currentText() != "Text File B")
+            source_data = self.combo_source.currentData()
+            is_ocr_mode = isinstance(source_data, dict) and source_data.get("type") == "ocr"
+            if not is_ocr_mode and isinstance(source_data, dict) and source_data.get("type") == "text":
+                self.last_loaded_right_candidate_index = int(source_data.get("candidate_index", 0) or 0)
             
             # Draw bboxes (Use red for all detected, or maybe lighter if not in OCR mode)
             #self.image_view.load_content(pix, ocr_data if ocr_data else [])
@@ -1817,7 +1949,7 @@ class MainWindow(QMainWindow):
             self.edit_left.setPlainText(text_l)
             
             # Right
-            if self.combo_source.currentText() == "Text File B":
+            if self.is_text_source_selected():
                 text_r = self.pages_right_text.get(p, "")
                 self.edit_right.setPlainText(text_r)
                 
@@ -1872,7 +2004,7 @@ class MainWindow(QMainWindow):
         else:
             path = self.project_config['ocr_json_path']
             real_page_num = page_num + self.project_config.get('page_offset', 0)
-            discovered = discover_ocr_results(path, real_page_num)
+            discovered = sort_ocr_results_by_priority(discover_ocr_results(path, real_page_num), self.global_config)
             if discovered:
                 result_info = discovered[0]
                 f_path = result_info["path"]
@@ -1929,7 +2061,7 @@ class MainWindow(QMainWindow):
         text_l = self.edit_left.toPlainText()
         text_r = self.edit_right.toPlainText()
         
-        need_ocr_map = (self.combo_source.currentText() == "Text File B" and bool(self.ocr_text_full))
+        need_ocr_map = (self.is_text_source_selected() and bool(self.ocr_text_full))
         
         self.diff_worker = DiffWorker(text_l, text_r, self.ocr_text_full, need_ocr_map)
         self.diff_worker.result_ready.connect(self.on_diff_finished)
@@ -1966,7 +2098,7 @@ class MainWindow(QMainWindow):
             self.ocr_diff_opcodes = ocr_opcodes
         else:
             # If not calculated, maybe we use main diff if right is OCR
-            if self.combo_source.currentText() != "Text File B":
+            if not self.is_text_source_selected():
                  self.ocr_diff_opcodes = opcodes
 
 
@@ -2006,10 +2138,12 @@ class MainWindow(QMainWindow):
         """
         检查未保存 (Exit Only). 如果有，弹窗提示。
         """
-        if self.dirty_pages_left or self.dirty_pages_right:
+        if self.dirty_pages_left or self.has_dirty_right_pages():
             msg = "Unsaved changes in:\n"
             if self.dirty_pages_left: msg += "- Left Text\n"
-            if self.dirty_pages_right: msg += "- Right Text\n"
+            for idx, pages in sorted(self.dirty_pages_right.items()):
+                if pages:
+                    msg += f"- Right Text: {self.get_right_candidate_label(idx)}\n"
             msg += "Do you want to save?"
             
             reply = QMessageBox.question(
@@ -2023,7 +2157,7 @@ class MainWindow(QMainWindow):
                 return False
             elif reply == QMessageBox.StandardButton.Yes:
                 if self.dirty_pages_left: self.save_left_data()
-                if self.dirty_pages_right: self.save_right_data()
+                if self.has_dirty_right_pages(): self.save_all_dirty_right_data()
                 return True
         return True
 
@@ -2034,7 +2168,7 @@ class MainWindow(QMainWindow):
         if is_left:
             self.dirty_pages_left.add(p)
         else:
-            self.dirty_pages_right.add(p)
+            self.current_right_dirty_pages().add(p)
             
     def update_memory_cache(self):
         """Update memory dicts from editors"""
@@ -2042,7 +2176,7 @@ class MainWindow(QMainWindow):
             page_num = self.current_loaded_page
             # Logic handled in save_current_page_data mostly, but for live updates:
             self.pages_left[page_num] = self.edit_left.toPlainText()
-            if self.combo_source.currentText() == "Text File B":
+            if self.is_text_source_selected():
                  self.pages_right_text[page_num] = self.edit_right.toPlainText()
         except: pass
 
@@ -2063,7 +2197,7 @@ class MainWindow(QMainWindow):
         if not self._is_updating_diff:
             try:
                 p = int(self.spin_page.text())
-                self.dirty_pages_right.add(p)
+                self.current_right_dirty_pages().add(p)
             except: pass
             self.update_memory_cache()
         self.deferred_run_diff()
@@ -2159,14 +2293,18 @@ class MainWindow(QMainWindow):
             
         # Right (Check Last Loaded Source!)
         if hasattr(self, 'last_loaded_source') and self.last_loaded_source == "Text File B":
+            candidate_idx = getattr(self, "last_loaded_right_candidate_index", getattr(self, "current_right_candidate_index", 0))
+            pages = self.right_candidate_pages.setdefault(candidate_idx, {})
             current_right = self.edit_right.toPlainText()
-            saved_right = self.pages_right_text.get(p, "")
+            saved_right = pages.get(p, "")
             if current_right != saved_right:
-                 self.pages_right_text[p] = current_right
-                 self.mark_page_dirty(p, False)
+                 pages[p] = current_right
+                 if candidate_idx == getattr(self, "current_right_candidate_index", 0):
+                     self.pages_right_text = pages
+                 self.dirty_pages_right.setdefault(candidate_idx, set()).add(p)
         elif not hasattr(self, 'last_loaded_source'):
             # Fallback for initialization or if variable missing
-             if self.combo_source.currentText() == "Text File B": # This was the buggy line if switching!
+             if self.is_text_source_selected(): # This was the buggy line if switching!
                  # But if we are here, we might be switching.
                  # Safe default: Do NOT save if we are unsure? 
                  # Or save if combo says Text File B? 
@@ -2228,7 +2366,7 @@ class MainWindow(QMainWindow):
         if not self.current_ocr_data: return
         
         # 如果是 Right Editor 且处于 OCR 模式，直接用行号 (旧逻辑保留，简单快速)
-        is_ocr_mode = (self.combo_source.currentText() != "Text File B")
+        is_ocr_mode = not self.is_text_source_selected()
         if editor == self.edit_right and is_ocr_mode:
             self._handle_right_editor_ocr_scroll(editor, idx)
             return
@@ -2367,8 +2505,8 @@ class MainWindow(QMainWindow):
         if not span:
             return
 
-        if side == "right" and self.combo_source.currentText() != "Text File B":
-            self.combo_source.setCurrentText("Text File B")
+        if side == "right" and not self.is_text_source_selected():
+            self.select_text_source()
             QApplication.processEvents()
         self.goto_page(row.get("page"))
 
@@ -2401,22 +2539,36 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "保存", f"Left data saved to {path}")
             self.config_manager.save()
 
-    def save_right_data(self):
-        if self.combo_source.currentText() != "Text File B":
+    def save_right_data(self, candidate_index=None, force=False):
+        if not force and not self.is_text_source_selected():
             QMessageBox.warning(self, "Error", "Right side is not a text file.")
             return
 
-        path = self.project_config.get('text_path_right')
+        if candidate_index is None:
+            candidate_index = getattr(self, "current_right_candidate_index", 0)
+        pages = self.right_candidate_pages.get(candidate_index, self.pages_right_text)
+        candidates = getattr(self, "right_text_candidates", [])
+        path = candidates[candidate_index].get("path", "") if 0 <= candidate_index < len(candidates) else ""
         if not path:
              path, _ = QFileDialog.getSaveFileName(self, "Save Right", "", "Text (*.txt)")
-             if path: 
-                 self.project_config['text_path_right'] = path
+             if path:
+                 if candidate_index == 0:
+                     self.project_config['text_path_right'] = path
+                 else:
+                     self.right_text_candidates[candidate_index]["path"] = path
+                     if "right_text_candidates" in self.project_config and candidate_index - 1 < len(self.project_config["right_text_candidates"]):
+                         self.project_config["right_text_candidates"][candidate_index - 1]["path"] = path
         
         if path:
-            write_pages_to_file(self.pages_right_text, path)
-            self.dirty_pages_right.clear()
+            write_pages_to_file(pages, path)
+            self.dirty_pages_right.get(candidate_index, set()).clear()
             QMessageBox.information(self, "保存", f"Right data saved to {path}")
             self.config_manager.save()
+
+    def save_all_dirty_right_data(self):
+        for idx, pages in list(self.dirty_pages_right.items()):
+            if pages:
+                self.save_right_data(idx, force=True)
 
     def run_batch_ocr(self):
         """批量 OCR / Cancel"""
@@ -2636,27 +2788,33 @@ class MainWindow(QMainWindow):
             saved = self.global_config.get("ocr_api_model", V2_MODELS[0])
             for model in V2_MODELS:
                 self.combo_ocr_model.addItem(model, model)
+                self.combo_ocr_model.setItemData(self.combo_ocr_model.count() - 1, model, Qt.ItemDataRole.ToolTipRole)
             idx = self.combo_ocr_model.findData(saved)
         elif engine == "mineru":
             models = ["vlm", "pipeline"]
             saved = self.global_config.get("ocr_engines", {}).get("mineru", {}).get("model_version", "vlm")
             for model in models:
                 self.combo_ocr_model.addItem(model, model)
+                self.combo_ocr_model.setItemData(self.combo_ocr_model.count() - 1, model, Qt.ItemDataRole.ToolTipRole)
             idx = self.combo_ocr_model.findData(saved)
         elif engine == "textin":
             saved = self.global_config.get("ocr_engines", {}).get("textin", {}).get("model", "默认")
             self.combo_ocr_model.addItem("默认", "默认")
+            self.combo_ocr_model.setItemData(0, "默认", Qt.ItemDataRole.ToolTipRole)
             idx = self.combo_ocr_model.findData(saved)
         elif engine == "quark":
             saved = self.global_config.get("ocr_engines", {}).get("quark", {}).get("model", "RecognizeGeneralDocument")
             self.combo_ocr_model.addItem("RecognizeGeneralDocument", "RecognizeGeneralDocument")
+            self.combo_ocr_model.setItemData(0, "RecognizeGeneralDocument", Qt.ItemDataRole.ToolTipRole)
             idx = self.combo_ocr_model.findData(saved)
         elif engine == "chrome_lens":
             saved = self.global_config.get("ocr_engines", {}).get("chrome_lens", {}).get("model", "默认")
             self.combo_ocr_model.addItem("默认", "默认")
+            self.combo_ocr_model.setItemData(0, "默认", Qt.ItemDataRole.ToolTipRole)
             idx = self.combo_ocr_model.findData(saved)
         else:
             self.combo_ocr_model.addItem("默认", "默认")
+            self.combo_ocr_model.setItemData(0, "默认", Qt.ItemDataRole.ToolTipRole)
             idx = 0
 
         if idx is None or idx < 0:
@@ -2795,7 +2953,7 @@ class MainWindow(QMainWindow):
         
         target_pos = -1
         
-        if target == self.edit_right and self.combo_source.currentText() != "Text File B":
+        if target == self.edit_right and not self.is_text_source_selected():
              # OCR Mode: Right IS OCR.
              target_pos = to_qt_pos(self.edit_right.toPlainText(), start_py_idx)
         else:

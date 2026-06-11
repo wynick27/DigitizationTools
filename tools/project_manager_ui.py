@@ -1,11 +1,12 @@
 import os
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTabWidget, QWidget,
                              QDialogButtonBox, QFormLayout, QLineEdit, QKeySequenceEdit,
-                             QListWidget, QPushButton, QSpinBox, QLabel, QFileDialog,
+                             QListWidget, QListWidgetItem, QPushButton, QSpinBox, QLabel, QFileDialog,
                              QInputDialog, QMessageBox, QComboBox, QTextEdit, QStackedWidget,
                              QCheckBox, QDoubleSpinBox)
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QKeySequence
+from ocr.ocr_engines import ENGINE_DEFS, PADDLE_ENGINE_ID, canonical_engine_id
 from ocr.ocr_worker import refresh_remote_engine_label
 
 class ProjectManagerDialog(QDialog):
@@ -90,9 +91,33 @@ class ProjectManagerDialog(QDialog):
         self.input_excluded_labels.setText(g.get("ocr_excluded_labels", "image,table,formula,Illustration,PrintedFormula,WrittenFormula"))
         self.input_excluded_labels.textChanged.connect(self.save_global)
 
+        self.list_ocr_priority = QListWidget()
+        priority = g.get("ocr_result_priority") or [PADDLE_ENGINE_ID, "chrome_lens", "textin", "mineru", "quark", "local"]
+        seen_priority = set()
+        for engine_id in priority:
+            engine_id = canonical_engine_id(engine_id)
+            if engine_id in ENGINE_DEFS and engine_id not in seen_priority:
+                self._add_ocr_priority_item(engine_id)
+                seen_priority.add(engine_id)
+        for engine_id in ENGINE_DEFS:
+            if engine_id not in seen_priority:
+                self._add_ocr_priority_item(engine_id)
+
+        priority_buttons = QWidget()
+        priority_buttons_layout = QHBoxLayout(priority_buttons)
+        priority_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        self.btn_ocr_priority_up = QPushButton("Up")
+        self.btn_ocr_priority_down = QPushButton("Down")
+        self.btn_ocr_priority_up.clicked.connect(lambda: self.move_ocr_priority(-1))
+        self.btn_ocr_priority_down.clicked.connect(lambda: self.move_ocr_priority(1))
+        priority_buttons_layout.addWidget(self.btn_ocr_priority_up)
+        priority_buttons_layout.addWidget(self.btn_ocr_priority_down)
+
         common_layout.addRow("Retry Count:", self.spin_retry)
         common_layout.addRow("Concurrent Tasks:", self.spin_concurrent)
         common_layout.addRow("Excluded Labels:", self.input_excluded_labels)
+        common_layout.addRow("OCR Result Priority:", self.list_ocr_priority)
+        common_layout.addRow("", priority_buttons)
 
         paddle_page, paddle_layout = self._add_ocr_page("PaddleOCR")
         self.input_api_token = QLineEdit()
@@ -299,6 +324,21 @@ class ProjectManagerDialog(QDialog):
         form = QFormLayout(page)
         self.ocr_pages.addWidget(page)
         return page, form
+
+    def _add_ocr_priority_item(self, engine_id):
+        item = QListWidgetItem(ENGINE_DEFS[engine_id].label)
+        item.setData(Qt.ItemDataRole.UserRole, engine_id)
+        self.list_ocr_priority.addItem(item)
+
+    def move_ocr_priority(self, delta):
+        row = self.list_ocr_priority.currentRow()
+        new_row = row + delta
+        if row < 0 or new_row < 0 or new_row >= self.list_ocr_priority.count():
+            return
+        item = self.list_ocr_priority.takeItem(row)
+        self.list_ocr_priority.insertItem(new_row, item)
+        self.list_ocr_priority.setCurrentRow(new_row)
+        self.save_global()
         
     def save_global(self):
         g = self.config_manager.get_global()
@@ -310,6 +350,11 @@ class ProjectManagerDialog(QDialog):
             g["ocr_concurrent_tasks"] = self.spin_concurrent.value()
         if hasattr(self, "input_excluded_labels"):
             g["ocr_excluded_labels"] = self.input_excluded_labels.text()
+        if hasattr(self, "list_ocr_priority"):
+            g["ocr_result_priority"] = [
+                self.list_ocr_priority.item(i).data(Qt.ItemDataRole.UserRole)
+                for i in range(self.list_ocr_priority.count())
+            ]
         if hasattr(self, "chk_paddle_orientation"):
             engines = g.setdefault("ocr_engines", {})
             engines.setdefault("paddleocr", {}).update({
@@ -402,6 +447,18 @@ class ProjectManagerDialog(QDialog):
         self.inp_pdf = self.add_browse_row("PDF Path:", "file", "PDF Files (*.pdf)")
         self.inp_left_txt = self.add_browse_row("Left Text:", "file", "Text (*.txt)")
         self.inp_right_txt = self.add_browse_row("Right Text:", "file", "Text (*.txt)")
+        self.list_right_candidates = QListWidget()
+        candidate_buttons = QWidget()
+        candidate_buttons_layout = QHBoxLayout(candidate_buttons)
+        candidate_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        self.btn_add_right_candidate = QPushButton("Add")
+        self.btn_remove_right_candidate = QPushButton("Remove")
+        self.btn_add_right_candidate.clicked.connect(self.add_right_candidate)
+        self.btn_remove_right_candidate.clicked.connect(self.remove_right_candidate)
+        candidate_buttons_layout.addWidget(self.btn_add_right_candidate)
+        candidate_buttons_layout.addWidget(self.btn_remove_right_candidate)
+        self.form_layout.addRow("Other Right Texts:", self.list_right_candidates)
+        self.form_layout.addRow("", candidate_buttons)
         self.inp_img_dir = self.add_browse_row("Image Dir:", "dir")
         self.inp_ocr_json = self.add_browse_row("OCR JSON Dir:", "dir")
         self.inp_export_dir = self.add_browse_row("Export Dir:", "dir")
@@ -511,6 +568,17 @@ class ProjectManagerDialog(QDialog):
         self.inp_img_dir.setText(p.get("image_dir", ""))
         self.inp_left_txt.setText(p.get("text_path_left", ""))
         self.inp_right_txt.setText(p.get("text_path_right", ""))
+        self.list_right_candidates.clear()
+        for candidate in p.get("right_text_candidates", []):
+            if isinstance(candidate, dict):
+                path = candidate.get("path", "")
+                label = candidate.get("label") or os.path.basename(path) or "Candidate"
+            else:
+                path = str(candidate)
+                label = os.path.basename(path) or "Candidate"
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            self.list_right_candidates.addItem(item)
         self.inp_ocr_json.setText(p.get("ocr_json_path", ""))
         self.inp_export_dir.setText(p.get("export_dir", ""))
         
@@ -549,6 +617,13 @@ class ProjectManagerDialog(QDialog):
         p["image_dir"] = self.inp_img_dir.text()
         p["text_path_left"] = self.inp_left_txt.text()
         p["text_path_right"] = self.inp_right_txt.text()
+        p["right_text_candidates"] = [
+            {
+                "label": self.list_right_candidates.item(i).text(),
+                "path": self.list_right_candidates.item(i).data(Qt.ItemDataRole.UserRole),
+            }
+            for i in range(self.list_right_candidates.count())
+        ]
         p["ocr_json_path"] = self.inp_ocr_json.text()
         p["export_dir"] = self.inp_export_dir.text()
         
@@ -575,6 +650,22 @@ class ProjectManagerDialog(QDialog):
         for inp in inputs:
             if hasattr(inp, 'blockSignals'):
                 inp.blockSignals(block)
+
+    def add_right_candidate(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select Right Text", "", "Text (*.txt)")
+        if not path:
+            return
+        item = QListWidgetItem(os.path.basename(path) or path)
+        item.setData(Qt.ItemDataRole.UserRole, path)
+        self.list_right_candidates.addItem(item)
+        self.save_current_project()
+
+    def remove_right_candidate(self):
+        row = self.list_right_candidates.currentRow()
+        if row < 0:
+            return
+        self.list_right_candidates.takeItem(row)
+        self.save_current_project()
 
     def add_project(self):
         name, ok = QInputDialog.getText(self, "New Project", "Project Name:")

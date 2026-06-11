@@ -124,6 +124,32 @@ def discover_ocr_results(save_dir: str, real_page_num: int) -> list[dict]:
     return results
 
 
+def sort_ocr_results_by_priority(results: list[dict], global_config: dict | None = None) -> list[dict]:
+    if not results:
+        return results
+    global_config = global_config or {}
+    priority = global_config.get("ocr_result_priority") or [
+        PADDLE_ENGINE_ID,
+        "chrome_lens",
+        "textin",
+        "mineru",
+        "quark",
+        "local",
+    ]
+    order = {canonical_engine_id(str(engine_id)): idx for idx, engine_id in enumerate(priority)}
+
+    def key(item):
+        engine_id = canonical_engine_id(item.get("engine_id", ""))
+        return (
+            order.get(engine_id, len(order)),
+            0 if item.get("legacy") else 1,
+            item.get("label", ""),
+            item.get("path", ""),
+        )
+
+    return sorted(results, key=key)
+
+
 def engine_id_from_suffix(suffix: str) -> str:
     low = suffix.lower()
     if "textin" in low:
