@@ -25,6 +25,7 @@ from tools.similarity_tools import SimilarityDialog, calculate_page_similarities
 from tools.headword_compare_tools import HeadwordCompareDialog
 
 from find_replace import FindReplaceDialog
+from lang.i18n import text_from_config
 
 
 
@@ -206,74 +207,7 @@ class ConfigManager:
 # ==========================================
 # 0.6 Language Dictionary (i18n)
 # ==========================================
-UI_TEXTS = {
-    "zh": {
-        "menu_edit": "编辑",
-        "menu_tools": "工具",
-        "menu_export": "导出",
-        "menu_lang": "语言",
-        "act_find": "查找和替换",
-        "act_undo_global": "撤销全局替换",
-        "act_split": "拆分PDF",
-        "act_exp_img": "导出PDF图片",
-        "act_merge": "合并文本文件",
-        "act_exp_slice": "导出当前页面切图",
-        "act_exp_ocr_curr": "导出当前页面OCR文本",
-        "act_exp_ocr_all": "导出所有页面OCR文本",
-        "act_exp_md_all": "导出所有为Markdown",
-        "act_exp_md_img_all": "导出所有为Markdown+图片",
-        "act_exp_l_json": "导出左侧文本(.json)",
-        "act_exp_r_json": "导出右侧文本(.json)",
-        "act_exp_l_mdx": "导出左侧文本(.mdx.txt)",
-        "act_exp_r_mdx": "导出右侧文本(.mdx.txt)",
-        "act_exp_l_json_img": "导出左侧文本(.json)+图片",
-        "act_exp_r_json_img": "导出右侧文本(.json)+图片",
-        "act_exp_l_mdx_img": "导出左侧文本(.mdx.txt)+图片",
-        "act_exp_r_mdx_img": "导出右侧文本(.mdx.txt)+图片",
-        "act_force_recreate": "强制重新生成图片",
-        "lbl_project": "项目: ",
-        "btn_manage": "设置 / 管理",
-        "lbl_page": "页码: ",
-        "lbl_source": " 右侧数据源: ",
-        "cb_wrap": "自动换行",
-        "lbl_engine": " OCR引擎: ",
-        "btn_ocr_cur": "OCR当前页面",
-        "btn_ocr_batch": "OCR所有缺失页面",
-    },
-    "en": {
-        "menu_edit": "Edit",
-        "menu_tools": "Tools",
-        "menu_export": "Export",
-        "menu_lang": "Language",
-        "act_find": "Find and Replace",
-        "act_undo_global": "Undo Global Replace",
-        "act_split": "Split PDF",
-        "act_exp_img": "Export PDF Images",
-        "act_merge": "Merge Texts",
-        "act_exp_slice": "Export Current Slices",
-        "act_exp_ocr_curr": "Export Current OCR Text",
-        "act_exp_ocr_all": "Export All OCR Text",
-        "act_exp_md_all": "Export All to Markdown",
-        "act_exp_md_img_all": "Export All to Markdown + Images",
-        "act_exp_l_json": "Export Left (.json)",
-        "act_exp_r_json": "Export Right (.json)",
-        "act_exp_l_mdx": "Export Left (.mdx.txt)",
-        "act_exp_r_mdx": "Export Right (.mdx.txt)",
-        "act_exp_l_json_img": "Export Left (.json) + Images",
-        "act_exp_r_json_img": "Export Right (.json) + Images",
-        "act_exp_l_mdx_img": "Export Left (.mdx.txt) + Images",
-        "act_exp_r_mdx_img": "Export Right (.mdx.txt) + Images",
-        "act_force_recreate": "Force Recreate Images",
-        "lbl_project": "Project: ",
-        "btn_manage": "Settings / Manage",
-        "lbl_page": "Page: ",
-        "lbl_source": " Right Data Source: ",
-        "cb_wrap": "Word Wrap",
-        "lbl_engine": " OCR Engine: ",
-        "btn_ocr_cur": "OCR Current",
-        "btn_ocr_batch": "OCR Missing Pages",
-    }
-}
+
 
 
 # ==========================================
@@ -1136,8 +1070,7 @@ class MainWindow(QMainWindow):
                 
                 
     def get_text(self, key):
-        lang = self.global_config.get("ui_lang", "zh")
-        return UI_TEXTS.get(lang, UI_TEXTS["zh"]).get(key, key)
+        return text_from_config(self.global_config, key)
         
     def switch_language(self, lang_code):
         self.global_config["ui_lang"] = lang_code
@@ -1157,8 +1090,8 @@ class MainWindow(QMainWindow):
         self.act_split.setText(self.get_text("act_split"))
         self.act_exp_img.setText(self.get_text("act_exp_img"))
         self.act_merge.setText(self.get_text("act_merge"))
-        self.act_similarity.setText("相似度窗口")
-        self.act_headword_compare.setText("词头对比窗口")
+        self.act_similarity.setText(self.get_text("act_similarity"))
+        self.act_headword_compare.setText(self.get_text("act_headword_compare"))
         
         self.act_exp_slice.setText(self.get_text("act_exp_slice"))
         self.act_exp_ocr_curr.setText(self.get_text("act_exp_ocr_curr"))
@@ -1185,6 +1118,7 @@ class MainWindow(QMainWindow):
         self.lbl_source.setText(self.get_text("lbl_source"))
         self.cb_word_wrap.setText(self.get_text("cb_wrap"))
         self.lbl_engine.setText(self.get_text("lbl_engine"))
+        self.lbl_ocr_model.setText(self.get_text("lbl_model"))
         self.btn_ocr_cur.setText(self.get_text("btn_ocr_cur"))
         self.btn_batch.setText(self.get_text("btn_ocr_batch"))
                 
