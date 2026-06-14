@@ -10,6 +10,7 @@ TEXTS = {
     "act_merge": "Merge Texts",
     "act_similarity": "Similarity Window",
     "act_headword_compare": "Headword Compare Window",
+    "act_report_review": "External Report Review",
     "act_exp_slice": "Export Current Slices",
     "act_exp_ocr_curr": "Export Current OCR Text",
     "act_exp_ocr_all": "Export All OCR Text",

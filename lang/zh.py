@@ -10,6 +10,7 @@ TEXTS = {
     "act_merge": "合并文本文件",
     "act_similarity": "相似度窗口",
     "act_headword_compare": "词头对比窗口",
+    "act_report_review": "外部报告审阅",
     "act_exp_slice": "导出当前页面切图",
     "act_exp_ocr_curr": "导出当前页面OCR文本",
     "act_exp_ocr_all": "导出所有页面OCR文本",

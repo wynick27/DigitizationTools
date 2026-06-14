@@ -23,6 +23,7 @@ from tools.project_manager_ui import ProjectManagerDialog
 from tools.export_manager import ExportManager
 from tools.similarity_tools import SimilarityDialog, calculate_page_similarities, text_similarity
 from tools.headword_compare_tools import HeadwordCompareDialog
+from tools.report_review_tools import ReportReviewDialog
 
 from find_replace import FindReplaceDialog
 from lang.i18n import text_from_config
@@ -1092,6 +1093,7 @@ class MainWindow(QMainWindow):
         self.act_merge.setText(self.get_text("act_merge"))
         self.act_similarity.setText(self.get_text("act_similarity"))
         self.act_headword_compare.setText(self.get_text("act_headword_compare"))
+        self.act_report_review.setText(self.get_text("act_report_review"))
         
         self.act_exp_slice.setText(self.get_text("act_exp_slice"))
         self.act_exp_ocr_curr.setText(self.get_text("act_exp_ocr_curr"))
@@ -1187,6 +1189,14 @@ class MainWindow(QMainWindow):
         self.headword_compare_dialog.raise_()
         self.headword_compare_dialog.activateWindow()
 
+    def show_report_review_dialog(self):
+        if not hasattr(self, "report_review_dialog") or self.report_review_dialog is None:
+            self.report_review_dialog = ReportReviewDialog(self)
+            self.report_review_dialog.destroyed.connect(lambda: setattr(self, "report_review_dialog", None))
+        self.report_review_dialog.show()
+        self.report_review_dialog.raise_()
+        self.report_review_dialog.activateWindow()
+
     def calculate_page_similarities(self):
         return calculate_page_similarities(self.pages_left, self.pages_right_text)
 
@@ -1254,6 +1264,9 @@ class MainWindow(QMainWindow):
         self.act_headword_compare = QAction("词头对比窗口", self)
         self.act_headword_compare.triggered.connect(self.show_headword_compare_dialog)
         self.tools_menu.addAction(self.act_headword_compare)
+        self.act_report_review = QAction("外部报告审阅", self)
+        self.act_report_review.triggered.connect(self.show_report_review_dialog)
+        self.tools_menu.addAction(self.act_report_review)
 
         self.btn_manage = QPushButton("Settings / Manage")
         self.btn_manage.clicked.connect(self.open_project_manager)
@@ -2458,6 +2471,89 @@ class MainWindow(QMainWindow):
             editor.setFocus()
         except Exception:
             pass
+
+    def goto_report_issue(self, row):
+        if not row:
+            return
+
+        side = row.get("side", "left")
+        if side == "right" and not self.is_text_source_selected():
+            self.select_text_source()
+            QApplication.processEvents()
+        candidates = list(row.get("search_candidates") or [])
+        if row.get("headword") and row["headword"] not in candidates:
+            candidates.insert(0, row["headword"])
+
+        page = row.get("page")
+        if page is None:
+            pages = self.pages_right_text if side == "right" else self.pages_left
+            for candidate in candidates:
+                candidate = str(candidate or "").strip()
+                if not candidate:
+                    continue
+                for candidate_page, page_text in pages.items():
+                    if candidate in page_text:
+                        page = candidate_page
+                        break
+                if page is not None:
+                    break
+        if page is None:
+            self.statusBar().showMessage("报告项目没有页码，且未能在文本中找到候选内容。", 5000)
+            return
+
+        self.goto_page(page)
+        editor = self.edit_right if side == "right" else self.edit_left
+        text = editor.toPlainText()
+        match_span = None
+        for candidate in candidates:
+            candidate = str(candidate or "").strip()
+            if not candidate:
+                continue
+            position = text.find(candidate)
+            if position >= 0:
+                match_span = (position, position + len(candidate))
+                break
+
+        if match_span is None:
+            def normalize(value):
+                value = re.sub(r"\{[^{}]*\}", "", value or "")
+                return re.sub(r"[\s・･▶>【】\[\]（）()]+", "", value).casefold()
+
+            targets = [normalize(value) for value in candidates if normalize(str(value or ""))]
+            best = (0.0, None)
+            offset = 0
+            for line in text.splitlines(True):
+                normalized_line = normalize(line)
+                for target in targets:
+                    if target in normalized_line or normalized_line in target:
+                        score = min(len(target), len(normalized_line)) / max(len(target), len(normalized_line), 1)
+                    else:
+                        score = difflib.SequenceMatcher(None, target, normalized_line, autojunk=False).ratio()
+                    if score > best[0]:
+                        best = (score, (offset, offset + len(line.rstrip("\r\n"))))
+                offset += len(line)
+            if best[0] >= 0.42:
+                match_span = best[1]
+
+        if match_span:
+            start_qt = to_qt_pos(text, match_span[0])
+            end_qt = to_qt_pos(text, match_span[1])
+            cursor = editor.textCursor()
+            cursor.setPosition(start_qt)
+            cursor.setPosition(end_qt, QTextCursor.MoveMode.KeepAnchor)
+            editor.setTextCursor(cursor)
+            editor.ensureCursorVisible()
+            editor.setFocus()
+            self.statusBar().showMessage(
+                f"已定位报告项目：第 {page} 页 {row.get('headword', '')}",
+                5000,
+            )
+        else:
+            editor.setFocus()
+            self.statusBar().showMessage(
+                f"已跳到第 {page} 页，但未找到报告中的词头或候选文本。",
+                5000,
+            )
 
     def save_left_data(self):
         path = self.project_config.get('text_path_left')
