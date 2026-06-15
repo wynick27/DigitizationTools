@@ -2481,8 +2481,31 @@ class MainWindow(QMainWindow):
             self.select_text_source()
             QApplication.processEvents()
         candidates = list(row.get("search_candidates") or [])
+        data = row.get("data") or {}
+        is_example_report = (
+            row.get("source_file") == "example_match_report.tsv"
+            or bool(data.get("json_example"))
+        )
+        if is_example_report:
+            example_candidates = []
+            for value in (
+                data.get("best_txt_candidate"),
+                data.get("search_text"),
+            ):
+                value = str(value or "").strip()
+                if not value:
+                    continue
+                japanese = value.split("/", 1)[0].strip()
+                if japanese and japanese not in example_candidates:
+                    example_candidates.append(japanese)
+                if value not in example_candidates:
+                    example_candidates.append(value)
+            candidates = example_candidates + [
+                value for value in candidates
+                if value not in example_candidates and value != row.get("headword")
+            ]
         if row.get("headword") and row["headword"] not in candidates:
-            candidates.insert(0, row["headword"])
+            candidates.append(row["headword"])
 
         page = row.get("page")
         if page is None:
