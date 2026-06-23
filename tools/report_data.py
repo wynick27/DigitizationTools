@@ -14,12 +14,17 @@ HEADWORD_KEYS = ("txt_head", "headword", "word", "entry", "词头", "json_head")
 SIDE_KEYS = ("side", "text_side", "pane")
 SEARCH_KEYS = (
     "search_text",
+    "context",
+    "line_context",
+    "txt_line",
     "txt_head",
     "best_txt_candidate",
     "txt_preview",
     "headword",
     "json_example",
     "json_content",
+    "old_txt_example",
+    "new_txt_example",
     "old",
     "new",
 )
@@ -173,8 +178,6 @@ def write_tool_report(path, rows, source_files=None):
     issues = []
     for row in rows:
         issue = dict(row)
-        # Candidates are reconstructed from the original fields when loading.
-        issue.pop("search_candidates", None)
         issues.append(issue)
     payload = {
         "format": REPORT_FORMAT,

@@ -2486,11 +2486,25 @@ class MainWindow(QMainWindow):
             row.get("source_file") == "example_match_report.tsv"
             or bool(data.get("json_example"))
         )
+        for value in (
+            data.get("search_text"),
+            data.get("context"),
+            data.get("line_context"),
+            data.get("txt_line"),
+            data.get("old_txt_example"),
+            data.get("new_txt_example"),
+            data.get("txt_preview"),
+        ):
+            value = str(value or "").strip()
+            if value and value not in candidates:
+                candidates.append(value)
         if is_example_report:
             example_candidates = []
             for value in (
                 data.get("best_txt_candidate"),
                 data.get("search_text"),
+                data.get("old_txt_example"),
+                data.get("new_txt_example"),
             ):
                 value = str(value or "").strip()
                 if not value:
