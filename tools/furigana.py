@@ -45,6 +45,27 @@ def kata_to_hira(s: str) -> str:
     return s.translate(K2H)
 
 
+def hira_to_kata(s: str) -> str:
+    result = []
+    for ch in s:
+        code = ord(ch)
+        if 0x3041 <= code <= 0x3096:
+            result.append(chr(code + 0x60))
+        else:
+            result.append(ch)
+    return "".join(result)
+
+
+def _display_reading(reading: str, kana_type: str = "hiragana") -> str:
+    if kana_type == "katakana":
+        return hira_to_kata(reading)
+    return reading
+
+
+def _format_ruby(surface: str, reading: str, left_marker: str = "[", right_marker: str = "]") -> str:
+    return f"{surface}{left_marker}{reading}{right_marker}"
+
+
 # ==========================================
 # JMDict-based furigana splitting
 # ==========================================
@@ -164,7 +185,13 @@ def _split_furigana_jmdict(surface: str, kana: str):
 # Regex-based fallback splitting
 # ==========================================
 
-def _split_furigana_regex(orig: str, hira: str) -> str:
+def _split_furigana_regex(
+    orig: str,
+    hira: str,
+    left_marker: str = "[",
+    right_marker: str = "]",
+    kana_type: str = "hiragana",
+) -> str:
     """
     Regex fallback to split interleaved okurigana (e.g. 言い返す -> 言[い]い返[かえ]す).
     Replaces SequenceMatcher which had bugs matching identical kana.
@@ -193,18 +220,24 @@ def _split_furigana_regex(orig: str, hira: str) -> str:
             else:
                 reading = groups[group_idx]
                 group_idx += 1
-                res += f"{text}[{reading}]"
+                res += _format_ruby(text, _display_reading(reading, kana_type), left_marker, right_marker)
         return res
     
     # If regex fails for some reason, return the whole thing
-    return f"{orig}[{hira}]"
+    return _format_ruby(orig, _display_reading(hira, kana_type), left_marker, right_marker)
 
 
 # ==========================================
 # Public API
 # ==========================================
 
-def generate_furigana_string(text: str) -> str:
+def generate_furigana_string(
+    text: str,
+    left_marker: str = "[",
+    right_marker: str = "]",
+    kana_type: str = "hiragana",
+    use_jmdict_split: bool = True,
+) -> str:
     """
     Add furigana annotations to Japanese text using pykakasi for tokenization.
     
@@ -213,7 +246,7 @@ def generate_furigana_string(text: str) -> str:
     - If JMDict is configured, attempts JMDict-based per-character reading splitting.
     - Otherwise uses Regex-based interleaved okurigana mapping logic.
     
-    Output format: 漢字[かんじ]
+    Output format defaults to text[reading].
     """
     if not HAS_KAKASI:
         return text
@@ -230,7 +263,7 @@ def generate_furigana_string(text: str) -> str:
             
         # 1) Try JMDict per-character split
         parts = None
-        if HAS_JMDICT:
+        if use_jmdict_split and HAS_JMDICT:
             parts = _split_furigana_jmdict(orig, hira)
             
         if parts:
@@ -239,11 +272,15 @@ def generate_furigana_string(text: str) -> str:
                 if kata_to_hira(surface) == reading:
                     item_res += surface
                 else:
-                    item_res += f"{surface}[{reading}]"
+                    item_res += _format_ruby(
+                        surface,
+                        _display_reading(reading, kana_type),
+                        left_marker,
+                        right_marker,
+                    )
             result.append(item_res)
         # 2) Fallback to robust Regex block split
         else:
-            result.append(_split_furigana_regex(orig, hira))
+            result.append(_split_furigana_regex(orig, hira, left_marker, right_marker, kana_type))
             
     return "".join(result)
-

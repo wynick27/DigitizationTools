@@ -704,7 +704,7 @@ class FindReplaceDialog(QDialog):
         l_fmt = QFormLayout(grp_fmt)
         self.chk_custom_replace = QCheckBox("Enable Custom Format")
         self.txt_custom_replace = QLineEdit()
-        self.txt_custom_replace.setPlaceholderText(r"e.g. \1[\2] (\1=src, \2=tgt)")
+        self.txt_custom_replace.setPlaceholderText(r"e.g. \1[\2] or \1.1\2.2 (\\ = backslash)")
         l_fmt.addRow(self.chk_custom_replace)
         l_fmt.addRow("Format:", self.txt_custom_replace)
         layout.addWidget(grp_fmt)
@@ -1310,11 +1310,6 @@ class FindReplaceDialog(QDialog):
                 
                 # Verify context match
                 if new_txt[start:end] == orig_t:
-                     if self.chk_custom_replace.isChecked():
-                         fmt = self.txt_custom_replace.text()
-                         if fmt:
-                             repl_t = fmt.replace(r'\1', orig_t).replace(r'\2', repl_t)
-                             
                      new_txt = new_txt[:start] + repl_t + new_txt[end:]
                      count += 1
             
@@ -1428,7 +1423,8 @@ class FindReplaceDialog(QDialog):
             regex_old, regex_new, regex_scope,
             self.chk_diff_insert.isChecked(),
             self.chk_diff_delete.isChecked(),
-            self.chk_diff_replace.isChecked()
+            self.chk_diff_replace.isChecked(),
+            self.txt_custom_replace.text() if self.chk_custom_replace.isChecked() else None
         )
         
         self.diff_worker_thread.progress.connect(self.progress_dialog.setValue)
@@ -1456,6 +1452,12 @@ class FindReplaceDialog(QDialog):
         self.tabs.setVisible(False)
         self.scope_group.setVisible(False)
         self.review_group.setVisible(True)
+        self.review_table.setColumnHidden(0, False)
+        self.review_top_widget.setVisible(True)
+        self.btn_rev_apply.setVisible(True)
+        self.btn_rev_cancel.setText("Cancel Review")
+        self.review_table.setColumnWidth(0, 30)
+        self.review_table.setColumnWidth(4, 400)
         self.review_table.resizeRowsToContents()
         self.status_label.setText(f"Found {len(self.current_review_items)} diff items.")
         

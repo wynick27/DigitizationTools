@@ -63,6 +63,10 @@ DEFAULT_GLOBAL_CONFIG = {
     "replace_history": [],
     "shortcuts_alt": [""] * 10,
     "shortcut_furigana": "Ctrl+Shift+F",
+    "furigana_left_marker": "[",
+    "furigana_right_marker": "]",
+    "furigana_kana_type": "hiragana",
+    "furigana_use_jmdict_split": True,
     "ui_lang": "zh"
 }
 
@@ -1156,7 +1160,13 @@ class MainWindow(QMainWindow):
         if not sel_text.strip(): return
         
         # Process Furigana via extracted tool
-        result_text = generate_furigana_string(sel_text)
+        result_text = generate_furigana_string(
+            sel_text,
+            left_marker=self.global_config.get("furigana_left_marker", "["),
+            right_marker=self.global_config.get("furigana_right_marker", "]"),
+            kana_type=self.global_config.get("furigana_kana_type", "hiragana"),
+            use_jmdict_split=self.global_config.get("furigana_use_jmdict_split", True),
+        )
                 
         cursor.insertText(result_text)
         editor.setTextCursor(cursor)

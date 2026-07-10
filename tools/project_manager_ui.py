@@ -54,6 +54,29 @@ class ProjectManagerDialog(QDialog):
         self.input_furigana.setKeySequence(QKeySequence(g.get("shortcut_furigana", "Ctrl+Shift+F")))
         self.input_furigana.keySequenceChanged.connect(self.save_global)
         layout.addRow("Furigana Shortcut:", self.input_furigana)
+
+        self.input_furigana_left = QLineEdit()
+        self.input_furigana_left.setText(g.get("furigana_left_marker", "["))
+        self.input_furigana_left.textChanged.connect(self.save_global)
+        layout.addRow("Ruby Left Marker:", self.input_furigana_left)
+
+        self.input_furigana_right = QLineEdit()
+        self.input_furigana_right.setText(g.get("furigana_right_marker", "]"))
+        self.input_furigana_right.textChanged.connect(self.save_global)
+        layout.addRow("Ruby Right Marker:", self.input_furigana_right)
+
+        self.combo_furigana_kana = QComboBox()
+        self.combo_furigana_kana.addItem("Hiragana", "hiragana")
+        self.combo_furigana_kana.addItem("Katakana", "katakana")
+        kana_idx = self.combo_furigana_kana.findData(g.get("furigana_kana_type", "hiragana"))
+        self.combo_furigana_kana.setCurrentIndex(kana_idx if kana_idx >= 0 else 0)
+        self.combo_furigana_kana.currentIndexChanged.connect(self.save_global)
+        layout.addRow("Ruby Reading Kana:", self.combo_furigana_kana)
+
+        self.chk_furigana_split = QCheckBox()
+        self.chk_furigana_split.setChecked(bool(g.get("furigana_use_jmdict_split", True)))
+        self.chk_furigana_split.toggled.connect(self.save_global)
+        layout.addRow("Split Readings (JMDict):", self.chk_furigana_split)
         
         alt_texts = g.get("shortcuts_alt", [""] * 10)
         for i in range(10):
@@ -409,6 +432,11 @@ class ProjectManagerDialog(QDialog):
         
         if hasattr(self, 'input_furigana'):
             g["shortcut_furigana"] = self.input_furigana.keySequence().toString()
+        if hasattr(self, 'input_furigana_left'):
+            g["furigana_left_marker"] = self.input_furigana_left.text()
+            g["furigana_right_marker"] = self.input_furigana_right.text()
+            g["furigana_kana_type"] = self.combo_furigana_kana.currentData()
+            g["furigana_use_jmdict_split"] = self.chk_furigana_split.isChecked()
         if hasattr(self, 'inputs_alt'):
             g["shortcuts_alt"] = [le.text() for le in self.inputs_alt]
             

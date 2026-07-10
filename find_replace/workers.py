@@ -3,13 +3,70 @@ import difflib
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
 
+def expand_custom_diff_format(format_text, old_segment, new_segment, old_match=None, new_match=None):
+    r"""Expand custom diff replacement tokens.
+
+    \1 and \2 mean the whole target/source diff segments. \1.N and \2.N
+    reference capture group N from the old/new filter regex match. \\ emits a
+    literal backslash.
+    """
+    result = []
+    i = 0
+    while i < len(format_text):
+        ch = format_text[i]
+        if ch != "\\":
+            result.append(ch)
+            i += 1
+            continue
+
+        if i + 1 >= len(format_text):
+            result.append("\\")
+            i += 1
+            continue
+
+        marker = format_text[i + 1]
+        if marker == "\\":
+            result.append("\\")
+            i += 2
+            continue
+
+        if marker not in ("1", "2"):
+            result.append("\\")
+            result.append(marker)
+            i += 2
+            continue
+
+        segment = old_segment if marker == "1" else new_segment
+        match = old_match if marker == "1" else new_match
+        i += 2
+
+        if i < len(format_text) and format_text[i] == ".":
+            j = i + 1
+            while j < len(format_text) and format_text[j].isdigit():
+                j += 1
+            if j > i + 1:
+                group_num = int(format_text[i + 1:j])
+                try:
+                    group_value = match.group(group_num) if match else ""
+                except IndexError:
+                    group_value = ""
+                result.append(group_value or "")
+                i = j
+                continue
+
+        result.append(segment)
+
+    return "".join(result)
+
+
 class ReviewDiffWorker(QThread):
     progress = pyqtSignal(int)
     finished = pyqtSignal(list, str) # items, msg
     
     def __init__(self, pages, pages_left, pages_right, target_is_left, 
                  regex_old, regex_new, regex_scope,
-                 check_insert, check_delete, check_replace):
+                 check_insert, check_delete, check_replace,
+                 custom_replace_format=None):
         super().__init__()
         self.pages = pages
         self.pages_left = pages_left
@@ -21,6 +78,7 @@ class ReviewDiffWorker(QThread):
         self.chk_insert = check_insert
         self.chk_delete = check_delete
         self.chk_replace = check_replace
+        self.custom_replace_format = custom_replace_format
         
         self.is_running = True
         self.items = []
@@ -78,13 +136,18 @@ class ReviewDiffWorker(QThread):
              old_segment = text_a[i1:i2]
              new_segment = text_b[j1:j2]
             
+             old_match = None
+             new_match = None
+
              # Regex Filters
              if self.regex_old and old_segment:
-                 if not self.regex_old.search(old_segment): continue
+                 old_match = self.regex_old.search(old_segment)
+                 if not old_match: continue
              if self.regex_old and not old_segment: continue
             
              if self.regex_new and new_segment:
-                 if not self.regex_new.search(new_segment): continue
+                 new_match = self.regex_new.search(new_segment)
+                 if not new_match: continue
              if self.regex_new and not new_segment: continue
             
              # Check Scope
@@ -104,7 +167,17 @@ class ReviewDiffWorker(QThread):
              prefix = html.escape(text_a[c_start:i1])
              suffix = html.escape(text_a[i2:c_end])
              seg_old_esc = html.escape(old_segment)
-             seg_new_esc = html.escape(new_segment)
+             replacement_segment = new_segment
+             if self.custom_replace_format:
+                 replacement_segment = expand_custom_diff_format(
+                     self.custom_replace_format,
+                     old_segment,
+                     new_segment,
+                     old_match,
+                     new_match,
+                 )
+
+             seg_new_esc = html.escape(replacement_segment)
              
              style_del = "background-color:#ffcccc; text-decoration:line-through;"
              style_ins = "background-color:#ccffcc;"
@@ -129,7 +202,7 @@ class ReviewDiffWorker(QThread):
                 'col': col,
                 'span': (i1, i2), 
                 'original': old_segment,
-                'new': new_segment,
+                'new': replacement_segment,
                 'context_html': diff_html,
                 'checked': True
              }
