@@ -4,7 +4,7 @@ TEXTS = {
     "menu_export": "Export",
     "menu_lang": "Language",
     "act_find": "Find and Replace",
-    "act_undo_global": "Undo Global Replace",
+    "act_undo_global": "Global Replace History…",
     "act_split": "Split PDF",
     "act_exp_img": "Export PDF Images",
     "act_merge": "Merge Texts",

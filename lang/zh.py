@@ -4,7 +4,7 @@ TEXTS = {
     "menu_export": "导出",
     "menu_lang": "语言",
     "act_find": "查找和替换",
-    "act_undo_global": "撤销全局替换",
+    "act_undo_global": "全局替换历史…",
     "act_split": "拆分PDF",
     "act_exp_img": "导出PDF图片",
     "act_merge": "合并文本文件",

@@ -19,7 +19,7 @@ from PyQt6.QtGui import (
     QTextCursor, QKeySequence, QShortcut
 )
 
-from .models import ReviewTableModel, HtmlDelegate
+from .models import ReviewTableModel, HtmlDelegate, to_qt_pos
 from .workers import ReviewDiffWorker
 from .templates import TemplateManager, TemplateEditorDialog
 
@@ -222,24 +222,22 @@ class FindReplaceDialog(QDialog):
         
     def save_search_history(self):
         """Save current find/replace terms to history"""
-        f_txt = self.cb_find.currentText().strip()
-        r_txt = self.cb_replace.currentText().strip()
+        # 查找和替换内容中的首尾空白可能具有实际意义，必须原样保存。
+        f_txt = self.cb_find.currentText()
+        r_txt = self.cb_replace.currentText()
         
-        f_hist = self.mainwindow.global_config.get("find_history", [])
-        r_hist = self.mainwindow.global_config.get("replace_history", [])
+        f_hist = list(self.mainwindow.global_config.get("find_history", []))
+        r_hist = list(self.mainwindow.global_config.get("replace_history", []))
         
         # Helper to update list
         def update_list(lst, item):
-            if not item: return False
-            changed = False
+            if item == "": return False
             if item in lst:
                 lst.remove(item)
-                changed = True
             lst.insert(0, item)
             # Limit size
             while len(lst) > 20: 
                 lst.pop()
-                changed = True
             return True # Always true if item added
             
         f_changed = update_list(f_hist, f_txt)
@@ -598,6 +596,7 @@ class FindReplaceDialog(QDialog):
         self._count_matches(is_global=True)
 
     def _count_matches(self, is_global):
+        self.save_search_history()
         regex = self._compile_regex_from_ui()
         if not regex: return
         
@@ -696,6 +695,18 @@ class FindReplaceDialog(QDialog):
         self.txt_diff_scope_regex = QLineEdit()
         self.txt_diff_scope_regex.setPlaceholderText(r"Regex scope (e.g. \*\*.*?\*\*)")
         form.addRow("Scope Match:", self.txt_diff_scope_regex)
+
+        scope_mode_widget = QWidget()
+        scope_mode_layout = QHBoxLayout(scope_mode_widget)
+        scope_mode_layout.setContentsMargins(0, 0, 0, 0)
+        self.rb_diff_scope_include = QRadioButton("仅在正则匹配范围内")
+        self.rb_diff_scope_exclude = QRadioButton("仅在正则匹配范围外")
+        self.rb_diff_scope_include.setChecked(True)
+        scope_mode_layout.addWidget(self.rb_diff_scope_include)
+        scope_mode_layout.addWidget(self.rb_diff_scope_exclude)
+        scope_mode_layout.addStretch()
+        scope_mode_widget.setToolTip("选择差异必须位于正则匹配范围内，或排除匹配范围内的差异")
+        form.addRow("Scope Mode:", scope_mode_widget)
         
         layout.addWidget(grp_filter)
         
@@ -780,10 +791,6 @@ class FindReplaceDialog(QDialog):
              QMessageBox.warning(self, "Error", "No rules in template.")
              return
              
-        # Undo Snapshot
-        if is_global:
-            self.mainwindow.push_global_undo(f"Batch: {name}")
-            
         target_dict = None
         pages = []
         
@@ -875,6 +882,16 @@ class FindReplaceDialog(QDialog):
                 return
 
         count_total = 0
+        current_page = None
+        if is_global:
+            self.mainwindow.save_current_page_data()
+            try:
+                current_page = int(self.mainwindow.spin_page.text())
+                if current_page not in pages:
+                    pages.append(current_page)
+            except (TypeError, ValueError):
+                pass
+            self.mainwindow.push_global_undo(f"Batch: {name}")
         
         if not is_global:
             # Local Page: Apply sequentially to editor text
@@ -902,8 +919,13 @@ class FindReplaceDialog(QDialog):
             cursor.endEditBlock()
             
         else:
-            # Global
+            editor_handles_current = (
+                current_page is not None
+                and (self.rb_left.isChecked() or self.mainwindow.is_text_source_selected())
+            )
             for p in pages:
+                if editor_handles_current and p == current_page:
+                    continue
                 if p not in target_dict: continue
                 txt = target_dict[p]
                 
@@ -915,8 +937,23 @@ class FindReplaceDialog(QDialog):
                 if txt != original:
                     target_dict[p] = txt
                     self.mainwindow.mark_page_dirty(p, self.rb_left.isChecked())
-            
-            self.mainwindow.reload_displayed_texts()
+
+            if editor_handles_current:
+                original = editor.toPlainText()
+                current_text = original
+                for cr in compiled_rules:
+                    current_text, n = cr['regex'].subn(cr['func'], current_text)
+                    count_total += n
+                if current_text != original:
+                    cursor = editor.textCursor()
+                    cursor.beginEditBlock()
+                    cursor.select(QTextCursor.SelectionType.Document)
+                    cursor.insertText(current_text)
+                    cursor.endEditBlock()
+                    target_dict[current_page] = editor.toPlainText()
+                    self.mainwindow.mark_page_dirty(current_page, self.rb_left.isChecked())
+
+            self.mainwindow.finalize_global_action(changed=count_total > 0)
             
         self.status_label.setText(f"Batch completed. {count_total} replacements.")
 
@@ -957,9 +994,21 @@ class FindReplaceDialog(QDialog):
         repl_text = self.cb_replace.currentText()
         repl_mode = self.combo_repl_mode.currentText()
         
-        # Snapshot for Undo (if global)
+        page_nums = list(page_nums)
+
+        # Snapshot for Undo (if global). Save the active editor first so the
+        # snapshot and page list include the actual current-page contents.
         if is_global:
+            self.mainwindow.save_current_page_data()
+            try:
+                current_page = int(self.mainwindow.spin_page.text())
+                if current_page not in page_nums:
+                    page_nums.append(current_page)
+            except (TypeError, ValueError):
+                current_page = None
             self.mainwindow.push_global_undo("Replace All")
+        else:
+            current_page = None
 
         repl_func = None
         # Determine replacement string/func
@@ -1026,11 +1075,18 @@ class FindReplaceDialog(QDialog):
             cursor.endEditBlock()
             
         else:
-            # Global - Dict API
+            # Global: keep the current page in the QTextDocument so Ctrl+Z's
+            # existing undo stack survives; update other pages through memory.
             target_dict = self.mainwindow.pages_left if target_is_left else self.mainwindow.pages_right_text
-            
+            editor_handles_current = (
+                current_page is not None
+                and (target_is_left or self.mainwindow.is_text_source_selected())
+            )
+
             for p in page_nums:
                 p_key = int(p) if isinstance(p, str) and p.isdigit() else p
+                if editor_handles_current and p_key == current_page:
+                    continue
                 if p_key not in target_dict: continue
                 
                 txt = target_dict[p_key]
@@ -1041,10 +1097,28 @@ class FindReplaceDialog(QDialog):
                     target_dict[p_key] = new_txt
                     self.mainwindow.mark_page_dirty(p_key, target_is_left)
                     count += n
-            
-            # Reload if current page affected
-            if hasattr(self.mainwindow, 'force_ui_reload'):
-                self.mainwindow.force_ui_reload()
+
+            if editor_handles_current:
+                text = editor.toPlainText()
+                matches = list(regex.finditer(text))
+                if matches:
+                    cursor = editor.textCursor()
+                    cursor.beginEditBlock()
+                    for match in reversed(matches):
+                        try:
+                            replacement = repl_func(match)
+                            start, end = match.span()
+                            cursor.setPosition(start)
+                            cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+                            cursor.insertText(replacement)
+                            count += 1
+                        except Exception:
+                            pass
+                    cursor.endEditBlock()
+                    target_dict[current_page] = editor.toPlainText()
+                    self.mainwindow.mark_page_dirty(current_page, target_is_left)
+
+            self.mainwindow.finalize_global_action(changed=count > 0)
 
         self.status_label.setText(f"Replaced {count} occurrences.")
 
@@ -1108,8 +1182,12 @@ class FindReplaceDialog(QDialog):
 
     def on_review(self, is_global=False, find_only=False):
         # 1. Clear previous
+        self.save_search_history()
         self.current_review_items = []
         self.review_is_global = is_global
+        self.review_target_is_left = self.rb_left.isChecked()
+        if is_global:
+            self.mainwindow.save_current_page_data()
         
         regex = self._compile_regex_from_ui()
         if not regex: return
@@ -1290,10 +1368,14 @@ class FindReplaceDialog(QDialog):
         
         try: curr_p = int(self.mainwindow.spin_page.text())
         except: curr_p = -999
+        target_editor = self.get_target_editor()
+        editor_handles_current = (
+            self.rb_left.isChecked() or self.mainwindow.is_text_source_selected()
+        )
             
         for p_num, items in by_page.items():
-            # Always load from memory since we just saved current page
-            txt = target_dict.get(p_num, "")
+            is_current_target = editor_handles_current and int(p_num) == curr_p
+            txt = target_editor.toPlainText() if is_current_target else target_dict.get(p_num, "")
             
             # Create new text by applying patches
             # Since items are sorted reverse, index shifting is handled?
@@ -1316,13 +1398,15 @@ class FindReplaceDialog(QDialog):
             # Update memory
             target_dict[p_num] = new_txt
             self.mainwindow.mark_page_dirty(p_num, self.rb_left.isChecked())
+            if is_current_target and new_txt != txt:
+                cursor = target_editor.textCursor()
+                cursor.beginEditBlock()
+                cursor.select(QTextCursor.SelectionType.Document)
+                cursor.insertText(new_txt)
+                cursor.endEditBlock()
             
         if self.review_is_global:
-            if hasattr(self.mainwindow, 'force_ui_reload'): self.mainwindow.force_ui_reload()
-        else:
-            # If local review, we might not be in global mode, but still affecting current page
-            # Just reload to be safe and consistent
-            if hasattr(self.mainwindow, 'force_ui_reload'): self.mainwindow.force_ui_reload()
+            self.mainwindow.finalize_global_action(changed=count > 0)
             
         self.close_review()
         self.status_label.setText(f"Applied {count} changes.")
@@ -1386,6 +1470,7 @@ class FindReplaceDialog(QDialog):
         # Implies Source is the OTHER side.
         
         target_is_left = self.rb_left.isChecked()
+        self.review_target_is_left = target_is_left
         target_side = "Left" if target_is_left else "Right"
         
         # 3. Pages
@@ -1424,7 +1509,8 @@ class FindReplaceDialog(QDialog):
             self.chk_diff_insert.isChecked(),
             self.chk_diff_delete.isChecked(),
             self.chk_diff_replace.isChecked(),
-            self.txt_custom_replace.text() if self.chk_custom_replace.isChecked() else None
+            self.txt_custom_replace.text() if self.chk_custom_replace.isChecked() else None,
+            scope_exclude=self.rb_diff_scope_exclude.isChecked(),
         )
         
         self.diff_worker_thread.progress.connect(self.progress_dialog.setValue)
@@ -1472,8 +1558,13 @@ class FindReplaceDialog(QDialog):
             item = self.current_review_items[row]
             page_num = item.get('page_num')
             span = item.get('span')
-            
-            if page_num:
+
+            target_is_left = getattr(self, 'review_target_is_left', self.rb_left.isChecked())
+            if not target_is_left and not self.mainwindow.is_text_source_selected():
+                self.mainwindow.select_text_source()
+                QApplication.processEvents()
+
+            if page_num is not None:
                 # 1. Switch Page
                 if str(page_num) != self.mainwindow.spin_page.text():
                     self.mainwindow.spin_page.setText(str(page_num))
@@ -1484,22 +1575,41 @@ class FindReplaceDialog(QDialog):
             
             # 2. Scroll to Span
             if span:
-                editor = self.get_target_editor()
+                editor = self.mainwindow.edit_left if target_is_left else self.mainwindow.edit_right
                 if not editor: return
-                
-                # Verify length matching (safety)
-                # Text should be loaded by jump_page
-                
+
                 cursor = editor.textCursor()
-                start, end = span
-                
+                text = editor.toPlainText()
+                expected_start, expected_end = span
+                start = max(0, min(int(expected_start), len(text)))
+                end = max(start, min(int(expected_end), len(text)))
+                original = item.get('original', '')
+
+                # Review 生成后文本可能变化；原位置失效时选择距离旧位置最近的原文。
+                if original and text[start:end] != original:
+                    positions = [m.start() for m in re.finditer(re.escape(original), text)]
+                    if positions:
+                        start = min(positions, key=lambda pos: abs(pos - expected_start))
+                        end = start + len(original)
+                    else:
+                        self.status_label.setText("定位失败：当前页面已找不到 Review 中的原文。")
+                        return
+
+                start_qt = to_qt_pos(text, start)
+                end_qt = to_qt_pos(text, end)
                 try:
-                    cursor.setPosition(start)
-                    cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+                    cursor.setPosition(start_qt)
+                    cursor.setPosition(end_qt, QTextCursor.MoveMode.KeepAnchor)
                     editor.setTextCursor(cursor)
                     editor.ensureCursorVisible()
                     editor.setFocus()
-                except: pass # In case text changed or index OOB
+                    editor.highlight_line_at_index(start_qt)
+                    self.mainwindow.request_highlight_other(editor, start_qt)
+                    self.status_label.setText(
+                        f"已定位：第 {page_num} 页，第 {item.get('line', '')} 行"
+                    )
+                except Exception as exc:
+                    self.status_label.setText(f"定位失败：{exc}")
 
     def reset_review_ui(self):
         """Reset the review UI to initial search state"""
@@ -1527,6 +1637,7 @@ class FindReplaceDialog(QDialog):
         return flags
 
     def on_find_next(self):
+        self.save_search_history()
         editor = self.get_target_editor()
         
         # Use centralized regex compilation to handle Translate/Empty logic
@@ -1593,6 +1704,7 @@ class FindReplaceDialog(QDialog):
             self.status_label.setText("Not found.")
 
     def on_replace(self):
+        self.save_search_history()
         editor = self.get_target_editor()
         cursor = editor.textCursor()
         if not cursor.hasSelection():
@@ -1605,7 +1717,6 @@ class FindReplaceDialog(QDialog):
         # But we need to calculate replacement string.
         
         repl_text = self.cb_replace.currentText()
-        if self.cb_replace.findText(repl_text) == -1: self.cb_replace.addItem(repl_text)
         
         selected_text = cursor.selectedText()
         new_text = repl_text

@@ -66,7 +66,7 @@ class ReviewDiffWorker(QThread):
     def __init__(self, pages, pages_left, pages_right, target_is_left, 
                  regex_old, regex_new, regex_scope,
                  check_insert, check_delete, check_replace,
-                 custom_replace_format=None):
+                 custom_replace_format=None, scope_exclude=False):
         super().__init__()
         self.pages = pages
         self.pages_left = pages_left
@@ -75,6 +75,7 @@ class ReviewDiffWorker(QThread):
         self.regex_old = regex_old
         self.regex_new = regex_new
         self.regex_scope = regex_scope
+        self.scope_exclude = scope_exclude
         self.chk_insert = check_insert
         self.chk_delete = check_delete
         self.chk_replace = check_replace
@@ -153,12 +154,13 @@ class ReviewDiffWorker(QThread):
              # Check Scope
              if self.regex_scope:
                  # Check if the diff overlap with any scope match
-                 in_scope = False
-                 for (start, end) in scope_spans:
-                     if not (i2 < start or i1 > end): # Overlaps
-                         in_scope = True
-                         break
-                 if not in_scope:
+                 if i1 == i2:  # Insert: use its insertion point.
+                     in_scope = any(start <= i1 < end for start, end in scope_spans)
+                 else:
+                     in_scope = any(i1 < end and start < i2 for start, end in scope_spans)
+                 if self.scope_exclude and in_scope:
+                     continue
+                 if not self.scope_exclude and not in_scope:
                      continue
             
              # Context

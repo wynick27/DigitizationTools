@@ -9,7 +9,8 @@ import time
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QTextEdit, QPlainTextEdit, QLabel, QPushButton, QSplitter, QFileDialog,
                              QMessageBox, QGraphicsView, QGraphicsScene, 
-                             QGraphicsRectItem, QLineEdit, QSpinBox, QToolBar, QComboBox, QCheckBox,)
+                             QGraphicsRectItem, QLineEdit, QSpinBox, QToolBar, QComboBox, QCheckBox,
+                             QDialog, QListWidget)
 from PyQt6.QtGui import (QTextCursor, QColor, QSyntaxHighlighter, QTextCharFormat, QTextFormat,
                          QAction, QPixmap, QImage, QPainter, QPen, QFont, QTextOption)
 from PyQt6.QtWidgets import QProgressBar
@@ -458,7 +459,7 @@ class DiffTextEdit(QPlainTextEdit):
         cursor.setPosition(idx)
         
         selection = QTextEdit.ExtraSelection()
-        selection.format.setBackground(QColor("#FFFFAA")) # 淡黄色高亮
+        selection.format.setBackground(QColor("#FFFFAA")) # 淡黄色行高亮
         fmt = selection.format
         fmt.setProperty(QTextFormat.Property.FullWidthSelection, True)
         selection.format = fmt
@@ -594,19 +595,26 @@ class DiffTextEdit(QPlainTextEdit):
 # ==========================================
 
 class ImageCanvas(QGraphicsView):
-    bbox_clicked = pyqtSignal(int)
+    bbox_clicked = pyqtSignal(int, int)  # OCR 块索引、块内字符偏移
     def __init__(self):
         super().__init__()
         self.scene = QGraphicsScene()
         self.setScene(self.scene)
         #self.setRenderHint(QPixmap.TransformationMode.SmoothTransformation)
         self.scale_factor = 1.0
+        self.bboxes_visible = True
+        self.bbox_items = []
+        self.highlight_items = []
+        self.bbox_click_targets = []
         # 拖拽相关
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
 
     def load_content(self, pixmap, ocr_data=None):
         self.scene.clear()
         self.highlight_item = None # Fix: Reset C++ object wrapper
+        self.bbox_items = []
+        self.highlight_items = []
+        self.bbox_click_targets = []
         if pixmap:
             self.scene.addPixmap(pixmap)
             self.setSceneRect(0, 0, pixmap.width(), pixmap.height())
@@ -636,7 +644,8 @@ class ImageCanvas(QGraphicsView):
         
     def draw_bboxes(self, ocr_data):
         pen = QPen(QColor(255, 0, 0, 200))
-        pen.setWidth(2)
+        pen.setWidth(3)
+        pen.setCosmetic(True)  # 缩放图片时保持固定的屏幕线宽
         
         for i, item in enumerate(ocr_data):
             # 兼容 PaddleOCR 格式
@@ -665,17 +674,54 @@ class ImageCanvas(QGraphicsView):
             rect.setPen(pen)
             rect.setToolTip(text) # 鼠标悬停显示文字
             rect.setData(0, i)
+            rect.setVisible(self.bboxes_visible)
+            self.bbox_items.append(rect)
             self.scene.addItem(rect)
 
+            area = max(0.0, w) * max(0.0, h)
+            self.bbox_click_targets.append((3, area, i, 0, (x, y, w, h)))
+            if isinstance(item, dict):
+                priority = {'char': 0, 'word': 1, 'line': 2}
+                for sub in item.get('sub_items') or []:
+                    sub_bbox = self.normalize_bbox_for_scene(
+                        sub.get('bbox'),
+                        sub.get('bbox_coordinate_type') or item.get('bbox_coordinate_type'),
+                    )
+                    if not sub_bbox:
+                        continue
+                    sx1, sy1, sx2, sy2 = sub_bbox
+                    sw, sh = sx2 - sx1, sy2 - sy1
+                    if sw <= 0 or sh <= 0:
+                        continue
+                    level = sub.get('level') or 'block'
+                    self.bbox_click_targets.append((
+                        priority.get(level, 3),
+                        sw * sh,
+                        i,
+                        int(sub.get('start', 0) or 0),
+                        (sx1, sy1, sw, sh),
+                    ))
+
+    def set_bboxes_visible(self, visible):
+        """显示或隐藏普通 OCR 框及当前定位框。"""
+        self.bboxes_visible = bool(visible)
+        for item in self.bbox_items:
+            item.setVisible(self.bboxes_visible)
+        for item in self.highlight_items:
+            item.setVisible(self.bboxes_visible)
+
     def mousePressEvent(self, event):
-        if (event.modifiers() & Qt.KeyboardModifier.ShiftModifier) and (event.button() == Qt.MouseButton.LeftButton):
-             items = self.items(event.pos())
-             for item in items:
-                 idx = item.data(0)
-                 if idx is not None:
-                     self.bbox_clicked.emit(idx)
-                     event.accept()
-                     return
+        if (event.modifiers() & Qt.KeyboardModifier.ControlModifier) and (event.button() == Qt.MouseButton.LeftButton):
+             scene_pos = self.mapToScene(event.pos())
+             matches = []
+             for priority, area, block_idx, local_offset, (x, y, w, h) in self.bbox_click_targets:
+                 if x <= scene_pos.x() <= x + w and y <= scene_pos.y() <= y + h:
+                     matches.append((priority, area, block_idx, local_offset))
+             if matches:
+                 _priority, _area, block_idx, local_offset = min(matches)
+                 self.bbox_clicked.emit(block_idx, local_offset)
+                 event.accept()
+                 return
         super().mousePressEvent(event)
         
     def wheelEvent(self, event):
@@ -699,22 +745,55 @@ class ImageCanvas(QGraphicsView):
         self.ensureVisible(x, y, w, h, 50, 50) # margin 50
 
     def set_highlight_bbox(self, x, y, w, h):
-        """设置高亮矩形 (蓝色)"""
-        # 移除旧的 highlight
-        if hasattr(self, 'highlight_item') and self.highlight_item:
+        """设置单个定位矩形。"""
+        self.set_highlight_bboxes([(x, y, w, h, 'block')])
+
+    def set_highlight_bboxes(self, bboxes, ensure_visible=True):
+        """同时显示字符/词及其所属行的定位框。"""
+        for item in getattr(self, 'highlight_items', []):
             try:
-                self.scene.removeItem(self.highlight_item)
+                self.scene.removeItem(item)
             except RuntimeError:
                 pass # Already deleted by C++
-            self.highlight_item = None
-            
-        if w > 0 and h > 0:
-            pen = QPen(QColor(0, 0, 255, 200)) # Blue
-            pen.setWidth(3)
-            self.highlight_item = QGraphicsRectItem(x, y, w, h)
-            self.highlight_item.setPen(pen)
-            self.highlight_item.setZValue(10) # Top layer
-            self.scene.addItem(self.highlight_item)
+        self.highlight_items = []
+        self.highlight_item = None
+
+        valid_bboxes = [bbox for bbox in bboxes if bbox[2] > 0 and bbox[3] > 0]
+        colors = {
+            'char': QColor(0, 180, 0, 220),       # 绿色：字符级
+            'word': QColor(255, 140, 0, 220),     # 橙色：词级
+            'line': QColor(0, 102, 255, 210),     # 蓝色：行级
+            'block': QColor(0, 102, 255, 210),    # 蓝色：无细粒度回退框
+        }
+        z_values = {'char': 13, 'word': 12, 'line': 11, 'block': 11}
+        for bbox in valid_bboxes:
+            x, y, w, h = bbox[:4]
+            level = bbox[4] if len(bbox) > 4 else 'block'
+            pen = QPen(colors.get(level, colors['block']))
+            pen.setWidth(4)
+            pen.setCosmetic(True)  # 定位框始终比普通 OCR 框更醒目
+            item = QGraphicsRectItem(x, y, w, h)
+            item.setPen(pen)
+            level_names = {'char': '字符级', 'word': '词级', 'line': '行级', 'block': '行/块级'}
+            item.setToolTip(f"当前定位：{level_names.get(level, '块级')}")
+            item.setZValue(z_values.get(level, 11))
+            item.setVisible(self.bboxes_visible)
+            self.scene.addItem(item)
+            self.highlight_items.append(item)
+        if self.highlight_items:
+            self.highlight_item = self.highlight_items[0]
+        if valid_bboxes and ensure_visible:
+            # 滚动位置优先保证所属整行可见；细粒度框仍照常绘制。
+            navigation_bbox = next(
+                (bbox for bbox in valid_bboxes if len(bbox) > 4 and bbox[4] == 'line'),
+                None,
+            )
+            if navigation_bbox is None:
+                navigation_bbox = next(
+                    (bbox for bbox in valid_bboxes if len(bbox) > 4 and bbox[4] == 'block'),
+                    valid_bboxes[0],
+                )
+            x, y, w, h = navigation_bbox[:4]
             self.ensure_visible_bbox(x, y, w, h)
 
 
@@ -962,6 +1041,64 @@ class FileHeaderWidget(QWidget):
 # 2.5 Config & Templates & Workers
 # ==========================================
 
+class GlobalReplaceHistoryDialog(QDialog):
+    def __init__(self, main_window):
+        super().__init__(main_window)
+        self.main_window = main_window
+        self.setWindowTitle("全局替换历史")
+        self.resize(620, 420)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("选择一个状态进行恢复；撤销和重做也会在此时间线中移动。"))
+        self.history_list = QListWidget()
+        self.history_list.itemDoubleClicked.connect(lambda _item: self.restore_selected())
+        layout.addWidget(self.history_list)
+
+        buttons = QHBoxLayout()
+        self.btn_undo = QPushButton("撤销")
+        self.btn_redo = QPushButton("重做")
+        self.btn_restore = QPushButton("恢复到选中状态")
+        btn_close = QPushButton("关闭")
+        self.btn_undo.clicked.connect(self.undo)
+        self.btn_redo.clicked.connect(self.redo)
+        self.btn_restore.clicked.connect(self.restore_selected)
+        btn_close.clicked.connect(self.close)
+        buttons.addWidget(self.btn_undo)
+        buttons.addWidget(self.btn_redo)
+        buttons.addStretch()
+        buttons.addWidget(self.btn_restore)
+        buttons.addWidget(btn_close)
+        layout.addLayout(buttons)
+        self.refresh()
+
+    def refresh(self):
+        self.history_list.clear()
+        history = self.main_window.global_undo_stack
+        current = self.main_window.global_history_index
+        for index, snapshot in enumerate(history):
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(snapshot.get('time', 0)))
+            marker = "  ← 当前" if index == current else ""
+            self.history_list.addItem(f"{stamp}  {snapshot.get('desc', '全局状态')}{marker}")
+        if 0 <= current < self.history_list.count():
+            self.history_list.setCurrentRow(current)
+        self.btn_undo.setEnabled(current > 0)
+        self.btn_redo.setEnabled(0 <= current < len(history) - 1)
+        self.btn_restore.setEnabled(bool(history))
+
+    def restore_selected(self):
+        row = self.history_list.currentRow()
+        if row >= 0 and self.main_window.restore_global_history_index(row):
+            self.refresh()
+
+    def undo(self):
+        if self.main_window.undo_global():
+            self.refresh()
+
+    def redo(self):
+        if self.main_window.redo_global():
+            self.refresh()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1005,7 +1142,10 @@ class MainWindow(QMainWindow):
         self._is_updating_diff = False # Recursion Guard
         
         # Global Undo Stack (for Find/Replace)
-        self.global_undo_stack = [] 
+        self.global_undo_stack = []
+        self.global_history_index = -1
+        self._pending_global_description = None
+        self.global_history_dialog = None
         self.find_replace_dialog = None
         self.last_manual_edit_time = 0
         self.current_loaded_page = None # Track actual loaded page index
@@ -1249,8 +1389,8 @@ class MainWindow(QMainWindow):
         self.act_find.triggered.connect(self.show_find_replace)
         self.edit_menu.addAction(self.act_find)
         
-        self.act_undo_global = QAction("Undo Global Replace", self)
-        self.act_undo_global.triggered.connect(self.undo_global)
+        self.act_undo_global = QAction("Global Replace History", self)
+        self.act_undo_global.triggered.connect(self.show_global_replace_history)
         self.edit_menu.addAction(self.act_undo_global)
         
         self.tools_menu = self.menubar.addMenu("Tools (实用工具)")
@@ -1307,7 +1447,7 @@ class MainWindow(QMainWindow):
         self.combo_source.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.combo_source.setMinimumContentsLength(24)
         self.combo_source.addItem("Text File B", {"type": "text", "candidate_index": 0})
-        self.combo_source.currentIndexChanged.connect(lambda: self.load_current_page())
+        self.combo_source.currentIndexChanged.connect(self.on_source_changed)
         toolbar.addWidget(self.combo_source)
         
         toolbar.addSeparator()
@@ -1322,6 +1462,16 @@ class MainWindow(QMainWindow):
         self.cb_word_wrap.setChecked(True) # Default On
         self.cb_word_wrap.toggled.connect(self.toggle_word_wrap)
         toolbar.addWidget(self.cb_word_wrap)
+
+        self.cb_show_bboxes = QCheckBox("定位框")
+        self.cb_show_bboxes.setChecked(True)
+        self.cb_show_bboxes.setToolTip(
+            "显示/隐藏图片上的 OCR 定位框\n"
+            "蓝色：行/块级；橙色：词级；绿色：字符级"
+        )
+        # image_view 在主布局阶段创建，因此在信号触发时再解析它。
+        self.cb_show_bboxes.toggled.connect(lambda visible: self.image_view.set_bboxes_visible(visible))
+        toolbar.addWidget(self.cb_show_bboxes)
         
         toolbar.addSeparator()
         self.lbl_engine = QLabel(" OCR Engine: ")
@@ -1637,6 +1787,78 @@ class MainWindow(QMainWindow):
         data = self.combo_source.currentData() if hasattr(self, "combo_source") else None
         return isinstance(data, dict) and data.get("type") == "text"
 
+    @staticmethod
+    def ocr_source_identity(source_data):
+        """跨页识别同一 OCR 引擎/模型，忽略结果文件名中的页码。"""
+        if not isinstance(source_data, dict) or source_data.get("type") != "ocr":
+            return None
+        filename = os.path.splitext(os.path.basename(source_data.get("path", "")))[0]
+        suffix = re.sub(r"^(?:page_)?\d+(?:_|$)", "", filename, count=1, flags=re.I)
+        return (
+            canonical_engine_id(source_data.get("engine_id", "")),
+            suffix.lower(),
+            bool(source_data.get("legacy")),
+        )
+
+    @staticmethod
+    def source_data_matches(left, right):
+        if not isinstance(left, dict) or not isinstance(right, dict):
+            return left == right
+        if left.get("type") != right.get("type"):
+            return False
+        if left.get("type") == "text":
+            return left.get("candidate_index", 0) == right.get("candidate_index", 0)
+        return left.get("path") == right.get("path")
+
+    def restore_source_selection(self, source_data):
+        self.combo_source.blockSignals(True)
+        try:
+            for index in range(self.combo_source.count()):
+                if self.source_data_matches(self.combo_source.itemData(index), source_data):
+                    self.combo_source.setCurrentIndex(index)
+                    break
+        finally:
+            self.combo_source.blockSignals(False)
+
+    def on_source_changed(self, _index):
+        """切换右侧数据源前处理当前文本的未保存修改。"""
+        if getattr(self, '_is_loading', False):
+            return
+        new_source = self.combo_source.currentData()
+        old_source = getattr(self, 'last_loaded_source_data', None)
+        if self.source_data_matches(old_source, new_source):
+            return
+
+        self.save_current_page_data()
+        if isinstance(old_source, dict) and old_source.get('type') == 'text':
+            old_candidate = int(old_source.get('candidate_index', 0) or 0)
+            if self.dirty_pages_right.get(old_candidate):
+                reply = QMessageBox.question(
+                    self,
+                    "保存右侧文本",
+                    f"{self.get_right_candidate_label(old_candidate)} 有未保存的修改，切换前是否保存？",
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.No
+                    | QMessageBox.StandardButton.Cancel,
+                )
+                if reply == QMessageBox.StandardButton.Cancel:
+                    self.restore_source_selection(old_source)
+                    return
+                if reply == QMessageBox.StandardButton.Yes:
+                    if not self.save_right_data(old_candidate, force=True):
+                        self.restore_source_selection(old_source)
+                        return
+                else:
+                    path = self.right_text_candidates[old_candidate].get('path', '')
+                    self.right_candidate_pages[old_candidate] = read_text_to_pages(path)
+                    self.dirty_pages_right.setdefault(old_candidate, set()).clear()
+                    if old_candidate == getattr(self, 'current_right_candidate_index', 0):
+                        self.pages_right_text = self.right_candidate_pages[old_candidate]
+                    # 防止 load_current_page 再把编辑器里的旧内容写回缓存。
+                    self.last_loaded_source = "Discarded Text File B"
+
+        self.load_current_page()
+
     def select_text_source(self, candidate_index=None):
         candidate_index = getattr(self, "current_right_candidate_index", 0) if candidate_index is None else candidate_index
         for i in range(self.combo_source.count()):
@@ -1693,11 +1915,13 @@ class MainWindow(QMainWindow):
     def refresh_ocr_source_options(self, page_num):
         current_text = self.combo_source.currentText() if hasattr(self, "combo_source") else "Text File B"
         current_path = None
+        current_ocr_identity = None
         current_candidate = getattr(self, "current_right_candidate_index", 0)
         current_data = self.combo_source.currentData() if hasattr(self, "combo_source") else None
         if isinstance(current_data, dict):
             if current_data.get("type") == "ocr":
                 current_path = current_data.get("path")
+                current_ocr_identity = self.ocr_source_identity(current_data)
             elif current_data.get("type") == "text":
                 current_candidate = current_data.get("candidate_index", current_candidate)
 
@@ -1734,6 +1958,13 @@ class MainWindow(QMainWindow):
                 if isinstance(data, dict) and data.get("type") == "ocr" and data.get("path") == current_path:
                     target_idx = i
                     break
+            else:
+                # 页码变化后路径会变化；若新页存在同一 OCR 来源则保持选择。
+                for i in range(self.combo_source.count()):
+                    data = self.combo_source.itemData(i)
+                    if self.ocr_source_identity(data) == current_ocr_identity:
+                        target_idx = i
+                        break
         elif isinstance(current_data, dict) and current_data.get("type") == "text":
             for i in range(self.combo_source.count()):
                 data = self.combo_source.itemData(i)
@@ -1890,6 +2121,7 @@ class MainWindow(QMainWindow):
             
             # Record last loaded source
             self.last_loaded_source = "OCR Results" if is_ocr_mode else "Text File B"
+            self.last_loaded_source_data = dict(source_data) if isinstance(source_data, dict) else source_data
 
         finally:
             self._is_loading = False
@@ -2290,10 +2522,7 @@ class MainWindow(QMainWindow):
 
     def request_highlight_other(self, source_editor, idx):
         """根据当前光标位置，高亮另一侧对应位置"""
-        # 1. 清除本侧高亮 (避免双方都有黄色条，只保留光标在当前侧，高亮在另一侧)
-        source_editor.clear_highlight()
-        
-        # 2. 确定方向
+        # 当前侧高亮由光标处理函数设置，这里保留它并同时高亮映射侧。
         is_left_source = (source_editor == self.edit_left)
         target_editor = self.edit_right if is_left_source else self.edit_left
         
@@ -2333,54 +2562,75 @@ class MainWindow(QMainWindow):
         
         target_ocr_idx = -1
         
-        # 1. 确定 Mapping Source
-        if editor == self.edit_left:
-             # Use ocr_diff_opcodes (Left -> OCR)
-             opcodes = getattr(self, 'ocr_diff_opcodes', [])
-             
-             # Convert Qt Index -> Py Index
-             text = editor.toPlainText()
-             src_py_idx = to_py_pos(text, idx)
-             
-             # Map src_py_idx to ocr_idx
-             for tag, i1, i2, j1, j2 in opcodes:
-                 if i1 <= src_py_idx <= i2:
-                     if tag == 'equal':
-                         target_ocr_idx = j1 + (src_py_idx - i1)
-                         if target_ocr_idx > j2: target_ocr_idx = j2
-                     else:
-                         target_ocr_idx = j1
-                     break
+        # 1. 先统一映射到左侧文本索引，再由左侧映射到 OCR 索引。
+        src_py_idx = to_py_pos(editor.toPlainText(), idx)
+        left_py_idx = src_py_idx
+        if editor == self.edit_right:
+            left_py_idx = -1
+            for tag, i1, i2, j1, j2 in getattr(self.edit_left, 'diff_opcodes', []):
+                if j1 <= src_py_idx <= j2:
+                    left_py_idx = i1 + (src_py_idx - j1) if tag == 'equal' else i1
+                    left_py_idx = min(left_py_idx, i2)
+                    break
+
+        if left_py_idx >= 0:
+            for tag, i1, i2, j1, j2 in getattr(self, 'ocr_diff_opcodes', []):
+                if i1 <= left_py_idx <= i2:
+                    target_ocr_idx = j1 + (left_py_idx - i1) if tag == 'equal' else j1
+                    target_ocr_idx = min(target_ocr_idx, j2)
+                    break
         
         # 2. Find BBox for target_ocr_idx
         if target_ocr_idx >= 0:
-            bbox = self.find_ocr_bbox_for_index(target_ocr_idx)
-            if bbox:
-                x1, y1, x2, y2 = bbox
-                self.image_view.set_highlight_bbox(x1, y1, x2 - x1, y2 - y1)
+            entries = self.find_ocr_bbox_entries_for_index(target_ocr_idx)
+            if entries:
+                self.image_view.set_highlight_bboxes(
+                    [(x1, y1, x2 - x1, y2 - y1, level) for level, (x1, y1, x2, y2) in entries]
+                )
                 return
 
     def normalize_display_bbox(self, bbox, coordinate_type=None):
         return self.image_view.normalize_bbox_for_scene(bbox, coordinate_type)
 
     def find_ocr_bbox_for_index(self, ocr_idx):
+        bboxes = self.find_ocr_bboxes_for_index(ocr_idx)
+        return bboxes[0] if bboxes else None
+
+    def find_ocr_bboxes_for_index(self, ocr_idx):
+        return [bbox for _level, bbox in self.find_ocr_bbox_entries_for_index(ocr_idx)]
+
+    def find_ocr_bbox_entries_for_index(self, ocr_idx):
         if not hasattr(self, 'ocr_char_map'):
-            return None
+            return []
         for mapping in self.ocr_char_map:
             start = mapping.get('start_index', 0)
             end = mapping.get('end_index', 0)
             if start <= ocr_idx <= end + 1:
                 local_idx = max(0, min(ocr_idx - start, max(0, end - start)))
-                for sub in mapping.get('sub_items') or []:
-                    if sub.get('start', 0) <= local_idx <= sub.get('end', 0):
+                # 同一字符可能同时落在 line/word/char 中，优先使用最细粒度。
+                priority = {'char': 0, 'word': 1, 'line': 2}
+                sub_items = sorted(
+                    mapping.get('sub_items') or [],
+                    key=lambda sub: priority.get(sub.get('level'), 3),
+                )
+                matches = []
+                for sub in sub_items:
+                    sub_start = sub.get('start', 0)
+                    sub_end = sub.get('end', sub_start)
+                    if sub_start <= local_idx < sub_end:
                         bbox = self.normalize_display_bbox(
                             sub.get('bbox'),
                             sub.get('bbox_coordinate_type') or mapping.get('bbox_coordinate_type'),
                         )
                         if bbox:
-                            return bbox
-                return self.normalize_display_bbox(mapping.get('bbox'), mapping.get('bbox_coordinate_type'))
-        return None
+                            level = sub.get('level') or 'block'
+                            matches.append((priority.get(level, 3), level, bbox))
+                if matches:
+                    # 最细框用于滚动定位，同时保留 word/line 等所属层级框。
+                    return [(level, bbox) for _priority, level, bbox in sorted(matches, key=lambda item: item[0])]
+                block_bbox = self.normalize_display_bbox(mapping.get('bbox'), mapping.get('bbox_coordinate_type'))
+                return [('block', block_bbox)] if block_bbox else []
+        return []
 
     def _handle_right_editor_ocr_scroll(self, editor, idx):
         # New Logic: Char based mapping using to_py_pos and ocr_char_map
@@ -2389,10 +2639,11 @@ class MainWindow(QMainWindow):
         
         if not hasattr(self, 'ocr_char_map'): return
         
-        bbox = self.find_ocr_bbox_for_index(py_idx)
-        if bbox:
-            x1, y1, x2, y2 = bbox
-            self.image_view.set_highlight_bbox(x1, y1, x2 - x1, y2 - y1)
+        entries = self.find_ocr_bbox_entries_for_index(py_idx)
+        if entries:
+            self.image_view.set_highlight_bboxes(
+                [(x1, y1, x2 - x1, y2 - y1, level) for level, (x1, y1, x2, y2) in entries]
+            )
             return
 
     def on_cursor_left(self):
@@ -2400,6 +2651,7 @@ class MainWindow(QMainWindow):
         self._is_syncing_cursor = True
         try:
             idx = self.edit_left.textCursor().position()
+            self.edit_left.highlight_line_at_index(idx)
             self.request_highlight_other(self.edit_left, idx)
             # 增加：检查左侧光标对应的 BBox
             if not self._is_navigating_from_image:
@@ -2412,6 +2664,7 @@ class MainWindow(QMainWindow):
         self._is_syncing_cursor = True
         try:
             idx = self.edit_right.textCursor().position()
+            self.edit_right.highlight_line_at_index(idx)
             self.request_highlight_other(self.edit_right, idx)
             if not self._is_navigating_from_image:
                  self.check_auto_scroll_bbox(self.edit_right, idx)
@@ -2619,7 +2872,7 @@ class MainWindow(QMainWindow):
     def save_right_data(self, candidate_index=None, force=False):
         if not force and not self.is_text_source_selected():
             QMessageBox.warning(self, "Error", "Right side is not a text file.")
-            return
+            return False
 
         if candidate_index is None:
             candidate_index = getattr(self, "current_right_candidate_index", 0)
@@ -2641,6 +2894,8 @@ class MainWindow(QMainWindow):
             self.dirty_pages_right.get(candidate_index, set()).clear()
             QMessageBox.information(self, "保存", f"Right data saved to {path}")
             self.config_manager.save()
+            return True
+        return False
 
     def save_all_dirty_right_data(self):
         for idx, pages in list(self.dirty_pages_right.items()):
@@ -2741,7 +2996,11 @@ class MainWindow(QMainWindow):
         worker.project_name = self.project_config.get("name") # Tag with project name
         worker.progress.connect(self.on_ocr_progress)
         worker.page_done.connect(self.on_ocr_page_done)
-        worker.finished.connect(self.on_ocr_finished)
+        # 显式捕获 worker，避免页面切换后依赖 QObject.sender() 丢失任务上下文。
+        worker.finished.connect(
+            lambda success, msg, completed_worker=worker:
+                self.on_ocr_finished(success, msg, completed_worker)
+        )
         
         self.ocr_thread = worker
         self.ocr_thread.start()
@@ -2758,48 +3017,44 @@ class MainWindow(QMainWindow):
         """Slot for accurate page-level progress bar updates."""
         self.progress_bar.setValue(done)
 
-    def on_ocr_finished(self, success, msg):
-        worker = self.sender()
-        if not worker: return
-        
-        is_current_project = (getattr(worker, 'project_name', None) == self.project_config.get("name"))
+    def on_ocr_finished(self, success, msg, worker=None):
+        worker = worker or self.sender() or getattr(self, 'ocr_thread', None)
+        if not worker:
+            return
 
-        if is_current_project:
-            QApplication.restoreOverrideCursor()
-            self.statusBar().showMessage(msg, 5000)
-            
-            # Reset Batch UI
+        is_current_project = (getattr(worker, 'project_name', None) == self.project_config.get("name"))
+        is_active_worker = getattr(self, 'ocr_thread', None) is worker
+
+        # OCR 状态属于任务而不是启动任务时所在的页面，切页后也必须复位。
+        if is_active_worker:
             if hasattr(self, 'btn_batch'):
                 self.btn_batch.setText("OCR所有缺失页面")
                 self.btn_batch.setEnabled(True)
             self.progress_bar.setVisible(False)
-        else:
-            # Background completion for other project
+            self.ocr_thread = None
+
+        if worker.mode == 'single':
+            QApplication.restoreOverrideCursor()
+
+        if not is_current_project:
             print(f"Background OCR finished for {getattr(worker, 'project_name', 'Unknown')}")
-            return # Do not update UI
-        
+            return
+
+        self.statusBar().showMessage(msg, 5000)
         if success:
             if worker.mode == 'single':
-                # Reload current page
-                # Export methods removed and delegated to tools.export_manager.ExportManager
+                # 只刷新当前正在浏览的页面，不强制跳回任务启动页。
                 self._suppress_next_load_similarity_status = True
                 try:
                     current_page = int(self.spin_page.text())
                     self.refresh_ocr_source_options(current_page)
-                    if self.combo_source.count() > 1:
-                        self.combo_source.setCurrentIndex(1)
                 except Exception:
                     pass
                 self.load_current_page()
             else:
                 QMessageBox.information(self, "Batch Done", msg)
-        else:
-            if "Program interrupted" not in msg: # Don't error on manual stop
-                 if is_current_project:
-                    QMessageBox.critical(self, "OCR Failed", msg)
-        
-        if self.ocr_thread == worker:
-            self.ocr_thread = None
+        elif "Program interrupted" not in msg: # Don't error on manual stop
+            QMessageBox.critical(self, "OCR Failed", msg)
 
 
             
@@ -2994,8 +3249,8 @@ class MainWindow(QMainWindow):
     def on_editor_focus(self):
         self.last_active_editor = self.sender()
         
-    def on_image_bbox_click(self, ocr_idx):
-        """Handle Shift+Click on Image BBox"""
+    def on_image_bbox_click(self, ocr_idx, local_offset=0):
+        """Handle Ctrl+Click on Image BBox"""
         if not hasattr(self, 'ocr_char_map') or not self.ocr_char_map: return
         
         # Get Py Index from ocr_idx
@@ -3022,7 +3277,21 @@ class MainWindow(QMainWindow):
         if ocr_idx < 0 or ocr_idx >= len(self.ocr_char_map): return
         
         data = self.ocr_char_map[ocr_idx]
-        start_py_idx = data['start_index']
+        start_py_idx = data['start_index'] + max(
+            0,
+            min(int(local_offset or 0), data['end_index'] - data['start_index']),
+        )
+
+        # 图片反向定位文本时也保留当前细粒度矩形框。
+        entries = self.find_ocr_bbox_entries_for_index(start_py_idx)
+        if entries:
+            self.image_view.set_highlight_bboxes(
+                [
+                    (x1, y1, x2 - x1, y2 - y1, level)
+                    for level, (x1, y1, x2, y2) in entries
+                ],
+                ensure_visible=False,
+            )
         
         # Determine target
         target = self.last_active_editor
@@ -3067,6 +3336,9 @@ class MainWindow(QMainWindow):
                 cursor.setPosition(target_pos)
                 target.setTextCursor(cursor)
                 target.ensureCursorVisible()
+                # 图片反向定位时两侧都显示醒目的行高亮，避免只靠细光标辨认。
+                target.highlight_line_at_index(target_pos)
+                self.request_highlight_other(target, target_pos)
                 target.setFocus() # Bring focus back to text
             finally:
                 self._is_navigating_from_image = False
@@ -3093,41 +3365,115 @@ class MainWindow(QMainWindow):
         self.find_replace_dialog.raise_()
         self.find_replace_dialog.activateWindow()
 
-    def push_global_undo(self, description="Global Action"):
+    def capture_global_state(self, description):
         import copy
-        snapshot = {
+        return {
             'time': time.time(),
             'desc': description,
             'left': copy.deepcopy(self.pages_left),
-            'right': copy.deepcopy(self.pages_right_text)
+            'right': copy.deepcopy(self.pages_right_text),
+            'right_candidates': copy.deepcopy(getattr(self, 'right_candidate_pages', {})),
+            'active_right_candidate': getattr(self, 'current_right_candidate_index', 0),
         }
-        self.global_undo_stack.append(snapshot)
-        if len(self.global_undo_stack) > 10:
-            self.global_undo_stack.pop(0)
-            
-    def undo_global(self):
-        if not self.global_undo_stack:
-            QMessageBox.information(self, "Undo", "Nothing to undo.")
+
+    @staticmethod
+    def global_states_equal(left, right):
+        if not left or not right:
+            return False
+        return (
+            left.get('left') == right.get('left')
+            and left.get('right_candidates', left.get('right'))
+            == right.get('right_candidates', right.get('right'))
+        )
+
+    def push_global_undo(self, description="Global Action"):
+        """开始一次全局操作，并记录操作前的实际状态。"""
+        before = self.capture_global_state(f"{description} 前")
+        if self.global_history_index < len(self.global_undo_stack) - 1:
+            del self.global_undo_stack[self.global_history_index + 1:]
+        current = (
+            self.global_undo_stack[self.global_history_index]
+            if 0 <= self.global_history_index < len(self.global_undo_stack)
+            else None
+        )
+        if not self.global_states_equal(current, before):
+            self.global_undo_stack.append(before)
+            self.global_history_index = len(self.global_undo_stack) - 1
+        self._pending_global_description = description
+
+    def finalize_global_action(self, changed=True):
+        """记录全局操作后的状态，使历史支持撤销、重做和任意恢复。"""
+        description = self._pending_global_description
+        self._pending_global_description = None
+        if not changed or not description:
             return
-            
-        last_snapshot = self.global_undo_stack[-1]
-        if self.last_manual_edit_time > last_snapshot['time']:
-            ret = QMessageBox.warning(self, "Undo Warning", 
-                "You have manually edited text since the last global replace.\n"
-                "Undoing will OVERWRITE your manual edits.\n\n"
-                "Are you sure you want to undo?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            if ret == QMessageBox.StandardButton.No: return
-        
-        snapshot = self.global_undo_stack.pop()
-        self.pages_left = snapshot['left']
-        self.pages_right_text = snapshot['right']
-        
-        self.reload_displayed_texts()
-        # self.status_label is not mainwindow status bar? 
-        # MainWindow usually has self.statusBar().
-        self.statusBar().showMessage(f"Undone: {snapshot['desc']}", 5000)
-        QMessageBox.information(self, "Undo", f"Reverted: {snapshot['desc']}")
+        self.global_undo_stack.append(self.capture_global_state(description))
+        self.global_history_index = len(self.global_undo_stack) - 1
+        if len(self.global_undo_stack) > 30:
+            overflow = len(self.global_undo_stack) - 30
+            del self.global_undo_stack[:overflow]
+            self.global_history_index -= overflow
+        if self.global_history_dialog and self.global_history_dialog.isVisible():
+            self.global_history_dialog.refresh()
+
+    def apply_global_snapshot(self, snapshot):
+        import copy
+        self.pages_left = copy.deepcopy(snapshot.get('left', {}))
+        if snapshot.get('right_candidates') is not None:
+            self.right_candidate_pages = copy.deepcopy(snapshot['right_candidates'])
+            active = int(snapshot.get('active_right_candidate', self.current_right_candidate_index) or 0)
+            self.current_right_candidate_index = min(active, max(0, len(self.right_text_candidates) - 1))
+            self.pages_right_text = self.right_candidate_pages.get(self.current_right_candidate_index, {})
+        else:
+            self.pages_right_text = copy.deepcopy(snapshot.get('right', {}))
+            self.right_candidate_pages[self.current_right_candidate_index] = self.pages_right_text
+
+        self.dirty_pages_left.update(self.pages_left.keys())
+        for candidate, pages in self.right_candidate_pages.items():
+            self.dirty_pages_right.setdefault(candidate, set()).update(pages.keys())
+        self.force_ui_reload()
+
+    def restore_global_history_index(self, index, confirm=True):
+        if not (0 <= index < len(self.global_undo_stack)):
+            return False
+        if index == self.global_history_index:
+            return True
+        if confirm:
+            reply = QMessageBox.warning(
+                self,
+                "恢复全局替换状态",
+                "恢复会覆盖当前内存中的文本状态，但不会立即写入文件。是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return False
+        self.save_current_page_data()
+        self.apply_global_snapshot(self.global_undo_stack[index])
+        self.global_history_index = index
+        self.statusBar().showMessage(
+            f"已恢复：{self.global_undo_stack[index].get('desc', '全局状态')}", 5000
+        )
+        return True
+
+    def undo_global(self):
+        if self.global_history_index <= 0:
+            QMessageBox.information(self, "撤销", "没有可撤销的全局替换。")
+            return False
+        return self.restore_global_history_index(self.global_history_index - 1)
+
+    def redo_global(self):
+        if self.global_history_index < 0 or self.global_history_index >= len(self.global_undo_stack) - 1:
+            QMessageBox.information(self, "重做", "没有可重做的全局替换。")
+            return False
+        return self.restore_global_history_index(self.global_history_index + 1)
+
+    def show_global_replace_history(self):
+        if not self.global_history_dialog:
+            self.global_history_dialog = GlobalReplaceHistoryDialog(self)
+        self.global_history_dialog.refresh()
+        self.global_history_dialog.show()
+        self.global_history_dialog.raise_()
+        self.global_history_dialog.activateWindow()
 
 # ==========================================
 # 6. Utility Functions Dialogs
