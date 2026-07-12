@@ -39,8 +39,10 @@ def write_pages_to_file(pages: dict[int, str], file_path: str):
                 f.write(f'<{page}>\n')
                 f.write(f'{text}\n')
         print(f"Saved to {file_path}")
+        return True
     except Exception as e:
         print(f"Save error: {e}")
+        return False
 
 class MergeTextDialog(QDialog):
     def __init__(self, parent=None):
