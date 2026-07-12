@@ -50,6 +50,30 @@ def to_py_pos(full_text: str, qt_pos: int) -> int:
         curr_qt += 2 if ord(c) > 0xFFFF else 1
     return len(full_text)
 
+def map_diff_index(opcodes, index, source_is_left=True):
+    """Map a Python character index through SequenceMatcher opcodes."""
+    for tag, i1, i2, j1, j2 in opcodes:
+        s1, s2 = (i1, i2) if source_is_left else (j1, j2)
+        d1, d2 = (j1, j2) if source_is_left else (i1, i2)
+        if s1 <= index < s2:
+            source_len = s2 - s1
+            target_len = d2 - d1
+            if tag == 'equal':
+                return d1 + (index - s1)
+            if source_len > 0 and target_len > 0:
+                relative = (index - s1) * target_len // source_len
+                return d1 + min(relative, target_len - 1)
+            return d1
+
+    # A cursor may legally sit just after the final character.
+    if opcodes:
+        _tag, i1, i2, j1, j2 = opcodes[-1]
+        source_end = i2 if source_is_left else j2
+        target_end = j2 if source_is_left else i2
+        if index == source_end:
+            return target_end
+    return -1
+
 # ==========================================
 # 0.1 Default Configuration
 # ==========================================
@@ -795,6 +819,22 @@ class ImageCanvas(QGraphicsView):
                 )
             x, y, w, h = navigation_bbox[:4]
             self.ensure_visible_bbox(x, y, w, h)
+
+            # A full line can be wider than the viewport. After positioning the
+            # line vertically, also bring the finest character/word box into
+            # view so the actual target cannot remain off-screen horizontally.
+            target_bbox = next(
+                (bbox for bbox in valid_bboxes if len(bbox) > 4 and bbox[4] == 'char'),
+                None,
+            )
+            if target_bbox is None:
+                target_bbox = next(
+                    (bbox for bbox in valid_bboxes if len(bbox) > 4 and bbox[4] == 'word'),
+                    valid_bboxes[0],
+                )
+            if target_bbox is not navigation_bbox:
+                tx, ty, tw, th = target_bbox[:4]
+                self.ensure_visible_bbox(tx, ty, tw, th)
 
 
 # ==========================================
@@ -2445,21 +2485,7 @@ class MainWindow(QMainWindow):
         py_idx = to_py_pos(src_text, qt_idx)
         
         opcodes = self.edit_left.diff_opcodes
-        mapped_py_idx = -1
-        
-        for tag, i1, i2, j1, j2 in opcodes:
-             # src range, dst range (Py indices)
-             s1, s2 = (i1, i2) if is_left_source else (j1, j2)
-             d1, d2 = (j1, j2) if is_left_source else (i1, i2)
-             
-             if s1 <= py_idx <= s2:
-                 if tag == 'equal':
-                     offset = py_idx - s1
-                     mapped_py_idx = d1 + offset
-                     if mapped_py_idx > d2: mapped_py_idx = d2
-                 else:
-                     mapped_py_idx = d1
-                 break
+        mapped_py_idx = map_diff_index(opcodes, py_idx, is_left_source)
         
         if mapped_py_idx == -1: return -1
         
@@ -2566,19 +2592,18 @@ class MainWindow(QMainWindow):
         src_py_idx = to_py_pos(editor.toPlainText(), idx)
         left_py_idx = src_py_idx
         if editor == self.edit_right:
-            left_py_idx = -1
-            for tag, i1, i2, j1, j2 in getattr(self.edit_left, 'diff_opcodes', []):
-                if j1 <= src_py_idx <= j2:
-                    left_py_idx = i1 + (src_py_idx - j1) if tag == 'equal' else i1
-                    left_py_idx = min(left_py_idx, i2)
-                    break
+            left_py_idx = map_diff_index(
+                getattr(self.edit_left, 'diff_opcodes', []),
+                src_py_idx,
+                source_is_left=False,
+            )
 
         if left_py_idx >= 0:
-            for tag, i1, i2, j1, j2 in getattr(self, 'ocr_diff_opcodes', []):
-                if i1 <= left_py_idx <= i2:
-                    target_ocr_idx = j1 + (left_py_idx - i1) if tag == 'equal' else j1
-                    target_ocr_idx = min(target_ocr_idx, j2)
-                    break
+            target_ocr_idx = map_diff_index(
+                getattr(self, 'ocr_diff_opcodes', []),
+                left_py_idx,
+                source_is_left=True,
+            )
         
         # 2. Find BBox for target_ocr_idx
         if target_ocr_idx >= 0:
@@ -3310,14 +3335,9 @@ class MainWindow(QMainWindow):
              
              # Locate Left Index corresponding to OCR Index `start_py_idx`
              # OCR is "right" side in ocr_diff_opcodes (j1, j2)
-             left_py_idx = -1
-             for tag, i1, i2, j1, j2 in opcodes:
-                 if j1 <= start_py_idx <= j2:
-                     if tag == 'equal':
-                         left_py_idx = i1 + (start_py_idx - j1)
-                     else:
-                         left_py_idx = i1 # Approximation for changed block
-                     break
+             left_py_idx = map_diff_index(
+                 opcodes, start_py_idx, source_is_left=False
+             )
              
              if left_py_idx != -1:
                  if target == self.edit_left:

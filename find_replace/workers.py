@@ -1,4 +1,7 @@
 import difflib
+import hashlib
+import threading
+from collections import OrderedDict
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
@@ -62,6 +65,11 @@ def expand_custom_diff_format(format_text, old_segment, new_segment, old_match=N
 class ReviewDiffWorker(QThread):
     progress = pyqtSignal(int)
     finished = pyqtSignal(list, str) # items, msg
+
+    _opcode_cache = OrderedDict()
+    _opcode_cache_lock = threading.Lock()
+    _opcode_cache_limit = 256
+    _opcode_cache_max_limit = 20000
     
     def __init__(self, pages, pages_left, pages_right, target_is_left, 
                  regex_old, regex_new, regex_scope,
@@ -80,9 +88,57 @@ class ReviewDiffWorker(QThread):
         self.chk_delete = check_delete
         self.chk_replace = check_replace
         self.custom_replace_format = custom_replace_format
+
+        # Global reviews commonly span thousands of pages. Keep enough entries
+        # for both target directions so a sequential rerun does not thrash a
+        # small LRU cache before reaching the pages cached most recently.
+        self._ensure_cache_capacity(len(pages))
         
         self.is_running = True
         self.items = []
+        self.cache_hits = 0
+
+    @staticmethod
+    def _text_cache_digest(text):
+        return hashlib.blake2b(
+            text.encode("utf-8", errors="surrogatepass"), digest_size=16
+        ).digest()
+
+    @classmethod
+    def clear_diff_cache(cls):
+        with cls._opcode_cache_lock:
+            cls._opcode_cache.clear()
+
+    @classmethod
+    def _ensure_cache_capacity(cls, page_count):
+        desired = max(256, page_count * 2)
+        with cls._opcode_cache_lock:
+            cls._opcode_cache_limit = max(
+                cls._opcode_cache_limit,
+                min(desired, cls._opcode_cache_max_limit),
+            )
+
+    @classmethod
+    def _get_opcodes(cls, text_a, text_b):
+        key = (
+            len(text_a), cls._text_cache_digest(text_a),
+            len(text_b), cls._text_cache_digest(text_b),
+        )
+        with cls._opcode_cache_lock:
+            cached = cls._opcode_cache.get(key)
+            if cached is not None:
+                cls._opcode_cache.move_to_end(key)
+                return cached, True
+
+        opcodes = tuple(
+            difflib.SequenceMatcher(None, text_a, text_b, autojunk=False).get_opcodes()
+        )
+        with cls._opcode_cache_lock:
+            cls._opcode_cache[key] = opcodes
+            cls._opcode_cache.move_to_end(key)
+            while len(cls._opcode_cache) > cls._opcode_cache_limit:
+                cls._opcode_cache.popitem(last=False)
+        return opcodes, False
         
     def run(self):
         try:
@@ -115,8 +171,9 @@ class ReviewDiffWorker(QThread):
             self.finished.emit([], str(e))
             
     def _generate_diff_items(self, page_num, text_a, text_b):
-        matcher = difflib.SequenceMatcher(None, text_a, text_b, autojunk=False)
-        opcodes = matcher.get_opcodes()
+        opcodes, cache_hit = self._get_opcodes(text_a, text_b)
+        if cache_hit:
+            self.cache_hits += 1
         
         # Pre-compute valid scope spans if regex_scope is defined
         scope_spans = []
@@ -170,7 +227,7 @@ class ReviewDiffWorker(QThread):
              suffix = html.escape(text_a[i2:c_end])
              seg_old_esc = html.escape(old_segment)
              replacement_segment = new_segment
-             if self.custom_replace_format:
+             if self.custom_replace_format is not None:
                  replacement_segment = expand_custom_diff_format(
                      self.custom_replace_format,
                      old_segment,
@@ -178,6 +235,11 @@ class ReviewDiffWorker(QThread):
                      old_match,
                      new_match,
                  )
+
+                 # A custom format can turn a source diff into a no-op. Such an
+                 # item should not be offered for review or application.
+                 if replacement_segment == old_segment:
+                     continue
 
              seg_new_esc = html.escape(replacement_segment)
              

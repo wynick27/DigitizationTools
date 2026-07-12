@@ -1520,6 +1520,7 @@ class FindReplaceDialog(QDialog):
         self.diff_worker_thread.start()
 
     def on_diff_worker_finished(self, items, msg):
+        cache_hits = getattr(self.diff_worker_thread, 'cache_hits', 0)
         self.diff_worker_thread = None
         self.progress_dialog.close()
         
@@ -1527,9 +1528,10 @@ class FindReplaceDialog(QDialog):
              if msg: QMessageBox.warning(self, "Diff Info", msg)
         
         self.current_review_items = items
+        cache_note = f"（复用缓存 {cache_hits} 页）" if cache_hits else ""
         
         if not items:
-            self.status_label.setText("No diff items found.")
+            self.status_label.setText(f"No diff items found.{cache_note}")
             return
 
         self.model = ReviewTableModel(self.current_review_items)
@@ -1545,7 +1547,9 @@ class FindReplaceDialog(QDialog):
         self.review_table.setColumnWidth(0, 30)
         self.review_table.setColumnWidth(4, 400)
         self.review_table.resizeRowsToContents()
-        self.status_label.setText(f"Found {len(self.current_review_items)} diff items.")
+        self.status_label.setText(
+            f"Found {len(self.current_review_items)} diff items.{cache_note}"
+        )
         
 
 
@@ -1592,7 +1596,7 @@ class FindReplaceDialog(QDialog):
                         start = min(positions, key=lambda pos: abs(pos - expected_start))
                         end = start + len(original)
                     else:
-                        self.status_label.setText("定位失败：当前页面已找不到 Review 中的原文。")
+                        self._set_review_location_status("定位失败：当前页面已找不到 Review 中的原文。")
                         return
 
                 start_qt = to_qt_pos(text, start)
@@ -1602,14 +1606,21 @@ class FindReplaceDialog(QDialog):
                     cursor.setPosition(end_qt, QTextCursor.MoveMode.KeepAnchor)
                     editor.setTextCursor(cursor)
                     editor.ensureCursorVisible()
+                    editor.centerCursor()
                     editor.setFocus()
                     editor.highlight_line_at_index(start_qt)
                     self.mainwindow.request_highlight_other(editor, start_qt)
-                    self.status_label.setText(
+                    self.mainwindow.check_auto_scroll_bbox(editor, start_qt)
+                    self._set_review_location_status(
                         f"已定位：第 {page_num} 页，第 {item.get('line', '')} 行"
                     )
                 except Exception as exc:
-                    self.status_label.setText(f"定位失败：{exc}")
+                    self._set_review_location_status(f"定位失败：{exc}")
+
+    def _set_review_location_status(self, message):
+        """Show navigation feedback without losing the current review count."""
+        count = len(self.current_review_items)
+        self.status_label.setText(f"共 {count} 个条目。{message}")
 
     def reset_review_ui(self):
         """Reset the review UI to initial search state"""
