@@ -52,6 +52,19 @@ class RevisionEditor(QTextEdit):
         self._prepare_plain_insertion()
         self.insertPlainText(source.text())
 
+    def wheelEvent(self, event):
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            direction = 1 if event.angleDelta().y() > 0 else -1
+            font = self.document().defaultFont()
+            size = font.pointSizeF()
+            if size <= 0:
+                size = self.font().pointSizeF()
+            font.setPointSizeF(max(6.0, min(72.0, size + direction)))
+            self.document().setDefaultFont(font)
+            event.accept()
+            return
+        super().wheelEvent(event)
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             modifiers = event.modifiers()
@@ -117,12 +130,6 @@ class RevisionViewWidget(QWidget):
         layout = QVBoxLayout(self)
 
         top = QHBoxLayout()
-        self.btn_prev_page = QPushButton("< 上一页")
-        self.btn_next_page = QPushButton("下一页 >")
-        self.page_label = QLabel()
-        top.addWidget(self.btn_prev_page)
-        top.addWidget(self.page_label)
-        top.addWidget(self.btn_next_page)
         top.addWidget(QLabel("对比基准:"))
         self.target_combo = QComboBox()
         self.target_combo.addItem("以左侧为基准", "left")
@@ -145,6 +152,10 @@ class RevisionViewWidget(QWidget):
         self.summary_label = QLabel()
         top.addWidget(self.summary_label)
         top.addStretch()
+        self.btn_apply = QPushButton("应用")
+        self.btn_cancel = QPushButton("不应用")
+        top.addWidget(self.btn_apply)
+        top.addWidget(self.btn_cancel)
         layout.addLayout(top)
 
         actions = QHBoxLayout()
@@ -180,16 +191,10 @@ class RevisionViewWidget(QWidget):
         )
         footer.addWidget(self.help_label)
         footer.addStretch()
-        self.btn_apply = QPushButton("应用并关闭")
-        self.btn_cancel = QPushButton("取消")
-        footer.addWidget(self.btn_apply)
-        footer.addWidget(self.btn_cancel)
         layout.addLayout(footer)
 
         self.btn_prev.clicked.connect(lambda: self.navigate_revision(-1))
         self.btn_next.clicked.connect(lambda: self.navigate_revision(1))
-        self.btn_prev_page.clicked.connect(lambda: self.navigate_page(-1))
-        self.btn_next_page.clicked.connect(lambda: self.navigate_page(1))
         self.btn_accept.clicked.connect(lambda: self.resolve_current("accept"))
         self.btn_reject.clicked.connect(lambda: self.resolve_current("reject"))
         self.btn_accept_all.clicked.connect(lambda: self.resolve_all("accept"))
@@ -221,6 +226,23 @@ class RevisionViewWidget(QWidget):
         self.rebuild_document()
 
     def request_close(self):
+        box = QMessageBox(self)
+        box.setWindowTitle("关闭修订")
+        box.setText("是否保存并应用修订窗口中的更改？")
+        box.setInformativeText("未处理的修订将保留对比基准中的内容。")
+        save_button = box.addButton("保存并应用", QMessageBox.ButtonRole.AcceptRole)
+        discard_button = box.addButton("不保存", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is save_button:
+            return self.apply_current(close=True)
+        if clicked is discard_button:
+            self.close_without_prompt()
+            return True
+        return False
+
+    def close_without_prompt(self):
         if self.close_callback:
             self.close_callback()
         else:
@@ -403,16 +425,44 @@ class RevisionViewWidget(QWidget):
         if group_id is None:
             self.status_message("请先将光标放在一处修订中。")
             return
-        self._resolve_group(group_id, action)
+        group_order = []
+        for segment in self._revision_segments():
+            if segment[2] not in group_order:
+                group_order.append(segment[2])
+        group_index = group_order.index(group_id)
+        next_groups = group_order[group_index + 1:] + group_order[:group_index]
+        if not self._resolve_group(group_id, action):
+            return
         self.update_summary()
+        for next_group in next_groups:
+            if self._select_revision_group(next_group):
+                break
 
     def resolve_all(self, action):
-        group_ids = list(dict.fromkeys(segment[2] for segment in self._revision_segments()))
+        segments = self._revision_segments()
+        if not segments:
+            return
         edit_cursor = QTextCursor(self.editor.document())
-        edit_cursor.beginEditBlock()
-        for group_id in group_ids:
-            self._resolve_group(group_id, action, edit_block=False)
-        edit_cursor.endEditBlock()
+        self._building = True
+        try:
+            edit_cursor.beginEditBlock()
+            # Work from one immutable snapshot. Reverse order keeps every saved
+            # range valid while earlier document positions are removed.
+            for start, end, _group_id, revision_type in reversed(segments):
+                cursor = QTextCursor(self.editor.document())
+                cursor.setPosition(start)
+                cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+                remove = (
+                    (action == "accept" and revision_type == "delete")
+                    or (action == "reject" and revision_type == "insert")
+                )
+                if remove:
+                    cursor.removeSelectedText()
+                else:
+                    cursor.setCharFormat(RevisionEditor.neutral_format())
+            edit_cursor.endEditBlock()
+        finally:
+            self._building = False
         self.update_summary()
 
     def navigate_revision(self, direction):
@@ -431,11 +481,30 @@ class RevisionViewWidget(QWidget):
             target = next((item for item in groups if item[0] > position), groups[0])
         else:
             target = next((item for item in reversed(groups) if item[0] < position), groups[-1])
+        self._show_revision_segment(target)
+
+    def _select_revision_group(self, group_id):
+        target = next(
+            (segment for segment in self._revision_segments() if segment[2] == group_id),
+            None,
+        )
+        if target is None:
+            return False
+        self._show_revision_segment(target)
+        return True
+
+    def _show_revision_segment(self, target):
         cursor = self.editor.textCursor()
         cursor.setPosition(target[0])
         cursor.setPosition(target[1], QTextCursor.MoveMode.KeepAnchor)
         self.editor.setTextCursor(cursor)
-        self.editor.centerCursor()
+        self.editor.ensureCursorVisible()
+        cursor_rect = self.editor.cursorRect()
+        viewport_center = self.editor.viewport().rect().center().y()
+        scrollbar = self.editor.verticalScrollBar()
+        scrollbar.setValue(
+            scrollbar.value() + cursor_rect.center().y() - viewport_center
+        )
 
     def update_summary(self):
         if self._building:
@@ -447,7 +516,6 @@ class RevisionViewWidget(QWidget):
         self.summary_label.setText(
             f"待处理 {len(groups)} 处（新增 {len(insertions)} / 删除 {len(deletions)}）"
         )
-        self.page_label.setText(f"第 {self.page_num} 页" if self.page_num is not None else "")
         has_revisions = bool(groups)
         for button in (
             self.btn_prev,
@@ -463,6 +531,14 @@ class RevisionViewWidget(QWidget):
         self.help_label.setText(message)
 
     def resolved_text(self):
+        """Return the result with every still-pending revision accepted."""
+        return self._document_text(accept_pending=True)
+
+    def partially_applied_text(self):
+        """Return only explicit decisions; unresolved revisions keep the baseline."""
+        return self._document_text(accept_pending=False)
+
+    def _document_text(self, accept_pending):
         parts = []
         cursor = QTextCursor(self.editor.document())
         cursor.movePosition(QTextCursor.MoveOperation.Start)
@@ -472,22 +548,19 @@ class RevisionViewWidget(QWidget):
                 QTextCursor.MoveMode.KeepAnchor,
             )
             fmt = cursor.charFormat()
-            if fmt.property(REVISION_TYPE_PROPERTY) != "delete":
+            revision_type = fmt.property(REVISION_TYPE_PROPERTY)
+            include = not revision_type
+            if revision_type == "insert":
+                include = accept_pending
+            elif revision_type == "delete":
+                include = not accept_pending
+            if include:
                 parts.append(cursor.selectedText().replace("\u2029", "\n"))
             cursor.clearSelection()
         return "".join(parts)
 
-    def apply_current(self, close=False, confirm_pending=True):
-        pending = {segment[2] for segment in self._revision_segments()}
-        if pending and confirm_pending:
-            answer = QMessageBox.question(
-                self,
-                "应用修订",
-                f"仍有 {len(pending)} 处修订未处理。应用时将接受这些修订，是否继续？",
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return False
-        result_text = self.resolved_text()
+    def apply_current(self, close=False):
+        result_text = self.partially_applied_text()
         self.apply_callback(self.apply_side(), result_text, self.page_num)
         if self.apply_side() == "left":
             self.left_text = result_text
@@ -495,7 +568,7 @@ class RevisionViewWidget(QWidget):
             self.right_text = result_text
         self.editor.document().clearUndoRedoStacks()
         if close:
-            self.request_close()
+            self.close_without_prompt()
         else:
             self.rebuild_document()
         return True

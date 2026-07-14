@@ -10,11 +10,14 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QTextEdit, QPlainTextEdit, QLabel, QPushButton, QSplitter, QFileDialog,
                              QMessageBox, QGraphicsView, QGraphicsScene,
                              QGraphicsRectItem, QLineEdit, QSpinBox, QToolBar, QComboBox, QCheckBox,
-                             QDialog, QListWidget)
+                             QDialog, QListWidget, QStackedWidget)
 from PyQt6.QtGui import (QTextCursor, QColor, QSyntaxHighlighter, QTextCharFormat, QTextFormat,
                          QAction, QPixmap, QImage, QPainter, QPen, QFont, QTextOption)
 from PyQt6.QtWidgets import QProgressBar
-from PyQt6.QtCore import Qt, QEvent, pyqtSignal, QTimer, QThread, pyqtSlot, QSize, QRect
+from PyQt6.QtCore import (
+    Qt, QEvent, QSignalBlocker, pyqtSignal, QTimer, QThread, pyqtSlot, QSize, QRect,
+    QUrl,
+)
 import bisect
 
 from tools.pdf_tools import SplitPdfDialog, ExportPdfImageDialog
@@ -26,6 +29,13 @@ from tools.similarity_tools import SimilarityDialog, calculate_page_similarities
 from tools.headword_compare_tools import HeadwordCompareDialog
 from tools.report_review_tools import ReportReviewDialog
 from tools.revision_view import RevisionViewWidget
+from tools.markup_support import (
+    MarkupPreviewEdit,
+    apply_visible_text_edit,
+    build_markup_projection,
+    map_projection_opcodes,
+    projection_for_rendered_text,
+)
 
 from find_replace import FindReplaceDialog
 from lang.i18n import text_from_config
@@ -845,19 +855,43 @@ class ImageCanvas(QGraphicsView):
 # OCRWorker moved to ocr.ocr_worker
 
 class DiffWorker(QThread):
-    result_ready = pyqtSignal(list, list) # opcodes, ocr_opcodes
+    result_ready = pyqtSignal(list, list, list, list)
 
-    def __init__(self, text_l, text_r, ocr_text_full, need_ocr_map):
+    def __init__(
+        self, text_l, text_r, ocr_text_full, need_ocr_map,
+        ignore_markup=False, mode_left="plain", mode_right="plain",
+    ):
         super().__init__()
         self.text_l = text_l
         self.text_r = text_r
         self.ocr_text_full = ocr_text_full
         self.need_ocr_map = need_ocr_map
+        self.ignore_markup = ignore_markup
+        self.mode_left = mode_left
+        self.mode_right = mode_right
     
     def run(self):
         # Main Diff
-        matcher = difflib.SequenceMatcher(None, self.text_l, self.text_r, autojunk=False)
-        opcodes = matcher.get_opcodes()
+        errors = []
+        if self.ignore_markup:
+            projection_left = build_markup_projection(self.text_l, self.mode_left)
+            projection_right = build_markup_projection(self.text_r, self.mode_right)
+            matcher = difflib.SequenceMatcher(
+                None,
+                projection_left.visible_text,
+                projection_right.visible_text,
+                autojunk=False,
+            )
+            visible_opcodes = matcher.get_opcodes()
+            opcodes = map_projection_opcodes(
+                visible_opcodes, projection_left, projection_right
+            )
+            errors.extend(f"左侧：{error.display()}" for error in projection_left.errors)
+            errors.extend(f"右侧：{error.display()}" for error in projection_right.errors)
+        else:
+            matcher = difflib.SequenceMatcher(None, self.text_l, self.text_r, autojunk=False)
+            opcodes = matcher.get_opcodes()
+            visible_opcodes = opcodes
         
         # OCR Mapping Diff
         ocr_opcodes = []
@@ -865,7 +899,7 @@ class DiffWorker(QThread):
              m2 = difflib.SequenceMatcher(None, self.text_l, self.ocr_text_full, autojunk=False)
              ocr_opcodes = m2.get_opcodes()
              
-        self.result_ready.emit(opcodes, ocr_opcodes)
+        self.result_ready.emit(opcodes, ocr_opcodes, visible_opcodes, errors)
 
 # ==========================================
 # 4. Smart Image Export Helpers
@@ -1202,6 +1236,10 @@ class MainWindow(QMainWindow):
         
     def closeEvent(self, event):
         """退出前检查未保存的更改"""
+        revision = getattr(self, "revision_view_widget", None)
+        if revision is not None and not revision.request_close():
+            event.ignore()
+            return
         if self.check_unsaved_changes():
             event.accept()
         else:
@@ -1275,6 +1313,12 @@ class MainWindow(QMainWindow):
 
     def eventFilter(self, watched, event):
         if (
+            event.type() == QEvent.Type.FocusIn
+            and isinstance(watched, (QPlainTextEdit, QTextEdit))
+            and QApplication.activeWindow() is self
+        ):
+            self.last_active_editor = watched
+        if (
             event.type() == QEvent.Type.MouseButtonPress
             and QApplication.activeWindow() is self
         ):
@@ -1338,9 +1382,22 @@ class MainWindow(QMainWindow):
         self.btn_batch.setText(self.get_text("btn_ocr_batch"))
                 
     def _get_focused_editor(self):
-        """Return the last active text editor (edit_left or edit_right)."""
+        """Return the last active editable source, rendered, or revision surface."""
+        focus = QApplication.focusWidget()
+        if (
+            isinstance(focus, (QPlainTextEdit, QTextEdit))
+            and not focus.isReadOnly()
+            and self.isAncestorOf(focus)
+        ):
+            self.last_active_editor = focus
+            return focus
         editor = getattr(self, 'last_active_editor', None)
-        if editor and isinstance(editor, QPlainTextEdit):
+        if (
+            editor
+            and isinstance(editor, (QPlainTextEdit, QTextEdit))
+            and not editor.isReadOnly()
+            and self.isAncestorOf(editor)
+        ):
             return editor
         # Fallback: try either editor
         if hasattr(self, 'edit_left'):
@@ -1351,6 +1408,9 @@ class MainWindow(QMainWindow):
         editor = self._get_focused_editor()
         if editor:
             editor.setFocus()
+            prepare_insertion = getattr(editor, "_prepare_plain_insertion", None)
+            if prepare_insertion:
+                prepare_insertion()
             cursor = editor.textCursor()
             cursor.insertText(text)
             editor.setTextCursor(cursor)
@@ -1370,13 +1430,16 @@ class MainWindow(QMainWindow):
         
         # Process Furigana via extracted tool
         result_text = generate_furigana_string(
-            sel_text,
+            sel_text.replace("\u2029", "\n"),
             left_marker=self.global_config.get("furigana_left_marker", "["),
             right_marker=self.global_config.get("furigana_right_marker", "]"),
             kana_type=self.global_config.get("furigana_kana_type", "hiragana"),
             use_jmdict_split=self.global_config.get("furigana_use_jmdict_split", True),
         )
-                
+        prepare_insertion = getattr(editor, "_prepare_plain_insertion", None)
+        if prepare_insertion:
+            prepare_insertion()
+            cursor = editor.textCursor()
         cursor.insertText(result_text)
         editor.setTextCursor(cursor)
 
@@ -1533,8 +1596,11 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.cb_word_wrap)
 
         self.btn_revision_view = QPushButton("修订")
-        self.btn_revision_view.setToolTip("在单窗口中审阅、接受、拒绝并编辑当前页差异")
-        self.btn_revision_view.clicked.connect(self.show_revision_view)
+        self.btn_revision_view.setCheckable(True)
+        self.btn_revision_view.setToolTip(
+            "在单窗口中审阅、接受、拒绝并编辑当前页差异；再次点击自动应用并退出"
+        )
+        self.btn_revision_view.toggled.connect(self.toggle_revision_view)
         toolbar.addWidget(self.btn_revision_view)
 
         self.cb_show_bboxes = QCheckBox("定位框")
@@ -1685,6 +1751,46 @@ class MainWindow(QMainWindow):
         right_container = QWidget()
         right_layout = QVBoxLayout(right_container)
         right_layout.setContentsMargins(0,0,0,0)
+
+        markup_layout = QHBoxLayout()
+        markup_layout.addWidget(QLabel("左侧格式:"))
+        self.combo_markup_left = QComboBox()
+        self.combo_markup_left.addItem("纯文本", "plain")
+        self.combo_markup_left.addItem("Markdown", "markdown")
+        self.combo_markup_left.addItem("HTML", "html")
+        markup_layout.addWidget(self.combo_markup_left)
+        markup_layout.addWidget(QLabel("右侧格式:"))
+        self.combo_markup_right = QComboBox()
+        self.combo_markup_right.addItem("纯文本", "plain")
+        self.combo_markup_right.addItem("Markdown", "markdown")
+        self.combo_markup_right.addItem("HTML", "html")
+        markup_layout.addWidget(self.combo_markup_right)
+        self.chk_ignore_markup = QCheckBox("比较时忽略标记")
+        markup_layout.addWidget(self.chk_ignore_markup)
+        markup_layout.addWidget(QLabel("视图:"))
+        self.combo_markup_view = QComboBox()
+        self.combo_markup_view.addItem("源码", "source")
+        self.combo_markup_view.addItem("渲染", "rendered")
+        markup_layout.addWidget(self.combo_markup_view)
+        markup_layout.addStretch()
+        right_layout.addLayout(markup_layout)
+
+        for combo, key in (
+            (self.combo_markup_left, "markup_mode_left"),
+            (self.combo_markup_right, "markup_mode_right"),
+        ):
+            index = combo.findData(self.project_config.get(key, "plain"))
+            combo.setCurrentIndex(max(0, index))
+            combo.currentIndexChanged.connect(self.on_markup_options_changed)
+        self.chk_ignore_markup.setChecked(
+            bool(self.project_config.get("ignore_markup_in_diff", False))
+        )
+        self.chk_ignore_markup.toggled.connect(self.on_markup_options_changed)
+        view_index = self.combo_markup_view.findData(
+            self.project_config.get("markup_view", "source")
+        )
+        self.combo_markup_view.setCurrentIndex(max(0, view_index))
+        self.combo_markup_view.currentIndexChanged.connect(self.on_markup_options_changed)
         
         # 2.1 正则配置区
         regex_layout = QHBoxLayout()
@@ -1732,9 +1838,13 @@ class MainWindow(QMainWindow):
         
         self.header_left = FileHeaderWidget(self, "left")
         self.edit_left = DiffTextEdit("left")
+        self.stack_left = QStackedWidget()
+        self.preview_left = MarkupPreviewEdit("left")
+        self.stack_left.addWidget(self.edit_left)
+        self.stack_left.addWidget(self.preview_left)
         
         left_box.addWidget(self.header_left)
-        left_box.addWidget(self.edit_left)
+        left_box.addWidget(self.stack_left)
         
         # --- Right Side Container ---
         right_container_widget = QWidget() # Rename to avoid conflict with right_container (outer)
@@ -1744,9 +1854,13 @@ class MainWindow(QMainWindow):
         
         self.header_right = FileHeaderWidget(self, "right")
         self.edit_right = DiffTextEdit("right")
+        self.stack_right = QStackedWidget()
+        self.preview_right = MarkupPreviewEdit("right")
+        self.stack_right.addWidget(self.edit_right)
+        self.stack_right.addWidget(self.preview_right)
         
         right_box.addWidget(self.header_right)
-        right_box.addWidget(self.edit_right)
+        right_box.addWidget(self.stack_right)
         
         # 初始化 Highlighters
         self.highlighter_left = DiffSyntaxHighlighter(self.edit_left.document())
@@ -1755,6 +1869,18 @@ class MainWindow(QMainWindow):
         # 绑定信号
         self.edit_left.textChanged.connect(self.on_text_changed_left)
         self.edit_right.textChanged.connect(self.on_text_changed_right)
+        self.preview_left.textChanged.connect(
+            lambda: self.on_markup_preview_changed("left")
+        )
+        self.preview_right.textChanged.connect(
+            lambda: self.on_markup_preview_changed("right")
+        )
+        self.preview_left.cursorPositionChanged.connect(
+            lambda: self.on_markup_preview_cursor("left")
+        )
+        self.preview_right.cursorPositionChanged.connect(
+            lambda: self.on_markup_preview_cursor("right")
+        )
         
         # 绑定 Patch 信号
         self.edit_left.apply_patch_signal.connect(lambda r, t: self.apply_patch(self.edit_left, r, t))
@@ -1767,6 +1893,12 @@ class MainWindow(QMainWindow):
         # 使用自定义的滚动监听，因为需要判断是否由用户触发
         self.edit_left.verticalScrollBar().valueChanged.connect(lambda v: self.on_scroll(self.edit_left, self.edit_right))
         self.edit_right.verticalScrollBar().valueChanged.connect(lambda v: self.on_scroll(self.edit_right, self.edit_left))
+        self.preview_left.verticalScrollBar().valueChanged.connect(
+            lambda _value: self.on_scroll(self.preview_left, self.preview_right)
+        )
+        self.preview_right.verticalScrollBar().valueChanged.connect(
+            lambda _value: self.on_scroll(self.preview_right, self.preview_left)
+        )
         
         # 绑定光标移动 (高亮对齐 & 自动滚动)
         self.edit_left.cursorPositionChanged.connect(self.on_cursor_left)
@@ -1775,6 +1907,8 @@ class MainWindow(QMainWindow):
         # 绑定缩放 (Ctrl+Wheel)
         self.edit_left.zoom_signal.connect(self.on_zoom_request)
         self.edit_right.zoom_signal.connect(self.on_zoom_request)
+        self.preview_left.zoom_signal.connect(self.on_markup_zoom_request)
+        self.preview_right.zoom_signal.connect(self.on_markup_zoom_request)
         
         # 标记是否正在编程滚动，防止死循环
         self._is_program_scrolling = False
@@ -1793,6 +1927,13 @@ class MainWindow(QMainWindow):
         self.image_view.bbox_clicked.connect(self.on_image_bbox_click)
         self.edit_left.focus_in_signal.connect(self.on_editor_focus)
         self.edit_right.focus_in_signal.connect(self.on_editor_focus)
+        self.preview_left.focus_in_signal.connect(self.on_editor_focus)
+        self.preview_right.focus_in_signal.connect(self.on_editor_focus)
+
+        self._updating_markup_preview = False
+        self._markup_preview_projections = {}
+        self._markup_source_projections = {}
+        self.refresh_markup_views()
 
         splitter.addWidget(right_container)
         splitter.setSizes([600, 1000]) # 初始比例
@@ -1803,7 +1944,9 @@ class MainWindow(QMainWindow):
         # Prevent auto-save of old content into new data
         self.current_loaded_page = None
         self.last_loaded_source = "Text File B" # Track source for saving
-        self.current_ocr_data = None      # 1. 加载文本
+        self.current_ocr_data = None
+        self.load_markup_options_from_project()
+        # 1. 加载文本
         self.pages_left = read_text_to_pages(self.project_config['text_path_left'])
         self.right_text_candidates = self.get_right_text_candidates()
         self.current_right_candidate_index = min(
@@ -2186,13 +2329,13 @@ class MainWindow(QMainWindow):
                 self.init_diff_timer()
             
             # Regex (Update Highlighters with Group ID)
-            self.highlighter_left.set_regex(self.project_config.get("regex_left"), self.project_config.get("regex_group_left", 0))
-            self.highlighter_right.set_regex(self.project_config.get("regex_right"), self.project_config.get("regex_group_right", 0))
+            self._update_source_regex_highlighters()
 
             # Force run immediately for first load? Or use deferred?
             # Use deferred to keep it async
             self._show_similarity_after_load = not getattr(self, "_suppress_next_load_similarity_status", False)
             self._suppress_next_load_similarity_status = False
+            self.refresh_markup_views()
             self.deferred_run_diff()
             
             # Record last loaded source
@@ -2296,6 +2439,267 @@ class MainWindow(QMainWindow):
 
     # ================= Diff 核心 =================
 
+    def load_markup_options_from_project(self):
+        if not hasattr(self, "combo_markup_left"):
+            return
+        controls = (
+            (self.combo_markup_left, self.project_config.get("markup_mode_left", "plain")),
+            (self.combo_markup_right, self.project_config.get("markup_mode_right", "plain")),
+            (self.combo_markup_view, self.project_config.get("markup_view", "source")),
+        )
+        for combo, value in controls:
+            combo.blockSignals(True)
+            index = combo.findData(value)
+            combo.setCurrentIndex(max(0, index))
+            combo.blockSignals(False)
+        self.chk_ignore_markup.blockSignals(True)
+        self.chk_ignore_markup.setChecked(
+            bool(self.project_config.get("ignore_markup_in_diff", False))
+        )
+        self.chk_ignore_markup.blockSignals(False)
+        self.refresh_markup_views()
+
+    def markup_mode(self, side):
+        combo = self.combo_markup_left if side == "left" else self.combo_markup_right
+        return combo.currentData() or "plain"
+
+    def on_markup_options_changed(self, _value=None):
+        self.project_config["markup_mode_left"] = self.markup_mode("left")
+        self.project_config["markup_mode_right"] = self.markup_mode("right")
+        self.project_config["ignore_markup_in_diff"] = self.chk_ignore_markup.isChecked()
+        self.project_config["markup_view"] = self.combo_markup_view.currentData() or "source"
+        self.config_manager.save()
+        self.refresh_markup_views()
+        self.deferred_run_diff()
+
+    def refresh_markup_views(self, side=None):
+        rendered = self.combo_markup_view.currentData() == "rendered"
+        self.stack_left.setCurrentIndex(1 if rendered else 0)
+        self.stack_right.setCurrentIndex(1 if rendered else 0)
+        if not rendered:
+            return
+        sides = (side,) if side else ("left", "right")
+        for current_side in sides:
+            self._render_markup_side(current_side)
+
+    def _render_markup_side(self, side):
+        source_editor = self.edit_left if side == "left" else self.edit_right
+        preview = self.preview_left if side == "left" else self.preview_right
+        source = source_editor.toPlainText()
+        projection = build_markup_projection(source, self.markup_mode(side))
+        self._markup_source_projections[side] = projection
+        self._updating_markup_preview = True
+        preview.blockSignals(True)
+        if side == "left":
+            document_path = self.project_config.get("text_path_left", "")
+        else:
+            source_data = self.combo_source.currentData()
+            if isinstance(source_data, dict) and source_data.get("type") == "ocr":
+                document_path = source_data.get("path", "")
+            else:
+                document_path = self.get_current_right_text_path()
+        if document_path:
+            base_directory = os.path.dirname(os.path.abspath(document_path))
+            preview.document().setBaseUrl(
+                QUrl.fromLocalFile(os.path.join(base_directory, ""))
+            )
+        else:
+            preview.document().setBaseUrl(QUrl())
+        preview.setHtml(projection.rendered_html)
+        preview.document().setModified(False)
+        preview.blockSignals(False)
+        self._updating_markup_preview = False
+        self._markup_preview_projections[side] = projection_for_rendered_text(
+            projection, preview.toPlainText()
+        )
+        if projection.errors:
+            self.statusBar().showMessage(
+                f"{side == 'left' and '左侧' or '右侧'}格式错误："
+                f"{projection.errors[0].display()}",
+                8000,
+            )
+
+    def on_markup_preview_changed(self, side):
+        if self._updating_markup_preview or self._is_loading:
+            return
+        preview = self.preview_left if side == "left" else self.preview_right
+        source_editor = self.edit_left if side == "left" else self.edit_right
+        projection = self._markup_preview_projections.get(side)
+        if projection is None:
+            return
+        new_visible = preview.toPlainText()
+        candidate = apply_visible_text_edit(
+            source_editor.toPlainText(), projection, new_visible
+        )
+        checked = build_markup_projection(candidate, self.markup_mode(side))
+        if checked.errors:
+            self.statusBar().showMessage(
+                f"拒绝写回，格式错误：{checked.errors[0].display()}", 8000
+            )
+            self._render_markup_side(side)
+            return
+        if candidate == source_editor.toPlainText():
+            return
+
+        self._updating_markup_preview = True
+        cursor = source_editor.textCursor()
+        cursor.beginEditBlock()
+        cursor.select(QTextCursor.SelectionType.Document)
+        cursor.insertText(candidate)
+        cursor.endEditBlock()
+        self._updating_markup_preview = False
+        self._markup_preview_projections[side] = projection_for_rendered_text(
+            checked, new_visible
+        )
+
+    def on_markup_preview_cursor(self, side):
+        if self._updating_markup_preview:
+            return
+        preview = self.preview_left if side == "left" else self.preview_right
+        source_editor = self.edit_left if side == "left" else self.edit_right
+        projection = self._markup_preview_projections.get(side)
+        if projection is None:
+            return
+        rendered_py = to_py_pos(
+            preview.toPlainText(), preview.textCursor().position()
+        )
+        source_py = projection.map_position(rendered_py)
+        source_qt = to_qt_pos(source_editor.toPlainText(), source_py)
+        source_editor.highlight_line_at_index(source_qt)
+        self.request_highlight_other(source_editor, source_qt)
+        self.check_auto_scroll_bbox(source_editor, source_qt)
+
+    def _markup_regex_ranges(self, side, source_text):
+        pattern = self.project_config.get(
+            "regex_left" if side == "left" else "regex_right", ""
+        )
+        group_id = self.project_config.get(
+            "regex_group_left" if side == "left" else "regex_group_right", 0
+        )
+        if not pattern:
+            return []
+        try:
+            regex = re.compile(pattern)
+        except re.error:
+            return []
+        ranges = []
+        offset = 0
+        for line in source_text.splitlines(keepends=True):
+            content = line.rstrip("\r\n")
+            for match in regex.finditer(content):
+                try:
+                    start, end = match.span(group_id)
+                except (IndexError, ValueError):
+                    start, end = match.span()
+                if start < end:
+                    ranges.append((offset + start, offset + end))
+            offset += len(line)
+        return ranges
+
+    def _restore_editor_scroll(self, preview, vertical_ratio, horizontal_ratio):
+        if preview is None:
+            return
+        vertical = preview.verticalScrollBar()
+        horizontal = preview.horizontalScrollBar()
+        was_scrolling = self._is_program_scrolling
+        self._is_program_scrolling = True
+        try:
+            vertical.setValue(round(vertical_ratio * vertical.maximum()))
+            horizontal.setValue(round(horizontal_ratio * horizontal.maximum()))
+        finally:
+            self._is_program_scrolling = was_scrolling
+
+    def _highlight_markup_previews(self, source_opcodes):
+        for side, preview, projection in (
+            ("left", self.preview_left, self._markup_preview_projections.get("left")),
+            ("right", self.preview_right, self._markup_preview_projections.get("right")),
+        ):
+            if projection is None:
+                continue
+            plain_text = preview.toPlainText()
+            vertical = preview.verticalScrollBar()
+            horizontal = preview.horizontalScrollBar()
+            vertical_ratio = (
+                vertical.value() / vertical.maximum() if vertical.maximum() > 0 else 0.0
+            )
+            horizontal_ratio = (
+                horizontal.value() / horizontal.maximum() if horizontal.maximum() > 0 else 0.0
+            )
+            source_text = (
+                self.edit_left.toPlainText() if side == "left"
+                else self.edit_right.toPlainText()
+            )
+            diff_flags = [False] * len(plain_text)
+            regex_flags = [False] * len(plain_text)
+
+            diff_ranges = []
+            for tag, i1, i2, j1, j2 in source_opcodes:
+                if tag == "equal":
+                    continue
+                diff_ranges.append((i1, i2) if side == "left" else (j1, j2))
+            regex_ranges = self._markup_regex_ranges(side, source_text)
+
+            for rendered_index, source_index in enumerate(
+                projection.visible_to_source[:-1]
+            ):
+                diff_flags[rendered_index] = any(
+                    start <= source_index < end for start, end in diff_ranges
+                )
+                regex_flags[rendered_index] = any(
+                    start <= source_index < end for start, end in regex_ranges
+                )
+
+            selections = []
+            run_start = 0
+            while run_start < len(plain_text):
+                flags = (diff_flags[run_start], regex_flags[run_start])
+                if not any(flags):
+                    run_start += 1
+                    continue
+                run_end = run_start + 1
+                while (
+                    run_end < len(plain_text)
+                    and (diff_flags[run_end], regex_flags[run_end]) == flags
+                ):
+                    run_end += 1
+                cursor = QTextCursor(preview.document())
+                cursor.setPosition(to_qt_pos(plain_text, run_start))
+                cursor.setPosition(
+                    to_qt_pos(plain_text, run_end),
+                    QTextCursor.MoveMode.KeepAnchor,
+                )
+                selection = QTextEdit.ExtraSelection()
+                selection.cursor = cursor
+                if flags == (True, True):
+                    selection.format.setBackground(QColor("#e3d7ff"))
+                    selection.format.setForeground(QColor("#9b1c1c"))
+                elif flags[0]:
+                    selection.format.setBackground(QColor("#ffd9d5"))
+                    selection.format.setForeground(QColor("#a61b1b"))
+                else:
+                    selection.format.setBackground(QColor("#dceeff"))
+                selections.append(selection)
+                run_start = run_end
+            preview.setExtraSelections(selections)
+            self._restore_editor_scroll(preview, vertical_ratio, horizontal_ratio)
+            # QTextDocument may finish rich-text layout after setExtraSelections
+            # returns. Restore again in the next event turn to avoid a late jump.
+            QTimer.singleShot(
+                0,
+                lambda editor=preview, vr=vertical_ratio, hr=horizontal_ratio:
+                    self._restore_editor_scroll(editor, vr, hr),
+            )
+
+    def toggle_revision_view(self, checked):
+        """Toggle the inline review surface; toggling it off applies current work."""
+        if checked:
+            self.show_revision_view()
+            return
+
+        widget = getattr(self, "revision_view_widget", None)
+        if widget is not None:
+            widget.apply_current(close=True)
+
     def show_revision_view(self):
         """Open an editable, inline revision view for the current page."""
         self.save_current_page_data()
@@ -2329,6 +2733,8 @@ class MainWindow(QMainWindow):
             widget.deleteLater()
         self.revision_view_widget = None
         self.text_splitter.setVisible(True)
+        with QSignalBlocker(self.btn_revision_view):
+            self.btn_revision_view.setChecked(False)
 
     def apply_revision_text(self, side, text, page_num=None):
         try:
@@ -2427,7 +2833,15 @@ class MainWindow(QMainWindow):
         
         need_ocr_map = (self.is_text_source_selected() and bool(self.ocr_text_full))
         
-        self.diff_worker = DiffWorker(text_l, text_r, self.ocr_text_full, need_ocr_map)
+        self.diff_worker = DiffWorker(
+            text_l,
+            text_r,
+            self.ocr_text_full,
+            need_ocr_map,
+            ignore_markup=self.chk_ignore_markup.isChecked(),
+            mode_left=self.markup_mode("left"),
+            mode_right=self.markup_mode("right"),
+        )
         self.diff_worker.result_ready.connect(self.on_diff_finished)
         self.diff_worker.finished.connect(self.on_diff_thread_finished)
         self.diff_worker.start()
@@ -2436,7 +2850,7 @@ class MainWindow(QMainWindow):
         self._is_updating_diff = False
         self.diff_worker = None
 
-    def on_diff_finished(self, opcodes, ocr_opcodes):
+    def on_diff_finished(self, opcodes, ocr_opcodes, visible_opcodes, markup_errors):
         text_l = self.edit_left.toPlainText()
         text_r = self.edit_right.toPlainText()
         
@@ -2445,17 +2859,23 @@ class MainWindow(QMainWindow):
         self.edit_right.set_diff_data(opcodes, text_l)
         
         # Highlight
-        self.edit_left.blockSignals(True)
-        self.edit_right.blockSignals(True)
+        left_blocker = QSignalBlocker(self.edit_left)
+        right_blocker = QSignalBlocker(self.edit_right)
         self.highlighter_left.set_diff_data(opcodes, is_left=True)
         self.highlighter_right.set_diff_data(opcodes, is_left=False)
-        self.edit_left.blockSignals(False)
-        self.edit_right.blockSignals(False)
-        
-        # Regex
-        # Regex
-        self.highlighter_left.set_regex(self.project_config.get("regex_left"), self.project_config.get("regex_group_left", 0))
-        self.highlighter_right.set_regex(self.project_config.get("regex_right"), self.project_config.get("regex_group_right", 0))
+        self.highlighter_left.set_regex(
+            self.project_config.get("regex_left"),
+            self.project_config.get("regex_group_left", 0),
+        )
+        self.highlighter_right.set_regex(
+            self.project_config.get("regex_right"),
+            self.project_config.get("regex_group_right", 0),
+        )
+        del right_blocker
+        del left_blocker
+        self._highlight_markup_previews(opcodes)
+        if markup_errors:
+            self.statusBar().showMessage(f"格式错误：{markup_errors[0]}", 8000)
         
         # OCR Mapping
         if ocr_opcodes:
@@ -2553,6 +2973,8 @@ class MainWindow(QMainWindow):
                 self.dirty_pages_left.add(p)
             except: pass
             self.update_memory_cache()
+        if not getattr(self, "_updating_markup_preview", False):
+            self.refresh_markup_views("left")
         self.deferred_run_diff()
         
     def on_text_changed_right(self):
@@ -2564,6 +2986,8 @@ class MainWindow(QMainWindow):
                 self.current_right_dirty_pages().add(p)
             except: pass
             self.update_memory_cache()
+        if not getattr(self, "_updating_markup_preview", False):
+            self.refresh_markup_views("right")
         self.deferred_run_diff()
 
     def on_regex_changed(self):
@@ -2573,11 +2997,23 @@ class MainWindow(QMainWindow):
         self.project_config["regex_group_right"] = self.spin_reg_grp_r.value()
         self.config_manager.save()
         
-        # Update Highlighters
-        self.highlighter_left.set_regex(self.project_config["regex_left"], self.project_config["regex_group_left"])
-        self.highlighter_right.set_regex(self.project_config["regex_right"], self.project_config["regex_group_right"])
+        self._update_source_regex_highlighters()
         
         self.run_diff()
+
+    def _update_source_regex_highlighters(self):
+        left_blocker = QSignalBlocker(self.edit_left)
+        right_blocker = QSignalBlocker(self.edit_right)
+        self.highlighter_left.set_regex(
+            self.project_config.get("regex_left"),
+            self.project_config.get("regex_group_left", 0),
+        )
+        self.highlighter_right.set_regex(
+            self.project_config.get("regex_right"),
+            self.project_config.get("regex_group_right", 0),
+        )
+        del right_blocker
+        del left_blocker
 
     def on_zoom_request(self, delta):
         """Synchronized Font Zoom (Ctrl+Wheel)"""
@@ -2599,6 +3035,11 @@ class MainWindow(QMainWindow):
         # Force line number update
         self.edit_left.update_line_number_area_width(0)
         self.edit_right.update_line_number_area_width(0)
+
+    def on_markup_zoom_request(self, delta):
+        """Keep both rendered comparison surfaces at the same font size."""
+        for preview in (self.preview_left, self.preview_right):
+            preview.adjust_font_size(delta)
 
     def toggle_word_wrap(self, checked):
         mode = QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere if checked else QTextOption.WrapMode.NoWrap
@@ -2667,19 +3108,19 @@ class MainWindow(QMainWindow):
         if self._is_program_scrolling: return
         # Don't sync scroll if we are actively syncing cursor (which handles its own visibility)
         if hasattr(self, '_is_syncing_cursor') and self._is_syncing_cursor: return
+        if not source.isVisible() or not target.isVisible(): return
         
         self._is_program_scrolling = True
-        
-        # Calculate ratio
-        s_bar = source.verticalScrollBar()
-        t_bar = target.verticalScrollBar()
-        
-        if s_bar.maximum() > 0:
+        try:
+            s_bar = source.verticalScrollBar()
+            t_bar = target.verticalScrollBar()
+            if s_bar.maximum() <= 0 or t_bar.maximum() <= 0:
+                return
             ratio = s_bar.value() / s_bar.maximum()
-            t_val = int(ratio * t_bar.maximum())
-            t_bar.setValue(t_val)
-            
-        self._is_program_scrolling = False
+            target_value = round(ratio * t_bar.maximum())
+            t_bar.setValue(target_value)
+        finally:
+            self._is_program_scrolling = False
 
     def request_highlight_other(self, source_editor, idx):
         """根据当前光标位置，高亮另一侧对应位置"""
@@ -3068,10 +3509,13 @@ class MainWindow(QMainWindow):
         revision = getattr(self, "revision_view_widget", None)
         if revision is not None and focus is not None and revision.isAncestorOf(focus):
             side = revision.apply_side()
-            if not revision.apply_current(close=False, confirm_pending=False):
+            if not revision.apply_current(close=False):
                 self.statusBar().showMessage("修订内容未能应用，保存已取消。", 5000)
                 return False
-        elif getattr(self, "last_active_editor", None) is self.edit_right:
+        elif (
+            getattr(self, "last_active_editor", None) is self.edit_right
+            or getattr(getattr(self, "last_active_editor", None), "side", None) == "right"
+        ):
             side = "right"
         else:
             side = "left"
