@@ -338,8 +338,20 @@ def _render_inline(value):
         protected.append(f'<a href="{target}">{label}</a>')
         return token
 
+    def protect_literal_math(match):
+        token = f"\ue000{len(protected)}\ue001"
+        protected.append(match.group(0))
+        return token
+
     # Destinations commonly contain underscores. Protect complete media/link
     # spans so emphasis parsing cannot corrupt their URLs or attributes.
+    for pattern in (
+        r"(?<!\\)\$\$.+?(?<!\\)\$\$",
+        r"(?<!\\)(?<!\$)\$(?!\$).+?(?<!\\)\$(?!\$)",
+        r"\\\(.+?\\\)",
+        r"\\\[.+?\\\]",
+    ):
+        escaped = re.sub(pattern, protect_literal_math, escaped)
     escaped = re.sub(r"!\[([^]]*)\]\(([^)]+)\)", protect_image, escaped)
     escaped = re.sub(r"\[([^]]+)\]\(([^)]+)\)", protect_link, escaped)
     escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
