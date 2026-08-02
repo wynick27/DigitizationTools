@@ -524,6 +524,7 @@ class ProjectManagerDialog(QDialog):
         self.form_layout.addRow(self._text("other_right"), self.list_right_candidates)
         self.form_layout.addRow("", candidate_buttons)
         self.inp_img_dir = self.add_browse_row(self._text("image_dir"), "dir")
+        self.inp_image_base_dir = self.add_browse_row(self._text("image_base_dir"), "dir")
         self.inp_ocr_json = self.add_browse_row(self._text("ocr_dir"), "dir")
         self.inp_export_dir = self.add_browse_row(self._text("export_dir"), "dir")
         
@@ -630,6 +631,7 @@ class ProjectManagerDialog(QDialog):
         self.inp_name.setText(p.get("name"))
         self.inp_pdf.setText(p.get("pdf_path", ""))
         self.inp_img_dir.setText(p.get("image_dir", ""))
+        self.inp_image_base_dir.setText(p.get("image_base_dir", ""))
         self.inp_left_txt.setText(p.get("text_path_left", ""))
         self.inp_right_txt.setText(p.get("text_path_right", ""))
         self.list_right_candidates.clear()
@@ -679,6 +681,7 @@ class ProjectManagerDialog(QDialog):
         # 2. Save Fields
         p["pdf_path"] = self.inp_pdf.text()
         p["image_dir"] = self.inp_img_dir.text()
+        p["image_base_dir"] = self.inp_image_base_dir.text()
         p["text_path_left"] = self.inp_left_txt.text()
         p["text_path_right"] = self.inp_right_txt.text()
         p["right_text_candidates"] = [
@@ -707,8 +710,9 @@ class ProjectManagerDialog(QDialog):
              current_list_item.setText(self.current_project_original_name)
 
     def block_signals_inputs(self, block):
-        inputs = [self.inp_pdf, self.inp_img_dir, self.inp_left_txt, self.inp_right_txt, 
-                  self.inp_ocr_json, self.inp_export_dir, self.inp_reg_l, self.inp_reg_r, self.inp_name,
+        inputs = [self.inp_pdf, self.inp_img_dir, self.inp_image_base_dir,
+                  self.inp_left_txt, self.inp_right_txt, self.inp_ocr_json,
+                  self.inp_export_dir, self.inp_reg_l, self.inp_reg_r, self.inp_name,
                   self.spin_start, self.spin_end, self.spin_offset,
                   self.spin_reg_grp_l, self.spin_reg_grp_r]
         for inp in inputs:

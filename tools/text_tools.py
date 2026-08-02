@@ -8,42 +8,62 @@ PAGE_PATTERN = re.compile(r"<(\d+)>")
 
 def read_text_to_pages(file_path: str) -> dict[int, str]:
     pages = {}
-    if not os.path.exists(file_path): 
+    if not file_path or not os.path.exists(file_path):
+        return pages
+    lower = file_path.lower()
+    if lower.endswith((".json", ".mdx", ".mdx.txt")):
         return pages
     try:
+        with open(file_path, "r", encoding="utf-8-sig") as stream:
+            source = stream.read()
+
         current_page = None
         current_content = []
-        with open(file_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.rstrip("\n")
-                match = PAGE_PATTERN.fullmatch(line.strip())
-                if match:
-                    if current_page is not None:
-                        pages[current_page] = "\n".join(current_content)
-                    current_page = int(match.group(1))
-                    current_content = []
-                else:
-                    current_content.append(line)
-            if current_page is not None:
-                pages[current_page] = "\n".join(current_content)
-    except Exception as e:
-        print(f"Read error {file_path}: {e}")
-    return pages
+        found_page_marker = False
+        for line in source.splitlines():
+            match = PAGE_PATTERN.fullmatch(line.strip())
+            if match:
+                found_page_marker = True
+                if current_page is not None:
+                    pages[current_page] = "\n".join(current_content)
+                current_page = int(match.group(1))
+                current_content = []
+            elif current_page is not None:
+                current_content.append(line)
+        if current_page is not None:
+            pages[current_page] = "\n".join(current_content)
 
+        if found_page_marker:
+            return pages
+
+        return {1: source}
+    except Exception as exc:
+        print(f"Read error {file_path}: {exc}")
+        return {}
 def write_pages_to_file(pages: dict[int, str], file_path: str):
     try:
-        sorted_pages = sorted(pages.keys())
-        with open(file_path, 'w', encoding='utf8') as f:
-            for page in sorted_pages:
-                text = pages[page]
-                f.write(f'<{page}>\n')
-                f.write(f'{text}\n')
+        existing_has_markers = False
+        if os.path.exists(file_path):
+            with open(file_path, "r", encoding="utf-8-sig") as source:
+                existing_has_markers = any(
+                    PAGE_PATTERN.fullmatch(line.strip())
+                    for line in source
+                )
+        single_document = set(pages) == {1} and not existing_has_markers
+        with open(file_path, "w", encoding="utf-8", newline="\n") as stream:
+            if single_document:
+                stream.write(pages[1])
+            else:
+                for page in sorted(pages):
+                    stream.write(f"<{page}>\n")
+                    stream.write(pages[page])
+                    if not pages[page].endswith("\n"):
+                        stream.write("\n")
         print(f"Saved to {file_path}")
         return True
-    except Exception as e:
-        print(f"Save error: {e}")
+    except Exception as exc:
+        print(f"Save error: {exc}")
         return False
-
 class MergeTextDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
