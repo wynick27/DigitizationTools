@@ -1,5 +1,7 @@
 import os
 import json
+import html
+import shutil
 import time
 import threading
 import requests
@@ -12,6 +14,11 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QImageReader
 
 from ocr.ocr_utils import get_page_image, TextToBBoxMapper, BBoxMerger, ImageStitcher
+from tools.image_review.models import ReviewMode
+from tools.image_review.service import OverrideStore
+from tools.image_review.sources import (
+    ImageAuditSource, default_override_path, dictionary_item_id,
+)
 
 # v2 API constants
 _V2_JOB_URL = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
@@ -493,6 +500,58 @@ class ImageExportWorker(QThread):
         self.mapper = TextToBBoxMapper(project_config.get('ocr_json_path', 'ocr_results'), project_config.get('page_offset', 0))
         self.merger = BBoxMerger()
         self.stitcher = ImageStitcher()
+        self.source_path = project_config.get("_image_export_source_path") or project_config.get(
+            "text_path_left" if side == "left" else "text_path_right", ""
+        )
+        override_path = default_override_path(
+            self.source_path, ReviewMode.DICTIONARY_SLICES, project_config, side
+        )
+        self.slice_overrides = OverrideStore(override_path).load()
+        self.audit_source = ImageAuditSource(self.source_path, project_config)
+        self.audit_items = self.audit_source.scan()
+        audit_override = (
+            self.audit_source.override_path
+            or default_override_path(
+                self.source_path, ReviewMode.MARKDOWN_IMAGES, project_config, side
+            )
+        )
+        self.audit_store = OverrideStore(audit_override)
+        self.audit_store.load()
+        self.audit_store.apply_to(self.audit_items)
+
+    def _copy_entry_images(self, entry_id, headword, output_dir, reserved_names=()):
+        exact = [
+            item for item in self.audit_items
+            if item.entry_id and item.entry_id == entry_id and not item.ignored
+        ]
+        candidates = exact or [
+            item for item in self.audit_items
+            if str(item.metadata.get("headword") or "") == headword and not item.ignored
+        ]
+        result = []
+        used = {str(name).casefold() for name in reserved_names}
+        for item in sorted(candidates, key=lambda value: (
+            int(value.metadata.get("image_order") or 0), value.page, value.sequence
+        )):
+            source = str(item.metadata.get("local_path") or "")
+            if not source or not os.path.isfile(source):
+                continue
+            filename = os.path.basename(item.output_name or item.original_name or source)
+            stem, extension = os.path.splitext(filename)
+            candidate = filename
+            suffix = 2
+            while candidate.casefold() in used:
+                candidate = f"{stem}_{suffix}{extension}"
+                suffix += 1
+            used.add(candidate.casefold())
+            target = os.path.join(output_dir, candidate)
+            if os.path.abspath(source) != os.path.abspath(target):
+                shutil.copy2(source, target)
+            result.append({
+                "path": candidate,
+                "caption": str(item.metadata.get("caption") or ""),
+            })
+        return result
 
     def run(self):
         try:
@@ -524,45 +583,70 @@ class ImageExportWorker(QThread):
                     self.progress.emit(f"Processing ({i+1}/{total}): {headword}...")
                     self.progress_val.emit(i + 1)
 
-                bboxes = self.mapper.find_bboxes(entry['text'], entry['pages'])
+                page_num = entry['pages'][0] if entry['pages'] else 0
+                page_idx = entry.get('page_index', 0)
+                stable_id = dictionary_item_id(
+                    self.source_path, self.side, headword, page_num, page_idx
+                )
+                override = self.slice_overrides.get(stable_id, {})
+                img_filename = (
+                    override.get("output_name")
+                    if isinstance(override, dict) and override.get("output_name")
+                    else f"{page_num}_{page_idx}.jpg"
+                )
+                entry["images"] = self._copy_entry_images(
+                    stable_id, headword, out_img_dir, (img_filename,)
+                )
+                override_segments = override.get("segments") if isinstance(override, dict) else None
+                if override_segments:
+                    merged = []
+                    for segment in sorted(override_segments, key=lambda value: value.get("order", 0)):
+                        bbox = segment.get("bbox") or []
+                        if len(bbox) != 4:
+                            continue
+                        x1, y1, x2, y2 = (float(value) for value in bbox)
+                        if x2 > x1 and y2 > y1:
+                            merged.append({
+                                "x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1,
+                                "r": x2, "b": y2, "page": int(segment.get("page") or page_num),
+                            })
+                    is_vertical = override.get("metadata", {}).get("orientation") == "vertical"
+                else:
+                    bboxes = self.mapper.find_bboxes(entry['text'], entry['pages'])
+                    merged = self.merger.merge(bboxes) if bboxes else []
+                    is_vertical = any(b['label'] == 'vertical_text' for b in bboxes) if bboxes else False
 
-                if bboxes:
-                    merged = self.merger.merge(bboxes)
-                    is_vertical = any(b['label'] == 'vertical_text' for b in bboxes)
+                if not merged:
+                    continue
+                pred_w, pred_h = self.stitcher.predict_size(merged, is_vertical)
+                if pred_w > 65500 or pred_h > 65500:
+                    self.progress.emit(f"SKIPPED {headword}: Size {pred_w}x{pred_h} > 65500")
+                    continue
 
-                    pred_w, pred_h = self.stitcher.predict_size(merged, is_vertical)
+                save_path = os.path.join(out_img_dir, img_filename)
 
-                    if pred_w > 65500 or pred_h > 65500:
-                        self.progress.emit(f"SKIPPED {headword}: Size {pred_w}x{pred_h} > 65500")
-                        continue
+                should_stitch = True
+                if not self.force_overwrite and os.path.exists(save_path):
+                    try:
+                        reader = QImageReader(save_path)
+                        size = reader.size()
+                        if size.isValid():
+                            diff_w = abs(size.width() - pred_w)
+                            diff_h = abs(size.height() - pred_h)
+                            if diff_w < 5 and diff_h < 5:
+                                should_stitch = False
+                    except Exception:
+                        pass
 
-                    page_num = entry['pages'][0] if entry['pages'] else 0
-                    page_idx = entry.get('page_index', 0)
-                    img_filename = f"{page_num}_{page_idx}.jpg"
-                    save_path = os.path.join(out_img_dir, img_filename)
+                if should_stitch:
+                    stitched_img = self.stitcher.stitch(
+                        merged, doc, self.project_config.get('image_dir'),
+                        self.project_config.get('page_offset', 0), is_vertical
+                    )
+                    if stitched_img:
+                        stitched_img.save(save_path)
 
-                    should_stitch = True
-                    if not self.force_overwrite and os.path.exists(save_path):
-                        try:
-                            reader = QImageReader(save_path)
-                            size = reader.size()
-                            if size.isValid():
-                                diff_w = abs(size.width() - pred_w)
-                                diff_h = abs(size.height() - pred_h)
-                                if diff_w < 5 and diff_h < 5:
-                                    should_stitch = False
-                        except Exception:
-                            pass
-
-                    if should_stitch:
-                        stitched_img = self.stitcher.stitch(
-                            merged, doc, self.project_config.get('image_dir'),
-                            self.project_config.get('page_offset', 0), is_vertical
-                        )
-                        if stitched_img:
-                            stitched_img.save(save_path)
-
-                    entry['image_path'] = img_filename
+                entry['image_path'] = img_filename
 
             self.progress.emit("Saving index file...")
 
@@ -579,6 +663,13 @@ class ImageExportWorker(QThread):
                         f.write(f"{e['text']}\n".replace('\n', '<br>\n'))
                         if 'image_path' in e:
                             f.write(f'<img src="{e["image_path"]}" />\n')
+                        for attached in e.get("images", ()):
+                            caption = html.escape(str(attached.get("caption") or ""))
+                            f.write("<figure>")
+                            f.write(f'<img src="{attached["path"]}" />')
+                            if caption:
+                                f.write(f"<figcaption>{caption}</figcaption>")
+                            f.write("</figure>\n")
                         f.write("</>\n")
 
             self.finished.emit(True, f"Export success! Saved to {final_path}")

@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass, field
 
 from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QTextOption as QtGuiTextOption
 from PyQt6.QtWidgets import QTextEdit
 
 
@@ -64,6 +65,8 @@ class MarkupPreviewEdit(QTextEdit):
         super().__init__(parent)
         self.side = side
         self.setAcceptRichText(False)
+        self.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.setWordWrapMode(QtGuiTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
 
     def focusInEvent(self, event):
         self.focus_in_signal.emit()
@@ -542,7 +545,7 @@ def build_markup_projection(source, mode="plain"):
         return _project_markdown(source)
     return MarkupProjection(
         "plain", source, source, list(range(len(source) + 1)),
-        f"<pre>{html.escape(source)}</pre>", [],
+        f'<pre style="white-space: pre-wrap; margin: 0">{html.escape(source)}</pre>', [],
     )
 
 

@@ -846,7 +846,15 @@ class ExportManager:
                 return
             
             from ocr.ocr_worker import ImageExportWorker
-            self.mw.img_export_worker = ImageExportWorker(entries, self.mw.project_config, fmt, export_dir, side, force_overwrite)
+            worker_config = dict(self.mw.project_config)
+            worker_config["_image_export_source_path"] = (
+                self.mw.project_config.get("text_path_left", "")
+                if side == "left"
+                else self.mw.get_current_right_text_path()
+            )
+            self.mw.img_export_worker = ImageExportWorker(
+                entries, worker_config, fmt, export_dir, side, force_overwrite
+            )
             
             self.mw.progress_dlg = QProgressDialog("Initializing...", "Cancel", 0, len(entries), self.mw)
             self.mw.progress_dlg.setWindowTitle("Exporting Images")
