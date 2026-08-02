@@ -146,6 +146,7 @@ class BaseStructuredSource:
         self.pending_bodies = {}
         self._headword_items_cache = None
         self._headword_key_index_cache = None
+        self._headword_cache_lock = threading.RLock()
 
     def fingerprint(self):
         stat = os.stat(self.path)
