@@ -528,9 +528,9 @@ class ProjectManagerDialog(QDialog):
         self.inp_export_dir = self.add_browse_row(self._text("export_dir"), "dir")
         
         # 3. Numeric Fields
-        self.spin_start = QSpinBox(); self.spin_start.setRange(1, 9999)
-        self.spin_end = QSpinBox(); self.spin_end.setRange(1, 9999)
-        self.spin_offset = QSpinBox(); self.spin_offset.setRange(-999, 999)
+        self.spin_start = QSpinBox(); self.spin_start.setRange(1, 99999)
+        self.spin_end = QSpinBox(); self.spin_end.setRange(1, 99999)
+        self.spin_offset = QSpinBox(); self.spin_offset.setRange(-99999, 99999)
         
         self.spin_start.valueChanged.connect(self.save_current_project)
         self.spin_end.valueChanged.connect(self.save_current_project)

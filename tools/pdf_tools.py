@@ -39,7 +39,7 @@ class SplitPdfDialog(QDialog):
         
         self.spin_split = QSpinBox()
         self.spin_split.setMinimum(1)
-        self.spin_split.setMaximum(9999)
+        self.spin_split.setMaximum(99999)
         self.spin_split.setValue(10)
         layout.addRow("每次拆分包含页数:", self.spin_split)
         
