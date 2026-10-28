@@ -1,9 +1,10 @@
-import difflib
 import hashlib
 import threading
+import bisect
 from collections import OrderedDict
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QThread, pyqtSignal
+from tools.diff_engine import DEFAULT_DIFF_ENGINE
 
 
 def expand_custom_diff_format(format_text, old_segment, new_segment, old_match=None, new_match=None):
@@ -89,9 +90,8 @@ class ReviewDiffWorker(QThread):
         self.chk_replace = check_replace
         self.custom_replace_format = custom_replace_format
 
-        # Global reviews commonly span thousands of pages. Keep enough entries
-        # for both target directions so a sequential rerun does not thrash a
-        # small LRU cache before reaching the pages cached most recently.
+        # Opcodes are cached in the canonical left-to-right direction, so the
+        # same entry is reused regardless of the selected replacement side.
         self._ensure_cache_capacity(len(pages))
         
         self.is_running = True
@@ -111,7 +111,7 @@ class ReviewDiffWorker(QThread):
 
     @classmethod
     def _ensure_cache_capacity(cls, page_count):
-        desired = max(256, page_count * 2)
+        desired = max(256, page_count)
         with cls._opcode_cache_lock:
             cls._opcode_cache_limit = max(
                 cls._opcode_cache_limit,
@@ -120,6 +120,8 @@ class ReviewDiffWorker(QThread):
 
     @classmethod
     def _get_opcodes(cls, text_a, text_b):
+        if text_a == text_b:
+            return (("equal", 0, len(text_a), 0, len(text_b)),), False
         key = (
             len(text_a), cls._text_cache_digest(text_a),
             len(text_b), cls._text_cache_digest(text_b),
@@ -130,15 +132,24 @@ class ReviewDiffWorker(QThread):
                 cls._opcode_cache.move_to_end(key)
                 return cached, True
 
-        opcodes = tuple(
-            difflib.SequenceMatcher(None, text_a, text_b, autojunk=False).get_opcodes()
-        )
+        # Reuse the result already calculated for the visible page by the main
+        # comparison view. The review cache then retains global-page results
+        # beyond the shared engine's smaller interactive LRU.
+        opcodes = tuple(DEFAULT_DIFF_ENGINE.compare(text_a, text_b).opcodes)
         with cls._opcode_cache_lock:
             cls._opcode_cache[key] = opcodes
             cls._opcode_cache.move_to_end(key)
             while len(cls._opcode_cache) > cls._opcode_cache_limit:
                 cls._opcode_cache.popitem(last=False)
         return opcodes, False
+
+    @staticmethod
+    def _reverse_opcodes(opcodes):
+        reverse_tag = {"insert": "delete", "delete": "insert"}
+        return tuple(
+            (reverse_tag.get(tag, tag), j1, j2, i1, i2)
+            for tag, i1, i2, j1, j2 in opcodes
+        )
         
     def run(self):
         try:
@@ -152,8 +163,7 @@ class ReviewDiffWorker(QThread):
                 t_l = self.pages_left.get(p, "")
                 t_r = self.pages_right.get(p, "")
                 
-                text_a = ""
-                text_b = ""
+                opcodes, cache_hit = self._get_opcodes(t_l, t_r)
                 if self.target_is_left:
                      # Target=Left. Turn Left into Right.
                      text_a = t_l
@@ -162,16 +172,22 @@ class ReviewDiffWorker(QThread):
                      # Target=Right. Turn Right into Left.
                      text_a = t_r
                      text_b = t_l
+                     opcodes = self._reverse_opcodes(opcodes)
                 
-                self._generate_diff_items(p, text_a, text_b)
+                self._generate_diff_items(
+                    p, text_a, text_b, opcodes=opcodes, cache_hit=cache_hit
+                )
                 
             self.finished.emit(self.items, "Done")
             
         except Exception as e:
             self.finished.emit([], str(e))
             
-    def _generate_diff_items(self, page_num, text_a, text_b):
-        opcodes, cache_hit = self._get_opcodes(text_a, text_b)
+    def _generate_diff_items(
+        self, page_num, text_a, text_b, opcodes=None, cache_hit=False
+    ):
+        if opcodes is None:
+            opcodes, cache_hit = self._get_opcodes(text_a, text_b)
         if cache_hit:
             self.cache_hits += 1
         
@@ -179,6 +195,13 @@ class ReviewDiffWorker(QThread):
         scope_spans = []
         if self.regex_scope:
             scope_spans = [m.span() for m in self.regex_scope.finditer(text_a)]
+        scope_starts = [start for start, _end in scope_spans]
+        scope_ends = [end for _start, end in scope_spans]
+
+        line_starts = [0]
+        line_starts.extend(
+            index + 1 for index, char in enumerate(text_a) if char == "\n"
+        )
         
         import html
         
@@ -212,9 +235,19 @@ class ReviewDiffWorker(QThread):
              if self.regex_scope:
                  # Check if the diff overlap with any scope match
                  if i1 == i2:  # Insert: use its insertion point.
-                     in_scope = any(start <= i1 < end for start, end in scope_spans)
+                     scope_index = bisect.bisect_right(scope_starts, i1) - 1
+                     in_scope = (
+                         scope_index >= 0 and scope_spans[scope_index][1] > i1
+                     )
                  else:
-                     in_scope = any(i1 < end and start < i2 for start, end in scope_spans)
+                     # Regex finditer spans are ordered and non-overlapping. The
+                     # first span ending after this diff is the only candidate
+                     # needed for an overlap test.
+                     scope_index = bisect.bisect_right(scope_ends, i1)
+                     in_scope = (
+                         scope_index < len(scope_spans)
+                         and scope_spans[scope_index][0] < i2
+                     )
                  if self.scope_exclude and in_scope:
                      continue
                  if not self.scope_exclude and not in_scope:
@@ -255,10 +288,9 @@ class ReviewDiffWorker(QThread):
                   diff_html = f"{prefix}<span style='{style_ins}'>{seg_new_esc}</span>{suffix}"
             
              # Line/Col Calculation
-             line = text_a.count('\n', 0, i1) + 1
-             last_nl = text_a.rfind('\n', 0, i1)
-             if last_nl == -1: col = i1 + 1
-             else: col = i1 - last_nl
+             line_index = bisect.bisect_right(line_starts, i1) - 1
+             line = line_index + 1
+             col = i1 - line_starts[line_index] + 1
 
              item_data = {
                 'page_num': page_num,

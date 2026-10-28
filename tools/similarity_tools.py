@@ -1,4 +1,3 @@
-import difflib
 import re
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
@@ -19,11 +18,13 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
+from tools.diff_engine import DEFAULT_DIFF_ENGINE
+
 
 def text_similarity(left_text: str, right_text: str) -> float:
     if not left_text and not right_text:
         return 1.0
-    return difflib.SequenceMatcher(None, left_text or "", right_text or "", autojunk=False).ratio()
+    return DEFAULT_DIFF_ENGINE.compare(left_text or "", right_text or "").ratio
 
 
 def calculate_page_similarities(pages_left: dict[int, str], pages_right: dict[int, str]) -> list[dict]:

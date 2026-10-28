@@ -1,3 +1,4 @@
+from tools.diff_engine import DEFAULT_DIFF_ENGINE
 import sys
 import os
 import json
@@ -26,7 +27,7 @@ from tools.text_tools import MergeTextDialog, read_text_to_pages, write_pages_to
 from tools.furigana import generate_furigana_string, HAS_FURIGANA, HAS_KAKASI
 from tools.project_manager_ui import ProjectManagerDialog
 from tools.export_manager import ExportManager
-from tools.similarity_tools import SimilarityDialog, calculate_page_similarities, text_similarity
+from tools.similarity_tools import SimilarityDialog, calculate_page_similarities
 from tools.headword_compare_tools import HeadwordCompareDialog
 from tools.report_review_tools import ReportReviewDialog
 from tools.revision_view import RevisionViewWidget
@@ -268,132 +269,120 @@ class ConfigManager:
 # 1. 自定义编辑器 (支持 Diff 交互) & Highlighter
 # ==========================================
 
+def qt_position_map(text):
+    """Return Python-index to UTF-16 position mapping in one pass."""
+    positions = [0]
+    qt_position = 0
+    for char in str(text or ""):
+        qt_position += 2 if ord(char) > 0xFFFF else 1
+        positions.append(qt_position)
+    return positions
+
+
 class DiffSyntaxHighlighter(QSyntaxHighlighter):
     def __init__(self, document):
         super().__init__(document)
-        self.diff_ranges = [] # List of tuples (start, end)
-        self.diff_starts = [] # List of start positions for bisect
-        self.diff_ranges = [] # List of tuples (start, end)
-        self.diff_starts = [] # List of start positions for bisect
+        self.diff_ranges = []
+        self.diff_starts = []
         self.regex_pattern = None
         self.regex_group = 0
-        
-        # 预定义格式
-        self.diff_fmt = QTextCharFormat()
-        self.diff_fmt.setForeground(QColor("red"))
-        self.diff_fmt.setBackground(QColor("#FFEEEE")) # 浅红背景
-        
-        self.regex_fmt = QTextCharFormat()
-        self.regex_fmt.setBackground(QColor("#E0F0FF")) # 浅蓝
-        
-        # Merge Format (Diff FG + Regex BG)
-        self.both_fmt = QTextCharFormat()
-        self.both_fmt.setForeground(QColor("red"))
-        self.both_fmt.setBackground(QColor("#E0F0FF"))
-        
+        self.diff_format = QTextCharFormat()
+        self.diff_format.setForeground(QColor("#b42318"))
+        self.diff_format.setBackground(QColor("#ffebe9"))
+        self.regex_format = QTextCharFormat()
+        self.regex_format.setBackground(QColor("#dceeff"))
+        self.both_format = QTextCharFormat(self.diff_format)
+        self.both_format.setBackground(QColor("#dceeff"))
+
     def set_diff_data(self, opcodes, is_left):
-        self.diff_ranges = []
         text = self.document().toPlainText()
-        
-        for tag, i1, i2, j1, j2 in opcodes:
-            if tag == 'equal': continue
-            s_py, e_py = (i1, i2) if is_left else (j1, j2)
-            if s_py < e_py:
-                s_qt = to_qt_pos(text, s_py)
-                e_qt = to_qt_pos(text, e_py)
-                self.diff_ranges.append((s_qt, e_qt))
-        
-        self.diff_ranges.sort() # Ensure sorted
-        self.diff_starts = [r[0] for r in self.diff_ranges]
+        positions = qt_position_map(text)
+        ranges = []
+        for tag, i1, i2, j1, j2 in opcodes or ():
+            if tag == "equal":
+                continue
+            start, end = (i1, i2) if is_left else (j1, j2)
+            if start < end:
+                ranges.append((positions[start], positions[end]))
+        self.diff_ranges = sorted(ranges)
+        self.diff_starts = [start for start, _end in self.diff_ranges]
         self.rehighlight()
-        
-    def set_regex(self, regex_str, group_id=0):
-        if not regex_str:
+
+    def set_regex(self, pattern, group=0):
+        try:
+            self.regex_pattern = re.compile(pattern) if pattern else None
+        except re.error:
             self.regex_pattern = None
-        else:
-            try:
-                self.regex_pattern = re.compile(regex_str)
-            except:
-                self.regex_pattern = None
-        self.regex_group = group_id
+        self.regex_group = group
+        self.rehighlight()
+
+    def set_diff_and_regex(self, opcodes, is_left, pattern, group=0):
+        text = self.document().toPlainText()
+        positions = qt_position_map(text)
+        ranges = []
+        for tag, i1, i2, j1, j2 in opcodes or ():
+            if tag == "equal":
+                continue
+            start, end = (i1, i2) if is_left else (j1, j2)
+            if start < end:
+                ranges.append((positions[start], positions[end]))
+        self.diff_ranges = sorted(ranges)
+        self.diff_starts = [start for start, _end in self.diff_ranges]
+        try:
+            self.regex_pattern = re.compile(pattern) if pattern else None
+        except re.error:
+            self.regex_pattern = None
+        self.regex_group = group
         self.rehighlight()
 
     def highlightBlock(self, text):
-        length = len(text)
-        if length == 0: return
-
-        # Optimization: use boolean array to track states
-        has_diff = [False] * length
-        has_regex = [False] * length
-        
+        if not text:
+            return
+        qt_positions = qt_position_map(text)
         block_start = self.currentBlock().position()
-        block_end = block_start + length
-        
-        # 1. Fill Diff
+        block_end = block_start + qt_positions[-1]
+        events = {}
+
+        def add_interval(start, end, kind):
+            if start >= end:
+                return
+            events.setdefault(start, [0, 0])[kind] += 1
+            events.setdefault(end, [0, 0])[kind] -= 1
+
         if self.diff_ranges:
-            end_idx = bisect.bisect_right(self.diff_starts, block_end)
-            start_search = bisect.bisect_right(self.diff_starts, block_start)
-            if start_search > 0: start_search -= 1
-            
-            count = 0 
-            for i in range(start_search, end_idx):
-                if count > 1000: break 
-                s, e = self.diff_ranges[i]
-                
-                intersect_start = max(s, block_start)
-                intersect_end = min(e, block_end)
-                
-                if intersect_start < intersect_end:
-                    rel_s = intersect_start - block_start
-                    rel_e = intersect_end - block_start
-                    has_diff[rel_s:rel_e] = [True] * (rel_e - rel_s)
-                count += 1
-        
-        # 2. Fill Regex
+            end_index = bisect.bisect_right(self.diff_starts, block_end)
+            start_index = max(0, bisect.bisect_right(self.diff_starts, block_start) - 1)
+            for start, end in self.diff_ranges[start_index:end_index]:
+                left = max(start, block_start) - block_start
+                right = min(end, block_end) - block_start
+                add_interval(left, right, 0)
         if self.regex_pattern:
-            count = 0
-            for match in self.regex_pattern.finditer(text):
-                if count > 100: break 
+            for index, match in enumerate(self.regex_pattern.finditer(text)):
+                if index >= 100:
+                    break
                 try:
-                    s, e = match.start(self.regex_group), match.end(self.regex_group)
-                except IndexError:
-                    # Fallback if group not found
-                    s, e = match.start(), match.end()
-                    
-                # Bound checks although finditer on text should be within text
-                s = max(0, s); e = min(length, e)
-                if s < e:
-                    has_regex[s:e] = [True] * (e - s)
-                count += 1
+                    start, end = match.span(self.regex_group)
+                except (IndexError, KeyError):
+                    start, end = match.span(0)
+                if start < end:
+                    add_interval(qt_positions[start], qt_positions[end], 1)
 
-        # 3. Apply Formats
-        # Run-Length Encoding approach to minimize setFormat calls
-        current_start = 0
-        current_type = (has_diff[0], has_regex[0]) 
-        
-        for i in range(1, length):
-            new_type = (has_diff[i], has_regex[i])
-            if new_type != current_type:
-                self.apply_format_chunk(current_start, i - current_start, current_type)
-                current_start = i
-                current_type = new_type
-        
-        self.apply_format_chunk(current_start, length - current_start, current_type)
-
-    def apply_format_chunk(self, start, length, flags):
-        is_diff, is_regex = flags
-        if not is_diff and not is_regex: return
-        
-        fmt = None
-        if is_diff and is_regex:
-            fmt = self.both_fmt
-        elif is_diff:
-            fmt = self.diff_fmt
-        elif is_regex:
-            fmt = self.regex_fmt
-            
-        if fmt:
-            self.setFormat(start, length, fmt)
+        active_diff = 0
+        active_regex = 0
+        previous = 0
+        for position in sorted(events):
+            if position > previous and (active_diff or active_regex):
+                if active_diff and active_regex:
+                    fmt = self.both_format
+                elif active_diff:
+                    fmt = self.diff_format
+                else:
+                    fmt = self.regex_format
+                self.setFormat(previous, position - previous, fmt)
+            diff_delta, regex_delta = events[position]
+            active_diff += diff_delta
+            active_regex += regex_delta
+            previous = position
 
 
 class LineNumberArea(QWidget):
@@ -868,7 +857,7 @@ class ImageCanvas(QGraphicsView):
 # OCRWorker moved to ocr.ocr_worker
 
 class DiffWorker(QThread):
-    result_ready = pyqtSignal(list, list, list, list)
+    result_ready = pyqtSignal(list, list, list, list, float)
 
     def __init__(
         self, text_l, text_r, ocr_text_full, need_ocr_map,
@@ -884,35 +873,25 @@ class DiffWorker(QThread):
         self.mode_right = mode_right
     
     def run(self):
-        # Main Diff
-        errors = []
-        if self.ignore_markup:
-            projection_left = build_markup_projection(self.text_l, self.mode_left)
-            projection_right = build_markup_projection(self.text_r, self.mode_right)
-            matcher = difflib.SequenceMatcher(
-                None,
-                projection_left.visible_text,
-                projection_right.visible_text,
-                autojunk=False,
-            )
-            visible_opcodes = matcher.get_opcodes()
-            opcodes = map_projection_opcodes(
-                visible_opcodes, projection_left, projection_right
-            )
-            errors.extend(f"左侧：{error.display()}" for error in projection_left.errors)
-            errors.extend(f"右侧：{error.display()}" for error in projection_right.errors)
-        else:
-            matcher = difflib.SequenceMatcher(None, self.text_l, self.text_r, autojunk=False)
-            opcodes = matcher.get_opcodes()
-            visible_opcodes = opcodes
-        
-        # OCR Mapping Diff
-        ocr_opcodes = []
-        if self.need_ocr_map and self.ocr_text_full:
-             m2 = difflib.SequenceMatcher(None, self.text_l, self.ocr_text_full, autojunk=False)
-             ocr_opcodes = m2.get_opcodes()
-             
-        self.result_ready.emit(opcodes, ocr_opcodes, visible_opcodes, errors)
+        result = DEFAULT_DIFF_ENGINE.compare(
+            self.text_l,
+            self.text_r,
+            self.ignore_markup,
+            self.mode_left,
+            self.mode_right,
+        )
+        ocr_opcodes = (
+            DEFAULT_DIFF_ENGINE.compare_for_ocr(self.text_l, self.ocr_text_full)
+            if self.need_ocr_map
+            else ()
+        )
+        self.result_ready.emit(
+            list(result.opcodes),
+            list(ocr_opcodes),
+            list(result.visible_opcodes),
+            list(result.errors),
+            float(result.ratio),
+        )
 
 # ==========================================
 # 4. Smart Image Export Helpers
@@ -2378,7 +2357,7 @@ class MainWindow(QMainWindow):
             self._show_similarity_after_load = not getattr(self, "_suppress_next_load_similarity_status", False)
             self._suppress_next_load_similarity_status = False
             self.refresh_markup_views()
-            self.deferred_run_diff()
+            self.run_diff_async()
             
             # Record last loaded source
             self.last_loaded_source = "OCR Results" if is_ocr_mode else "Text File B"
@@ -2835,9 +2814,10 @@ class MainWindow(QMainWindow):
         if not self.ocr_text_full: 
             self.ocr_diff_opcodes = []
             return
-            
-        matcher = difflib.SequenceMatcher(None, left_text, self.ocr_text_full, autojunk=False)
-        self.ocr_diff_opcodes = matcher.get_opcodes()
+
+        self.ocr_diff_opcodes = DEFAULT_DIFF_ENGINE.compare_for_ocr(
+            left_text, self.ocr_text_full
+        )
 
     def init_diff_timer(self):
         self.diff_timer = QTimer(self)
@@ -2871,6 +2851,9 @@ class MainWindow(QMainWindow):
             mode_left=self.markup_mode("left"),
             mode_right=self.markup_mode("right"),
         )
+        self.diff_worker.source_text_left = text_l
+        self.diff_worker.source_text_right = text_r
+        self._rerun_diff_after_worker = False
         self.diff_worker.result_ready.connect(self.on_diff_finished)
         self.diff_worker.finished.connect(self.on_diff_thread_finished)
         self.diff_worker.start()
@@ -2878,10 +2861,27 @@ class MainWindow(QMainWindow):
     def on_diff_thread_finished(self):
         self._is_updating_diff = False
         self.diff_worker = None
+        if getattr(self, "_rerun_diff_after_worker", False):
+            self._rerun_diff_after_worker = False
+            QTimer.singleShot(0, self.run_diff_async)
 
-    def on_diff_finished(self, opcodes, ocr_opcodes, visible_opcodes, markup_errors):
+    def on_diff_finished(
+        self, opcodes, ocr_opcodes, visible_opcodes, markup_errors, similarity
+    ):
         text_l = self.edit_left.toPlainText()
         text_r = self.edit_right.toPlainText()
+        worker = getattr(self, "diff_worker", None)
+        if (
+            worker is None
+            or text_l != getattr(worker, "source_text_left", text_l)
+            or text_r != getattr(worker, "source_text_right", text_r)
+            or self.chk_ignore_markup.isChecked() != getattr(worker, "ignore_markup", False)
+            or self.markup_mode("left") != getattr(worker, "mode_left", "plain")
+            or self.markup_mode("right") != getattr(worker, "mode_right", "plain")
+        ):
+            self._rerun_diff_after_worker = True
+            return
+        self.current_diff_opcodes = tuple(opcodes or ())
         
         # Set Data
         self.edit_left.set_diff_data(opcodes, text_r)
@@ -2890,13 +2890,15 @@ class MainWindow(QMainWindow):
         # Highlight
         left_blocker = QSignalBlocker(self.edit_left)
         right_blocker = QSignalBlocker(self.edit_right)
-        self.highlighter_left.set_diff_data(opcodes, is_left=True)
-        self.highlighter_right.set_diff_data(opcodes, is_left=False)
-        self.highlighter_left.set_regex(
+        self.highlighter_left.set_diff_and_regex(
+            opcodes,
+            True,
             self.project_config.get("regex_left"),
             self.project_config.get("regex_group_left", 0),
         )
-        self.highlighter_right.set_regex(
+        self.highlighter_right.set_diff_and_regex(
+            opcodes,
+            False,
             self.project_config.get("regex_right"),
             self.project_config.get("regex_group_right", 0),
         )
@@ -2919,8 +2921,9 @@ class MainWindow(QMainWindow):
         if getattr(self, "_show_similarity_after_load", False):
             self._show_similarity_after_load = False
             page = self.current_loaded_page if self.current_loaded_page is not None else self.spin_page.text()
-            ratio = text_similarity(text_l, text_r)
-            self.statusBar().showMessage(f"Page {page} Similarity: {ratio * 100:.2f}%")
+            self.statusBar().showMessage(
+                f"Page {page} Similarity: {similarity * 100:.2f}%"
+            )
 
     # ================= 交互 =================
 

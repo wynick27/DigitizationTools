@@ -625,3 +625,30 @@ def apply_visible_text_edit(source, projection, new_visible_text):
     if source_cursor < len(source):
         output.append(source[source_cursor:])
     return "".join(output)
+
+
+def collapse_projection_whitespace(projection):
+    """Collapse formatting whitespace while retaining source position mapping."""
+    chars = []
+    mapping = []
+    pending_space = None
+    for index, char in enumerate(projection.visible_text):
+        source_position = projection.visible_to_source[index]
+        if char.isspace():
+            if chars and pending_space is None:
+                pending_space = source_position
+            continue
+        if pending_space is not None:
+            chars.append(" ")
+            mapping.append(pending_space)
+            pending_space = None
+        chars.append(char)
+        mapping.append(source_position)
+    return MarkupProjection(
+        projection.mode,
+        projection.source,
+        "".join(chars),
+        mapping + [len(projection.source)],
+        projection.rendered_html,
+        list(projection.errors),
+    )
