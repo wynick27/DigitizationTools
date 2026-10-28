@@ -6,7 +6,7 @@ import re
 import fitz
 import tempfile
 from importlib import metadata
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QImageReader
 
@@ -218,6 +218,8 @@ class OCRWorker(QThread):
                         return False, page_num, "cancelled"
                     try:
                         result = self._run_engine(img_bytes, token, model, page_num)
+                        if not self._is_running:
+                            return False, page_num, "cancelled"
                         json_path = get_result_path(save_dir, real_page_num, self.engine, self.global_config)
                         payload = {
                             "__engine": self.engine,
@@ -244,22 +246,25 @@ class OCRWorker(QThread):
                 return False, page_num, str(last_exc)
 
             # PyMuPDF documents are not thread-safe, so page extraction stays on
-            # this QThread. Keep only one concurrency-sized image batch in memory.
+            # this QThread. Refill each free slot without waiting for slow peers.
             effective_workers = max(1, min(concurrent, total))
             self._executor = ThreadPoolExecutor(max_workers=effective_workers)
 
+            futures = {}
+            pages = iter(self.page_list)
+            exhausted = False
+            submitted_count = 0
             try:
-                for batch_start in range(0, total, effective_workers):
-                    if not self._is_running:
-                        break
-                    futures = {}
-                    for page_num in self.page_list[
-                        batch_start:batch_start + effective_workers
-                    ]:
-                        if not self._is_running:
+                while self._is_running and (futures or not exhausted):
+                    while self._is_running and not exhausted and len(futures) < effective_workers:
+                        try:
+                            page_num = next(pages)
+                        except StopIteration:
+                            exhausted = True
                             break
+                        submitted_count += 1
                         self.progress.emit(
-                            f"Preparing page {page_num} ({done_count + len(futures) + 1}/{total})..."
+                            f"Preparing page {page_num} ({submitted_count}/{total})..."
                         )
                         real_page_num = page_num + self.project_config.get("page_offset", 0)
                         img_bytes = get_page_image(
@@ -278,11 +283,19 @@ class OCRWorker(QThread):
                         prepared_count += 1
                         future = self._executor.submit(process_page, page_num, img_bytes)
                         futures[future] = page_num
+                        del img_bytes
 
-                    for future in as_completed(futures):
+                    if not self._is_running:
+                        break
+                    if not futures:
+                        continue
+                    completed, _pending = wait(
+                        futures, timeout=0.2, return_when=FIRST_COMPLETED
+                    )
+                    for future in completed:
                         if not self._is_running:
                             break
-                        pn = futures[future]
+                        pn = futures.pop(future)
                         try:
                             ok, page_num, err = future.result()
                         except Exception as exc:
@@ -309,7 +322,7 @@ class OCRWorker(QThread):
                                         doc.close()
                                     return
             finally:
-                self._executor.shutdown(wait=False)
+                self._executor.shutdown(wait=False, cancel_futures=True)
                 self._executor = None
 
             if self._is_running and prepared_count == 0:
@@ -464,8 +477,6 @@ class OCRWorker(QThread):
     # ------------------------------------------------------------------
     def stop(self):
         self._is_running = False
-        if self._executor:
-            self._executor.shutdown(wait=False)
 
 
 class ImageExportWorker(QThread):
